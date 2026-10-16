@@ -1,0 +1,366 @@
+schema: comet.native.v4
+name: app-shell-document-model
+language: en
+phase: archive
+status: done
+state_version: 10
+brief: brief.md
+document_constraints_version: 1
+shape_confirmation_hash: 4128d144f11d4212896d4348d70e47f9e6df7fc43ea24517014ec6259a6cb37e
+spec_changes:
+  - capability: document-model
+    operation: create
+    source: specs/document-model/spec.md
+  - capability: editor-shell
+    operation: create
+    source: specs/editor-shell/spec.md
+  - capability: image-io
+    operation: create
+    source: specs/image-io/spec.md
+workspace:
+  isolation: current
+  change_branch: master
+  target_branch: master
+  finish: null
+loop:
+  stage: done
+  goal_cycle: 1
+  iteration: 2
+  attempt: 1
+  retry_epoch: 0
+  failed_iteration_count: 0
+  no_progress_count: 0
+  execution_failure_count: 0
+  previous_unresolved_ids: []
+  next_action: null
+acceptance:
+  - id: A1
+    source: brief.md
+    text: "A1: `cargo build` builds the project from `Cargo.toml` (library +
+      `game-asset-creator` binary), and `cargo test` runs and passes from the
+      repository root."
+    result: passed
+    reason:
+      text: Cargo.toml defines lib game_asset_creator and [[bin]] game-asset-creator
+        (edition 2021; eframe/egui 0.36, egui_dock 0.21, image, png, rfd).
+        Runtime checks cargo test, clippy -D warnings, fmt --check all passed;
+        cargo build re-run by verifier finished cleanly.
+      truncated: false
+  - id: A2
+    source: brief.md
+    text: 'A2: `cargo run` (the `game-asset-creator` binary) opens the main window
+      titled "Game Asset Creator".'
+    result: passed
+    reason:
+      text: main.rs calls eframe::run_native(APP_TITLE, ...) with
+        ViewportBuilder::with_title(APP_TITLE) where APP_TITLE = "Game Asset
+        Creator" (asserted by tests/app.rs title_constant). Verifier launched
+        target/debug/game-asset-creator and the process stayed alive for 6s
+        before being killed; Builder reports a screenshot of the titled window.
+      truncated: false
+  - id: A3
+    source: brief.md
+    text: "A3: The main window shows three dockable panels — Tools, Layers, Asset
+      Library — that can be dragged/re-docked and closed, plus a View menu that
+      shows/hides each one; documents appear as closable tabs in the document
+      area."
+    result: passed
+    reason:
+      text: default_layout puts Tools, Layers, Asset Library panel tabs and an empty
+        document leaf in an egui_dock DockState; DockArea uses default
+        draggable/closeable tabs. View menu has a checkbox per Panel driving
+        set_panel_open (remove_tab / re-append without duplicates; tested by
+        panels_can_be_hidden_and_restored). Document tabs close via
+        TabViewer::on_close -> forget_document, and via Close.
+      truncated: false
+  - id: A4
+    source: brief.md
+    text: "A4: File → Open… accepts PNG, JPG/JPEG, BMP, and WebP; opening a file
+      adds a new document tab named after the file that shows the image pixels,
+      and focuses it. An unreadable or unsupported file shows an error message
+      and adds no tab."
+    result: passed
+    reason:
+      text: Open uses rfd dialog filtered to png/jpg/jpeg/bmp/webp; open_path ->
+        AppState::open -> load_document, adds tab named after file, appends to
+        doc leaf, sets active and focused node and current doc (tests
+        opening_an_image_adds_a_focused_tab, second-image test). Corrupt,
+        missing, and unsupported (.tga) files set an error shown in an Error
+        window and add no tab (failed_open_shows_error_and_adds_no_tab).
+      truncated: false
+  - id: A5
+    source: brief.md
+    text: "A5: File → New… asks for width, height, and DPI and opens a new tab
+      containing a fully transparent single-layer document of that size; invalid
+      (zero/non-numeric) values are rejected."
+    result: passed
+    reason:
+      text: New dialog with width/height/DPI fields defaulting 512/512/72; parse
+        rejects zero, non-numeric, negative, >16384 sides and
+        non-positive/non-finite DPI with an inline error keeping the dialog
+        open; valid input creates Untitled-N transparent single-layer doc in a
+        focused tab (new_document_dialog_* tests).
+      truncated: false
+  - id: A6
+    source: brief.md
+    text: "A6: File → Export… writes the current document to PNG, JPG, BMP, or WebP
+      by chosen extension, compositing visible layers; exporting an opened PNG
+      to PNG reproduces identical RGBA pixel values (verified by automated test
+      through the same app export path the menu uses)."
+    result: passed
+    reason:
+      text: Menu Export calls EditorApp::export_to (same path as tests) ->
+        export_document which composites visible layers and encodes by extension
+        for png/jpg/jpeg/bmp/webp; export_round_trips_png_pixels_exactly
+        verifies identical RGBA through export_to; unsupported extension errors
+        before creating a file; Export menu item disabled without a document;
+        Ctrl+Shift+E bound.
+      truncated: false
+  - id: A7
+    source: brief.md
+    text: "A7: JPG and BMP export composite transparent pixels over white; PNG and
+      WebP keep alpha (WebP lossless). DPI is written to PNG (pHYs) and JPG
+      (JFIF density)."
+    result: passed
+    reason:
+      text: JPEG (quality 95) and BMP use flatten_on_white and RGB8; PNG writes RGBA8
+        via png crate with pHYs in px/m from DPI; WebP uses
+        WebPEncoder::new_lossless RGBA8; JPEG sets PixelDensity in inches. Tests
+        cover over-white compositing, alpha preservation for PNG/WebP, and DPI
+        round-trip 300/72 PNG and 150 JPG.
+      truncated: false
+  - id: A8
+    source: brief.md
+    text: "A8: Loading reads every supported format into a document with one RGBA8
+      layer of the image's size, records the source path and name, and reads DPI
+      from PNG pHYs / JPG JFIF density (72 when absent or for BMP/WebP)."
+    result: passed
+    reason:
+      text: load_document validates extension, decodes via image crate, into_rgba8,
+        creates one Background layer of image size, sets name to file name and
+        source_path; DPI from PNG pHYs (meter unit only) and JFIF APP0 density
+        (inch or cm converted), else 72; BMP/WebP 72. Tested for all formats
+        incl. .JPEG case, cm conversion, and defaults.
+      truncated: false
+  - id: A9
+    source: brief.md
+    text: "A9: The Layers panel lists the current document's layers top-first with a
+      visibility indicator and follows the focused document tab (empty state
+      when no document); the Tools panel shows disabled placeholder tool
+      buttons; the Asset Library panel shows placeholder text."
+    result: passed
+    reason:
+      text: layers_panel renders AppState::current_layer_rows (reversed = top-first)
+        with eye/dash visibility indicator, or 'No document' when none; current
+        doc is updated each frame from dock find_active_focused document tab and
+        on close falls back to remaining doc. Tools panel shows disabled
+        Move/Select/Brush/Eraser/Fill/Picker buttons; Asset Library shows
+        placeholder text. Status bar shows name, size, DPI or 'No document'.
+      truncated: false
+  - id: A10
+    source: brief.md
+    text: "A10: Unit tests cover the document model: construction and validation of
+      size/DPI, layer buffer size invariants, add/insert/remove/move layer
+      ordering, and compositing of visible layers with opacity."
+    result: passed
+    reason:
+      text: document.rs unit tests cover construction/metadata, zero size and invalid
+        DPI rejection (incl. NaN/inf and set_dpi), layer size mismatch rejection
+        leaving stack unchanged, add/insert/remove/move ordering with
+        out-of-range errors, opacity clamping, and compositing (single layer
+        exact, hidden/zero-opacity excluded, opacity blend, translucent alpha
+        combine, empty transparent).
+      truncated: false
+builder_handoff:
+  candidate_id: 9365f8ea-1284-4218-a5a4-6a2b916f5d9e
+  identity_provider: skill-coordinated
+  builder_execution_ref: skill-coordinated:builder:f60c328c-1926-4b3f-bb7f-cd80d5d842fd
+  iteration: 2
+  summary:
+    text: "Resubmission of the unchanged iteration-1 candidate with the Runtime
+      check plan attached. Created Rust Cargo project (lib + game-asset-creator
+      bin). src/document.rs: Document/Layer model with RgbaImage buffers,
+      size/DPI validation, add/insert/remove/move, source-over composite with
+      opacity. src/io.rs: load PNG/JPG/BMP/WebP into single-layer docs (DPI from
+      PNG pHYs / JFIF density, default 72); export by extension (PNG via png
+      crate with pHYs, WebP lossless, JPG q95 + JFIF dpi, JPG/BMP flattened on
+      white). src/app_state.rs: window-free open/new/export/close/current/layer
+      rows. src/ui.rs: eframe 0.36 + egui_dock 0.21 UI with File
+      (New/Open/Export/Close/Quit + shortcuts) and View menus, dockable
+      Tools/Layers/Asset Library panels, document tabs showing composite at
+      100%, New dialog with inline validation, error window, status bar. main.rs
+      runs eframe; extra CLI paths are opened at startup."
+    truncated: false
+  addressed_acceptance_ids:
+    - A1
+    - A2
+    - A3
+    - A4
+    - A5
+    - A6
+    - A7
+    - A8
+    - A9
+    - A10
+  checks:
+    - name:
+        text: cargo test
+        truncated: false
+      result: passed
+      note:
+        text: "48 tests: 23 unit (document, io, app_state), 13 app (tests/app.rs incl.
+          headless egui frames), 12 io round-trip"
+        truncated: false
+    - name:
+        text: cargo clippy --all-targets -- -D warnings
+        truncated: false
+      result: passed
+      note: null
+    - name:
+        text: cargo fmt --check
+        truncated: false
+      result: passed
+      note: null
+    - name:
+        text: manual launch
+        truncated: false
+      result: passed
+      note:
+        text: Launched target/debug/game-asset-creator with a sample PNG on macOS;
+          screenshot showed window titled Game Asset Creator, File/View menus,
+          Tools/Layers/Asset Library docks, sample.png tab with pixels, Layers
+          listing Background, status bar with size/DPI.
+        truncated: false
+  checks_truncated: false
+  known_limits:
+    - text: eframe/egui pinned to 0.36 because egui_dock 0.21 (latest) depends on egui
+        0.36.
+      truncated: false
+    - text: Native file dialogs (rfd) are not exercised by automated tests; menu
+        actions route to EditorApp::open_path/export_to/submit_new_dialog which
+        are tested directly.
+      truncated: false
+    - text: File -> New caps width/height at 16384 to avoid huge allocations.
+      truncated: false
+    - text: Lossless WebP may not preserve RGB under fully transparent pixels; alpha
+        and visible pixels are exact.
+      truncated: false
+    - text: Repository has no commits; work is uncommitted on master.
+      truncated: false
+  known_limits_truncated: false
+  review: null
+  submitted_at: 2026-10-16T15:39:47.543Z
+blockers: []
+verification:
+  candidate_id: 9365f8ea-1284-4218-a5a4-6a2b916f5d9e
+  identity_provider: skill-coordinated
+  verifier_execution_ref: skill-coordinated:verifier:fd5cde10-e32a-4717-876d-169553929648
+  iteration: 2
+  attempt: 1
+  assurance: skill-coordinated
+  verdict: pass
+  checks:
+    - id: cargo-test
+      name:
+        text: cargo test
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 890
+    - id: cargo-clippy
+      name:
+        text: cargo clippy
+        truncated: false
+      argv_display:
+        - text: clippy
+          truncated: false
+        - text: --all-targets
+          truncated: false
+        - text: --
+          truncated: false
+        - text: -D
+          truncated: false
+        - text: warnings
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 428
+    - id: cargo-fmt
+      name:
+        text: cargo fmt check
+        truncated: false
+      argv_display:
+        - text: fmt
+          truncated: false
+        - text: --check
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 99
+  summary:
+    text: "All A1-A10 pass: build/tests/clippy/fmt green, binary launches and stays
+      alive, implementation matches brief and
+      document-model/image-io/editor-shell specs."
+    truncated: false
+  risks:
+    - text: rfd native Open/Export dialogs and real keyboard shortcuts are not
+        exercised by automated tests; only code-inspected and Builder-reported
+        manual launch.
+      truncated: false
+    - text: Export creates the output file before encoding, so an encode/write failure
+        may leave a partial file; BufWriter flush errors on drop are ignored for
+        PNG/JPEG/WebP.
+      truncated: false
+    - text: JFIF DPI is read only when APP0 JFIF immediately follows SOI; JPEGs with
+        EXIF-first or no JFIF fall back to 72.
+      truncated: false
+    - text: Lossless WebP may not preserve RGB under fully transparent pixels (alpha
+        preserved).
+      truncated: false
+  risks_truncated: false
+  completed_at: 2026-10-16T15:41:36.984Z
+history:
+  - goal_cycle: 1
+    iteration: 1
+    attempt: 0
+    outcome: recovery
+    unresolved_ids: []
+    summary:
+      text: Native check input changed after the candidate was built; a new Builder
+        candidate is required before checks can run again.
+      truncated: false
+    completed_at: 2026-10-16T15:39:28.682Z
+  - goal_cycle: 1
+    iteration: 2
+    attempt: 1
+    outcome: pass
+    unresolved_ids: []
+    summary:
+      text: "All A1-A10 pass: build/tests/clippy/fmt green, binary launches and stays
+        alive, implementation matches brief and
+        document-model/image-io/editor-shell specs."
+      truncated: false
+    completed_at: 2026-10-16T15:41:36.984Z
+history_overflow:
+  dropped_entries: 0
+  first_dropped_at: null
+  last_dropped_at: null
+  outcome_counts:
+    pass: 0
+    fail: 0
+    blocked: 0
+    execution-error: 0
+    recovery: 0
+verification_result: pass
+verification_report: verification.md
+archived: true
+created_at: 2026-10-16T15:16:41.872Z
