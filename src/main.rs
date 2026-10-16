@@ -1,0 +1,26 @@
+use std::path::PathBuf;
+
+use game_asset_creator::{EditorApp, APP_TITLE};
+
+fn main() -> eframe::Result {
+    // Any paths on the command line are opened as documents at startup.
+    let paths: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title(APP_TITLE)
+            .with_inner_size([1280.0, 800.0])
+            .with_min_inner_size([640.0, 400.0]),
+        ..Default::default()
+    };
+    eframe::run_native(
+        APP_TITLE,
+        options,
+        Box::new(move |_cc| {
+            let mut app = EditorApp::new();
+            for path in &paths {
+                app.open_path(path);
+            }
+            Ok(Box::new(app))
+        }),
+    )
+}

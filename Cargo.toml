@@ -1,0 +1,27 @@
+[package]
+name = "game-asset-creator"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+description = "Desktop image editor for creating and extracting game assets"
+license = "MIT"
+
+[lib]
+name = "game_asset_creator"
+path = "src/lib.rs"
+
+[[bin]]
+name = "game-asset-creator"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.36"
+egui = "0.36"
+egui_dock = "0.21"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "webp"] }
+png = "0.18"
+rfd = "0.17"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
