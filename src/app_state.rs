@@ -1,29 +1,72 @@
-//! Window-independent application state: the open documents and which one is
-//! current. The egui layer drives these operations; tests call them directly.
+//! Window-independent application state: the open documents, their undo
+//! history, and which one is current. The egui layer drives these
+//! operations; tests call them directly.
+//!
+//! Documents are only modified through [`AppState::execute`], [`AppState::undo`]
+//! and [`AppState::redo`]; read access is public.
 
 use std::path::Path;
 
-use crate::document::{Document, DocumentError};
+use crate::document::{Document, DocumentError, PixelRect};
 use crate::io::{self, IoError};
+use crate::undo::{Command, CommandError, UndoStack};
 
 /// Stable identifier of an open document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DocId(pub u64);
 
-/// An open document plus a revision counter that bumps on every change, so
-/// views know when to refresh cached textures.
+/// An open document with its undo history, active layer, and the regions
+/// changed since the view last refreshed.
 #[derive(Debug)]
 pub struct OpenDocument {
     pub id: DocId,
     pub document: Document,
+    /// Bumps on every change.
     pub revision: u64,
+    undo: UndoStack,
+    active_layer: usize,
+    dirty: Vec<PixelRect>,
+}
+
+impl OpenDocument {
+    fn new(id: DocId, document: Document) -> Self {
+        let active_layer = document.layer_count().saturating_sub(1);
+        Self {
+            id,
+            document,
+            revision: 0,
+            undo: UndoStack::new(),
+            active_layer,
+            dirty: Vec::new(),
+        }
+    }
+
+    /// Index (bottom = 0) of the layer edits target.
+    pub fn active_layer(&self) -> usize {
+        self.active_layer
+    }
+
+    pub fn undo_stack(&self) -> &UndoStack {
+        &self.undo
+    }
+
+    fn changed(&mut self, rect: PixelRect) {
+        self.revision += 1;
+        self.dirty.push(rect);
+        self.active_layer = self
+            .active_layer
+            .min(self.document.layer_count().saturating_sub(1));
+    }
 }
 
 /// One row of the Layers panel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LayerRow {
+    /// The layer's index in the document (bottom = 0).
+    pub index: usize,
     pub name: String,
     pub visible: bool,
+    pub active: bool,
 }
 
 #[derive(Debug, Default)]
@@ -48,11 +91,8 @@ impl AppState {
         self.documents.iter().find(|d| d.id == id)
     }
 
-    /// Mutable access to a document. Bumps its revision so views refresh.
-    pub fn document_mut(&mut self, id: DocId) -> Option<&mut Document> {
-        let open = self.documents.iter_mut().find(|d| d.id == id)?;
-        open.revision += 1;
-        Some(&mut open.document)
+    fn document_mut(&mut self, id: DocId) -> Option<&mut OpenDocument> {
+        self.documents.iter_mut().find(|d| d.id == id)
     }
 
     pub fn current_id(&self) -> Option<DocId> {
@@ -97,8 +137,8 @@ impl AppState {
         }
     }
 
-    /// Closes a document. If it was current, the most recently opened remaining
-    /// document becomes current.
+    /// Closes a document and drops its history. If it was current, the most
+    /// recently opened remaining document becomes current.
     pub fn close(&mut self, id: DocId) -> Option<Document> {
         let index = self.documents.iter().position(|d| d.id == id)?;
         let closed = self.documents.remove(index);
@@ -108,6 +148,60 @@ impl AppState {
         Some(closed.document)
     }
 
+    /// Applies `command` to a document and records it for undo.
+    pub fn execute(&mut self, id: DocId, command: Box<dyn Command>) -> Result<(), CommandError> {
+        let open = self
+            .document_mut(id)
+            .ok_or_else(|| CommandError::Invalid("no such document".to_owned()))?;
+        let dirty = open.undo.execute(&mut open.document, command)?;
+        open.changed(dirty);
+        Ok(())
+    }
+
+    /// Undoes the document's most recent command. Returns whether anything changed.
+    pub fn undo(&mut self, id: DocId) -> bool {
+        let Some(open) = self.document_mut(id) else {
+            return false;
+        };
+        match open.undo.undo(&mut open.document) {
+            Some(dirty) => {
+                open.changed(dirty);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Redoes the document's most recently undone command. Returns whether anything changed.
+    pub fn redo(&mut self, id: DocId) -> bool {
+        let Some(open) = self.document_mut(id) else {
+            return false;
+        };
+        match open.undo.redo(&mut open.document) {
+            Some(dirty) => {
+                open.changed(dirty);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Sets the layer edits target. Out-of-range indices are ignored.
+    pub fn set_active_layer(&mut self, id: DocId, index: usize) {
+        if let Some(open) = self.document_mut(id) {
+            if index < open.document.layer_count() {
+                open.active_layer = index;
+            }
+        }
+    }
+
+    /// Returns and clears the regions changed since the last call.
+    pub fn take_dirty(&mut self, id: DocId) -> Vec<PixelRect> {
+        self.document_mut(id)
+            .map(|open| std::mem::take(&mut open.dirty))
+            .unwrap_or_default()
+    }
+
     /// The current document's layers, top-most first.
     pub fn current_layer_rows(&self) -> Vec<LayerRow> {
         self.current_document()
@@ -115,10 +209,13 @@ impl AppState {
                 open.document
                     .layers()
                     .iter()
+                    .enumerate()
                     .rev()
-                    .map(|layer| LayerRow {
+                    .map(|(index, layer)| LayerRow {
+                        index,
                         name: layer.name.clone(),
                         visible: layer.visible,
+                        active: index == open.active_layer,
                     })
                     .collect()
             })
@@ -128,11 +225,7 @@ impl AppState {
     fn insert(&mut self, document: Document) -> DocId {
         let id = DocId(self.next_id);
         self.next_id += 1;
-        self.documents.push(OpenDocument {
-            id,
-            document,
-            revision: 0,
-        });
+        self.documents.push(OpenDocument::new(id, document));
         self.current = Some(id);
         id
     }
@@ -142,6 +235,37 @@ impl AppState {
 mod tests {
     use super::*;
     use crate::document::Layer;
+    use crate::undo::FillLayer;
+
+    /// Adds a layer on top (test-only command).
+    struct AddLayer(Option<Layer>, usize);
+
+    impl Command for AddLayer {
+        fn label(&self) -> &str {
+            "Add Layer"
+        }
+        fn apply(&mut self, doc: &mut Document) -> Result<(), CommandError> {
+            let layer = self.0.take().expect("layer");
+            self.1 = doc.layer_count();
+            doc.add_layer(layer)
+                .map_err(|e| CommandError::Invalid(e.to_string()))
+        }
+        fn revert(&mut self, doc: &mut Document) {
+            self.0 = doc.remove_layer(self.1).ok();
+        }
+        fn dirty_rect(&self, doc: &Document) -> PixelRect {
+            doc.bounds()
+        }
+        fn memory_cost(&self) -> usize {
+            0
+        }
+    }
+
+    fn add(state: &mut AppState, id: DocId, layer: Layer) {
+        state
+            .execute(id, Box::new(AddLayer(Some(layer), 0)))
+            .unwrap();
+    }
 
     #[test]
     fn new_documents_are_numbered_and_current() {
@@ -181,13 +305,68 @@ mod tests {
     }
 
     #[test]
-    fn document_mut_bumps_revision() {
+    fn execute_undo_redo_track_revision_and_dirty() {
         let mut state = AppState::new();
-        let a = state.new_document(1, 1, 72.0).unwrap();
-        assert_eq!(state.document(a).unwrap().revision, 0);
-        state.document_mut(a).unwrap().name = "renamed".into();
-        assert_eq!(state.document(a).unwrap().revision, 1);
-        assert_eq!(state.document(a).unwrap().document.name, "renamed");
+        let a = state.new_document(3, 2, 72.0).unwrap();
+        let original = state.document(a).unwrap().document.clone();
+        assert!(state.take_dirty(a).is_empty());
+
+        state
+            .execute(a, Box::new(FillLayer::new(0, [9, 8, 7, 6])))
+            .unwrap();
+        let open = state.document(a).unwrap();
+        assert_eq!(open.revision, 1);
+        assert!(open.undo_stack().can_undo());
+        assert_eq!(state.take_dirty(a), vec![PixelRect::new(0, 0, 3, 2)]);
+        assert!(state.take_dirty(a).is_empty());
+
+        assert!(state.undo(a));
+        assert_eq!(state.document(a).unwrap().document, original);
+        assert_eq!(state.document(a).unwrap().revision, 2);
+        assert!(!state.undo(a));
+        assert!(state.redo(a));
+        assert!(!state.redo(a));
+        assert_eq!(state.take_dirty(a).len(), 2);
+        assert!(state
+            .document(a)
+            .unwrap()
+            .document
+            .layer(0)
+            .unwrap()
+            .pixels
+            .pixels()
+            .all(|p| p.0 == [9, 8, 7, 6]));
+    }
+
+    #[test]
+    fn failed_command_changes_nothing() {
+        let mut state = AppState::new();
+        let a = state.new_document(2, 2, 72.0).unwrap();
+        assert!(state
+            .execute(a, Box::new(FillLayer::new(3, [1; 4])))
+            .is_err());
+        assert!(state
+            .execute(DocId(42), Box::new(FillLayer::new(0, [1; 4])))
+            .is_err());
+        let open = state.document(a).unwrap();
+        assert_eq!(open.revision, 0);
+        assert!(!open.undo_stack().can_undo());
+        assert!(state.take_dirty(a).is_empty());
+    }
+
+    #[test]
+    fn active_layer_defaults_to_top_and_is_settable() {
+        let mut state = AppState::new();
+        let a = state.new_document(2, 2, 72.0).unwrap();
+        assert_eq!(state.document(a).unwrap().active_layer(), 0);
+        add(&mut state, a, Layer::transparent("Top", 2, 2));
+        state.set_active_layer(a, 1);
+        assert_eq!(state.document(a).unwrap().active_layer(), 1);
+        state.set_active_layer(a, 7);
+        assert_eq!(state.document(a).unwrap().active_layer(), 1);
+        // Undoing the layer addition keeps the active index in range.
+        state.undo(a);
+        assert_eq!(state.document(a).unwrap().active_layer(), 0);
     }
 
     #[test]
@@ -195,16 +374,23 @@ mod tests {
         let mut state = AppState::new();
         assert!(state.current_layer_rows().is_empty());
         let a = state.new_document(2, 2, 72.0).unwrap();
-        let doc = state.document_mut(a).unwrap();
-        doc.add_layer(Layer::transparent("Top", 2, 2)).unwrap();
-        let mut hidden = Layer::transparent("Hidden", 2, 2);
+        add(&mut state, a, Layer::transparent("Middle", 2, 2));
+        let mut hidden = Layer::transparent("Top", 2, 2);
         hidden.visible = false;
-        doc.insert_layer(1, hidden).unwrap();
+        add(&mut state, a, hidden);
+        state.set_active_layer(a, 1);
         let rows = state.current_layer_rows();
-        let rows: Vec<_> = rows.iter().map(|r| (r.name.as_str(), r.visible)).collect();
+        let rows: Vec<_> = rows
+            .iter()
+            .map(|r| (r.index, r.name.as_str(), r.visible, r.active))
+            .collect();
         assert_eq!(
             rows,
-            [("Top", true), ("Hidden", false), ("Background", true)]
+            [
+                (2, "Top", false, false),
+                (1, "Middle", true, true),
+                (0, "Background", true, false)
+            ]
         );
 
         let b = state.new_document(2, 2, 72.0).unwrap();

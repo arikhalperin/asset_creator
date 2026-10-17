@@ -27,6 +27,47 @@ pub enum DocumentError {
     IndexOutOfRange { index: usize, len: usize },
 }
 
+/// An axis-aligned rectangle in image pixel coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+pub struct PixelRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl PixelRect {
+    pub const fn new(x: u32, y: u32, width: u32, height: u32) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.width == 0 || self.height == 0
+    }
+
+    pub fn right(&self) -> u32 {
+        self.x + self.width
+    }
+
+    pub fn bottom(&self) -> u32 {
+        self.y + self.height
+    }
+
+    /// The overlapping rectangle, or `None` when they do not overlap.
+    pub fn intersect(&self, other: PixelRect) -> Option<PixelRect> {
+        let x = self.x.max(other.x);
+        let y = self.y.max(other.y);
+        let right = self.right().min(other.right());
+        let bottom = self.bottom().min(other.bottom());
+        (right > x && bottom > y).then(|| PixelRect::new(x, y, right - x, bottom - y))
+    }
+}
+
 /// A single raster layer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Layer {
@@ -192,11 +233,24 @@ impl Document {
     /// scaled by opacity), so a single full-opacity layer composites to exactly
     /// its own pixels, including colour values under fully transparent pixels.
     pub fn composite(&self) -> RgbaImage {
-        let mut out = RgbaImage::new(self.width, self.height);
+        self.composite_region(self.bounds())
+    }
+
+    /// The whole document as a rectangle.
+    pub fn bounds(&self) -> PixelRect {
+        PixelRect::new(0, 0, self.width, self.height)
+    }
+
+    /// Composites only `rect` (clipped to the document), returning an image
+    /// of the clipped rectangle's size. Same blending as [`Self::composite`].
+    pub fn composite_region(&self, rect: PixelRect) -> RgbaImage {
+        let rect = rect.intersect(self.bounds()).unwrap_or_default();
+        let mut out = RgbaImage::new(rect.width, rect.height);
         for layer in self.layers.iter().filter(|l| l.visible && l.opacity > 0.0) {
             let opacity = layer.opacity;
-            for (dst, src) in out.pixels_mut().zip(layer.pixels.pixels()) {
-                *dst = blend_over(*dst, *src, opacity);
+            for (x, y, dst) in out.enumerate_pixels_mut() {
+                let src = *layer.pixels.get_pixel(rect.x + x, rect.y + y);
+                *dst = blend_over(*dst, src, opacity);
             }
         }
         out
@@ -459,6 +513,38 @@ mod tests {
         // blue dominates because it is on top
         assert!(p[2] > p[0]);
         assert_eq!(p[1], 0);
+    }
+
+    #[test]
+    fn composite_region_matches_full_composite() {
+        let mut doc = Document::new("x", 5, 4, 72.0).unwrap();
+        let base = RgbaImage::from_fn(5, 4, |x, y| Rgba([(x * 50) as u8, (y * 60) as u8, 7, 255]));
+        doc.add_layer(Layer::new("base", base)).unwrap();
+        let mut top = Layer::new("top", solid(5, 4, [0, 0, 255, 100]));
+        top.set_opacity(0.7);
+        doc.add_layer(top).unwrap();
+        let full = doc.composite();
+        let region = doc.composite_region(PixelRect::new(1, 2, 3, 2));
+        assert_eq!((region.width(), region.height()), (3, 2));
+        for (x, y, p) in region.enumerate_pixels() {
+            assert_eq!(p, full.get_pixel(x + 1, y + 2));
+        }
+        // Clipped to the document.
+        let clipped = doc.composite_region(PixelRect::new(4, 3, 10, 10));
+        assert_eq!((clipped.width(), clipped.height()), (1, 1));
+        let outside = doc.composite_region(PixelRect::new(9, 9, 2, 2));
+        assert_eq!((outside.width(), outside.height()), (0, 0));
+    }
+
+    #[test]
+    fn pixel_rect_intersection() {
+        let a = PixelRect::new(0, 0, 10, 10);
+        assert_eq!(
+            a.intersect(PixelRect::new(5, 5, 10, 10)),
+            Some(PixelRect::new(5, 5, 5, 5))
+        );
+        assert_eq!(a.intersect(PixelRect::new(10, 0, 5, 5)), None);
+        assert!(PixelRect::new(1, 1, 0, 3).is_empty());
     }
 
     #[test]

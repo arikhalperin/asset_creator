@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use game_asset_creator::ui::{NewDocumentForm, Panel, Tab};
-use game_asset_creator::{EditorApp, Layer, APP_TITLE};
+use game_asset_creator::{Command, CommandError, Document, EditorApp, Layer, PixelRect, APP_TITLE};
 use image::{Rgba, RgbaImage};
 
 fn write_png(dir: &Path, name: &str, width: u32, height: u32) -> (PathBuf, RgbaImage) {
@@ -14,6 +14,41 @@ fn write_png(dir: &Path, name: &str, width: u32, height: u32) -> (PathBuf, RgbaI
     let path = dir.join(name);
     pixels.save(&path).unwrap();
     (path, pixels)
+}
+
+/// Adds a layer on top of the stack.
+struct AddLayer {
+    layer: Option<Layer>,
+    index: usize,
+}
+
+impl AddLayer {
+    fn new(layer: Layer) -> Self {
+        Self {
+            layer: Some(layer),
+            index: 0,
+        }
+    }
+}
+
+impl Command for AddLayer {
+    fn label(&self) -> &str {
+        "Add Layer"
+    }
+    fn apply(&mut self, doc: &mut Document) -> Result<(), CommandError> {
+        self.index = doc.layer_count();
+        doc.add_layer(self.layer.take().expect("layer"))
+            .map_err(|e| CommandError::Invalid(e.to_string()))
+    }
+    fn revert(&mut self, doc: &mut Document) {
+        self.layer = doc.remove_layer(self.index).ok();
+    }
+    fn dirty_rect(&self, doc: &Document) -> PixelRect {
+        doc.bounds()
+    }
+    fn memory_cost(&self) -> usize {
+        0
+    }
 }
 
 /// Runs one headless egui frame of the whole UI.
@@ -243,14 +278,18 @@ fn layers_follow_current_document_and_close() {
     frame(&mut app, &ctx);
     assert_eq!(app.state.current_id(), Some(blank));
 
-    // Add layers to the blank document; the listing is top-first.
-    {
-        let doc = app.state.document_mut(blank).unwrap();
-        doc.add_layer(Layer::transparent("Top", 4, 4)).unwrap();
-        let mut hidden = Layer::transparent("Hidden", 4, 4);
-        hidden.visible = false;
-        doc.insert_layer(1, hidden).unwrap();
-    }
+    // Add layers to the blank document (through commands); the listing is top-first.
+    let mut hidden = Layer::transparent("Hidden", 4, 4);
+    hidden.visible = false;
+    app.state
+        .execute(blank, Box::new(AddLayer::new(hidden)))
+        .unwrap();
+    app.state
+        .execute(
+            blank,
+            Box::new(AddLayer::new(Layer::transparent("Top", 4, 4))),
+        )
+        .unwrap();
     let rows: Vec<_> = app
         .state
         .current_layer_rows()
