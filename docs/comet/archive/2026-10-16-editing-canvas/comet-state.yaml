@@ -1,0 +1,478 @@
+schema: comet.native.v4
+name: editing-canvas
+language: en
+phase: archive
+status: done
+state_version: 12
+brief: brief.md
+document_constraints_version: 1
+shape_confirmation_hash: 7b5a5d68c09a9e187adf7b8beb05bc9427388a880f7f5f66d9ccc60b243710e7
+spec_changes:
+  - capability: canvas
+    operation: create
+    source: specs/canvas/spec.md
+  - capability: editor-shell
+    operation: modify
+    source: specs/editor-shell/spec.md
+  - capability: undo
+    operation: create
+    source: specs/undo/spec.md
+workspace:
+  isolation: branch
+  change_branch: comet/editing-canvas
+  target_branch: master
+  finish: merge
+loop:
+  stage: done
+  goal_cycle: 1
+  iteration: 2
+  attempt: 1
+  retry_epoch: 0
+  failed_iteration_count: 1
+  no_progress_count: 0
+  execution_failure_count: 0
+  previous_unresolved_ids: []
+  next_action: null
+acceptance:
+  - id: A1
+    source: brief.md
+    text: "A1: Opening a 4000×4000 image shows it on the canvas; continuous pan
+      (space-drag, scroll) and zoom (Ctrl/Cmd+wheel, pinch) frames do no
+      recompositing and no texture uploads, and a release-build headless
+      benchmark of pan/zoom frames on a 4000×4000 document averages under 8 ms
+      of CPU time per frame. The running app pans and zooms the image without
+      visible stutter."
+    result: passed
+    reason:
+      text: TileCache uploads every tile of every mip level once on first refresh;
+        later refresh() calls do nothing unless pending/dirty, so pan/zoom
+        (incl. switching mip level) never recomposites or uploads. Integration
+        tests check pinch, scroll and space-drag with unchanged upload counters;
+        the release benchmark (Runtime check) asserts <8 ms/frame with
+        tessellation and zero uploads. Live stutter-free feel was not driven by
+        hand (see risks).
+      truncated: false
+  - id: A2
+    source: brief.md
+    text: "A2: Ctrl/Cmd+wheel and pinch zoom continuously (not in fixed steps)
+      keeping the image point under the cursor fixed on screen; zoom is clamped
+      to 1%–6400%."
+    result: passed
+    reason:
+      text: Canvas uses i.zoom_delta() (Cmd/Ctrl+wheel and pinch) multiplicatively via
+        zoom_around anchored at the pointer; clamp_zoom 0.01..64. Tests cover
+        anchor invariance, a non-step small wheel delta, and the clamp at both
+        ends.
+      truncated: false
+  - id: A3
+    source: brief.md
+    text: "A3: Cmd/Ctrl+0 (View → Fit to Window) fits the whole image in the view,
+      centered; Cmd/Ctrl+1 (View → Actual Size) shows 100% (one image pixel per
+      physical screen pixel); Cmd/Ctrl+= and Cmd/Ctrl+- zoom in/out by a factor
+      of √2 around the view center. A newly opened document starts at Fit if
+      larger than the view, otherwise at 100%, centered."
+    result: passed
+    reason:
+      text: ViewState::fit/actual_size/centered/initial match the spec, with zoom in
+        physical pixels (ppp-aware). Cmd+=/−/0/1 shortcuts and View menu items
+        queue ViewActions; ZoomIn/Out use ×√2 at the view center. egui keyboard
+        UI-zoom is disabled. Unit tests and the view_shortcuts and
+        small/large-initial tests pass.
+      truncated: false
+  - id: A4
+    source: brief.md
+    text: "A4: Holding Space and left-dragging pans the view (grab cursor shown);
+      middle-drag and plain wheel/two-finger scroll also pan; Space does not
+      type into or trigger other widgets while panning."
+    result: passed
+    reason:
+      text: "Space+primary drag and middle drag pan; Grab cursor while Space is held
+        over the canvas and Grabbing while dragging; plain smooth_scroll_delta
+        pans. Space over the canvas takes focus so other widgets don't get it,
+        and is ignored while a text edit is focused. Tests: space_drag_pans,
+        plain_drag_without_space_does_not_pan, middle_drag_pans,
+        scroll_pans_without_reupload."
+      truncated: false
+  - id: A5
+    source: brief.md
+    text: "A5: Transparent and semi-transparent image areas are drawn over a
+      screen-space checkerboard (8-point light/dark gray squares) limited to the
+      image bounds; the area outside the image is the plain canvas background."
+    result: passed
+    reason:
+      text: A 2×2 Repeat/Nearest checker texture is drawn over the visible image rect
+        only, with UVs = screen position / 16 points, so squares are 8 points in
+        screen space and don't scale with zoom. Light 0xD6 / dark 0xA8 gray.
+        Outside the image is extreme_bg_color. Tiles are drawn on top.
+      truncated: false
+  - id: A6
+    source: brief.md
+    text: "A6: Above 800% zoom (strictly greater than 8×) a 1-physical-pixel grid is
+      drawn on pixel boundaries over the visible image; at or below 8× no grid
+      is drawn; View → Show Pixel Grid (default on) toggles it."
+    result: passed
+    reason:
+      text: The grid draws when show_grid && zoom > 8.0 (strict), with 1/ppp-point (1
+        physical px) lines on each pixel boundary within the visible pixel rect.
+        Show Pixel Grid checkbox in the View menu, default true. The test checks
+        no grid at exactly 8×, a grid above it, and that the toggle turns it
+        off.
+      truncated: false
+  - id: A7
+    source: brief.md
+    text: "A7: Image sampling is nearest-neighbor when magnified (crisp pixels) and
+      smooth (linear with mipmaps) when minified."
+    result: passed
+    reason:
+      text: "Level 0 tiles use mag Nearest and min Linear. At zoom >= 1 the canvas
+        draws level 0, so magnified pixels are crisp. When minified,
+        mip_level_for_zoom picks the CPU-built 2× box-filtered (premultiplied)
+        pyramid level at or above display resolution, drawn with LINEAR, so GPU
+        minification within a level is always <2×. I checked egui-wgpu 0.36.2
+        create_sampler: it honors min/mag filters (mip_level_count 1), so linear
+        filtering plus explicit mip levels holds on the actual wgpu path. This
+        is equivalent to LINEAR_MIPMAP_NEAREST. Tests cover level selection,
+        sizes, premultiplied downsample, partial refresh == rebuild, and a Fit
+        view drawing ≤20 meshes from level 2."
+      truncated: false
+  - id: A8
+    source: brief.md
+    text: "A8: The composite is cached in tiles; an edit that changes a rectangle
+      recomposites and re-uploads only tiles intersecting that rectangle
+      (verified by tile-upload counters in tests), and undo/redo of it does the
+      same."
+    result: passed
+    reason:
+      text: "mark_dirty marks only intersecting tiles at each level; refresh
+        composites only the pending rects via composite_region and re-uploads
+        only dirty tiles. Tests: a single-pixel edit/undo uploads exactly 1
+        level-0 tile each, a tile-corner pixel uploads 1, Fill/undo on 300×300
+        uploads 4 each, and the pyramid partial refresh uploads exactly 1 tile
+        per level and equals a full rebuild."
+      truncated: false
+  - id: A9
+    source: brief.md
+    text: 'A9: Every document has an undo stack; documents can only be modified
+      through `AppState::execute(Command)` (no public mutable document access);
+      executing pushes the command and clears redo history; undo/redo restore
+      exact pixel data; a command exposes a label used in the Edit menu ("Undo
+      Fill Layer").'
+    result: passed
+    reason:
+      text: Each OpenDocument owns an UndoStack. AppState exposes only
+        &OpenDocument/&Document; document_mut is private, and execute/undo/redo
+        are the only mutation paths. execute drains redo. Tests show FillLayer
+        apply/undo/redo is bit-exact. The label 'Fill Layer' drives the 'Undo
+        Fill Layer'/'Redo …' menu text.
+      truncated: false
+  - id: A10
+    source: brief.md
+    text: "A10: Edit menu has Undo (Cmd/Ctrl+Z), Redo (Cmd/Ctrl+Shift+Z and Ctrl+Y),
+      and Fill Layer…; Undo/Redo are disabled when nothing to undo/redo, Fill
+      Layer… when there is no current document."
+    result: passed
+    reason:
+      text: Edit menu has Undo (Cmd+Z) and Redo (Cmd+Shift+Z) enabled only via
+        can_undo/can_redo, plus Fill Layer… enabled only with a current
+        document. Cmd+Y (Ctrl+Y off macOS) is also bound to Redo. Shortcut
+        ordering consumes Shift+Z before Z. Tests exercise Cmd+Z, Cmd+Shift+Z
+        and Cmd+Y.
+      truncated: false
+  - id: A11
+    source: brief.md
+    text: "A11: Edit → Fill Layer… opens a dialog with an RGBA color picker
+      defaulting to the last used color (opaque black initially); OK fills the
+      entire active layer with that color as one undoable step and the canvas
+      updates; Cancel changes nothing."
+    result: passed
+    reason:
+      text: The Fill Layer window uses color_edit_button_srgba_unmultiplied (RGBA),
+        seeded with last_fill_color (default [0,0,0,255]). OK runs one FillLayer
+        on the active layer via execute and remembers the color; Cancel just
+        closes. The canvas refreshes from the dirty rects on the next frame. The
+        test covers default color, fill, upload counts, remembered color and
+        Cancel leaving history unchanged.
+      truncated: false
+  - id: A12
+    source: brief.md
+    text: "A12: The Layers panel highlights the active layer; clicking a row makes
+      it active; a new or opened document's active layer is its top layer."
+    result: passed
+    reason:
+      text: The Layers panel uses selectable_label(row.active), and a click sets the
+        active layer for the current document. OpenDocument::new sets
+        active_layer = top, and it is kept in range after changes. Unit tests
+        cover the default, setting it and row flags; the actual row click has no
+        automated test (see risks).
+      truncated: false
+  - id: A13
+    source: brief.md
+    text: "A13: Each document's undo history keeps unlimited steps but drops the
+      oldest steps once their recorded memory exceeds 1 GB; the most recent step
+      is always kept."
+    result: passed
+    reason:
+      text: UndoStack counts costs recorded at push for both undo and redo, and pops
+        the oldest undo entries while memory > 1 GiB and more than one step
+        remains. FillLayer's cost is the saved layer size. Unit tests cover
+        dropping the oldest, keeping a single over-budget step, and redo
+        accounting.
+      truncated: false
+  - id: A14
+    source: brief.md
+    text: "A14: The status bar shows the current zoom percentage, and the cursor's
+      image pixel coordinate while the pointer is over the image."
+    result: passed
+    reason:
+      text: status_text appends the zoom % and 'x, y' from canvas.hover_pixel, which
+        is set only when the pointer is inside the image bounds. The test checks
+        100% and that a 1-point move shifts by 1 pixel at ppp 1.
+      truncated: false
+builder_handoff:
+  candidate_id: b2be3f8d-3f8d-4f46-94fe-ec5737efe9f3
+  identity_provider: skill-coordinated
+  builder_execution_ref: skill-coordinated:builder:ec83506f-14a0-4fee-9c7a-f3b7a33d1569
+  iteration: 2
+  summary:
+    text: "Repair for A7: egui-wgpu ignores TextureOptions.mipmap_mode (textures
+      created with mip_level_count 1), so minified views had no mipmaps.
+      TileCache now builds a CPU mip pyramid (up to 8 levels, 2x box filter
+      averaged in premultiplied alpha, CPU level images updated only in dirty
+      regions, per-level tile textures). The canvas draws from
+      mip_level_for_zoom(zoom): level 0 when zoom >= 1 (nearest magnification),
+      otherwise the smallest level still at or above display resolution with
+      linear filtering, so GPU minification is always < 2x. uploads() still
+      reports full-resolution tile uploads; level_uploads(k) per level. New
+      tests: mip level selection, level sizes/rect mapping, premultiplied
+      downsample (no hidden-colour bleed), partial refresh equals full rebuild
+      with exactly one tile per level re-uploaded, and an integration test that
+      a Fit view of 4000x4000 draws <=20 meshes (level-2 tiles) instead of 256.
+      Everything else unchanged from iteration 1: Added src/undo.rs (Command
+      trait, UndoStack with per-command cost recorded at push and 1 GB budget
+      dropping oldest, FillLayer), src/canvas.rs (ViewState math:
+      cursor-anchored zoom, fit/actual/initial, clamp 1%-6400%;
+      TileGrid/TileCache with 256px tiles and dirty marking + upload counters;
+      CanvasState widget: Cmd/Ctrl+wheel and pinch zoom, scroll pan, Space+drag
+      and middle-drag pan with grab cursors, screen-space checkerboard texture,
+      nearest-mag/linear+mipmap-min tile textures, pixel grid when zoom > 8 and
+      toggle on). Document gained PixelRect, bounds() and composite_region().
+      AppState: per-document UndoStack, active layer (default top, kept in
+      range), dirty-rect queue, execute/undo/redo/set_active_layer/take_dirty;
+      public document_mut removed. UI: Edit menu (Undo/Redo with labels, Fill
+      Layer... dialog with RGBA picker remembering last color), View menu zoom
+      items + Show Pixel Grid, shortcuts Cmd+Z / Cmd+Shift+Z / Cmd+Y / Cmd+= /
+      Cmd+- / Cmd+0 / Cmd+1 (egui keyboard UI-zoom disabled), Layers rows
+      selectable for active layer, status bar zoom % and hover pixel. Shortcuts
+      are suppressed only when a text edit is focused (fixed a bug where canvas
+      focus from Space would have blocked them)."
+    truncated: false
+  addressed_acceptance_ids:
+    - A7
+    - A1
+    - A8
+  checks:
+    - name:
+        text: cargo test
+        truncated: false
+      result: passed
+      note:
+        text: "88 tests: 46 unit, 13 app, 17 canvas, 12 io; 1 ignored benchmark"
+        truncated: false
+    - name:
+        text: cargo test --release --test canvas -- --ignored
+        truncated: false
+      result: passed
+      note:
+        text: 0.069 ms per pan/zoom frame, zero uploads
+        truncated: false
+    - name:
+        text: cargo clippy --all-targets -- -D warnings
+        truncated: false
+      result: passed
+      note: null
+    - name:
+        text: cargo fmt --check
+        truncated: false
+      result: passed
+      note: null
+    - name:
+        text: manual launch (aliasing check)
+        truncated: false
+      result: passed
+      note:
+        text: "Release app with a 4000x4000 image of alternating 1px black/white columns
+          at Fit (18%): renders as uniform mid-gray with no moire, confirming
+          mipmapped minification in the real wgpu renderer."
+        truncated: false
+  checks_truncated: false
+  known_limits:
+    - text: Mip selection is per-level (no blending between levels); GPU minification
+        within a level is linear and always < 2x.
+      truncated: false
+    - text: The pyramid keeps CPU copies of every level (~1.33x the composite size;
+        ~85 MB for 4000x4000).
+      truncated: false
+    - text: Live mouse/trackpad pan/zoom smoothness not driven by hand; evidence is
+        headless input tests and the release CPU benchmark.
+      truncated: false
+    - text: Layers panel row click not covered by an automated click test.
+      truncated: false
+    - text: Ctrl means Cmd on macOS (egui COMMAND modifier).
+      truncated: false
+  known_limits_truncated: false
+  review: null
+  submitted_at: 2026-10-16T19:34:59.234Z
+blockers: []
+verification:
+  candidate_id: b2be3f8d-3f8d-4f46-94fe-ec5737efe9f3
+  identity_provider: skill-coordinated
+  verifier_execution_ref: skill-coordinated:verifier:632c72c5-4176-4dcd-9531-9124dae8d300
+  iteration: 2
+  attempt: 1
+  assurance: skill-coordinated
+  verdict: pass
+  checks:
+    - id: cargo-test
+      name:
+        text: cargo test
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 7008
+    - id: bench-release
+      name:
+        text: release pan/zoom benchmark
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: canvas
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 2582
+    - id: cargo-clippy
+      name:
+        text: cargo clippy
+        truncated: false
+      argv_display:
+        - text: clippy
+          truncated: false
+        - text: --all-targets
+          truncated: false
+        - text: --
+          truncated: false
+        - text: -D
+          truncated: false
+        - text: warnings
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 444
+    - id: cargo-fmt
+      name:
+        text: cargo fmt check
+        truncated: false
+      argv_display:
+        - text: fmt
+          truncated: false
+        - text: --check
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 121
+  summary:
+    text: "All 14 acceptance items pass. The A7 repair works on the real wgpu path:
+      a CPU-built mip pyramid with per-level linear tiles, with GPU minification
+      always under 2×, while level 0 stays nearest when magnified. egui-wgpu
+      0.36.2 honors the min/mag filters. The other items still hold on code
+      review and on the tests (canvas suite re-run locally: 17 passed)."
+    truncated: false
+  risks:
+    - text: Mip selection snaps per level with no blending between levels
+        (nearest-mip), so a slight sharpness jump is possible when zoom crosses
+        a power of two.
+      truncated: false
+    - text: Each tile is its own ClampToEdge texture, so linear filtering at tile and
+        level edges does not blend across tiles; faint seams are possible at
+        some minified zooms.
+      truncated: false
+    - text: The minified_view_draws_from_mip_pyramid test only bounds the mesh count
+        from above and would also pass if nothing were drawn.
+      truncated: false
+    - text: Live trackpad/mouse smoothness, the minified on-screen look (Builder
+        screenshot only) and the Layers row click were not exercised by hand;
+        these rely on headless tests and code reading.
+      truncated: false
+    - text: The CPU pyramid keeps about 1.33× the composite in memory (~85 MB for
+        4000×4000), and opening a document uploads every level up front.
+      truncated: false
+    - text: A focused button drawn before the canvas in the same frame could still
+        react to Space; low likelihood.
+      truncated: false
+  risks_truncated: false
+  completed_at: 2026-10-16T19:38:00.265Z
+history:
+  - goal_cycle: 1
+    iteration: 1
+    attempt: 1
+    outcome: fail
+    unresolved_ids:
+      - A7
+    summary:
+      text: "13 of 14 acceptance items pass on code and automated evidence. A7 fails:
+        minified sampling is linear without mipmaps because eframe uses the wgpu
+        renderer, which ignores mipmap_mode (mip_level_count 1, no mipmap
+        filter). Switch to the glow renderer or supply mipmaps explicitly, then
+        re-verify."
+      truncated: false
+    completed_at: 2026-10-16T19:31:34.503Z
+  - goal_cycle: 1
+    iteration: 2
+    attempt: 1
+    outcome: pass
+    unresolved_ids: []
+    summary:
+      text: "All 14 acceptance items pass. The A7 repair works on the real wgpu path:
+        a CPU-built mip pyramid with per-level linear tiles, with GPU
+        minification always under 2×, while level 0 stays nearest when
+        magnified. egui-wgpu 0.36.2 honors the min/mag filters. The other items
+        still hold on code review and on the tests (canvas suite re-run locally:
+        17 passed)."
+      truncated: false
+    completed_at: 2026-10-16T19:38:00.265Z
+history_overflow:
+  dropped_entries: 0
+  first_dropped_at: null
+  last_dropped_at: null
+  outcome_counts:
+    pass: 0
+    fail: 0
+    blocked: 0
+    execution-error: 0
+    recovery: 0
+verification_result: pass
+verification_report: verification.md
+archived: true
+created_at: 2026-10-16T16:52:38.573Z
