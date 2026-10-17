@@ -9,8 +9,11 @@ use std::path::Path;
 
 use crate::document::{Document, DocumentError, PixelRect};
 use crate::io::{self, IoError};
+use crate::layers::{self, LayerProps};
 use crate::paint::{ActiveStroke, BrushSettings, StrokeKind};
-use crate::undo::{Change, Command, CommandError, UndoStack};
+use crate::project::{self, ProjectError};
+use crate::transform::{self, Affine, Interpolation, TransformSession};
+use crate::undo::{Change, Command, CommandError, PaintTarget, UndoStack};
 
 /// Stable identifier of an open document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -25,33 +28,61 @@ pub struct OpenDocument {
     /// Bumps on every change.
     pub revision: u64,
     undo: UndoStack,
-    active_layer: usize,
+    edit_target: EditTarget,
+    /// Layer the edit target was chosen on; another active layer edits pixels.
+    target_layer: usize,
+    /// Undo state id at the last save (or open/creation).
+    saved_state: u64,
     dirty: Vec<PixelRect>,
     /// Bumps whenever the selection changes.
     pub selection_revision: u64,
     stroke: Option<ActiveStroke>,
+    transform: Option<TransformSession>,
     last_stroke_end: Option<(f32, f32)>,
 }
 
 impl OpenDocument {
     fn new(id: DocId, document: Document) -> Self {
-        let active_layer = document.layer_count().saturating_sub(1);
         Self {
             id,
             document,
             revision: 0,
             undo: UndoStack::new(),
-            active_layer,
+            edit_target: EditTarget::Pixels,
+            target_layer: 0,
+            saved_state: 0,
             dirty: Vec::new(),
             selection_revision: 0,
             stroke: None,
+            transform: None,
             last_stroke_end: None,
         }
     }
 
     /// Index (bottom = 0) of the layer edits target.
     pub fn active_layer(&self) -> usize {
-        self.active_layer
+        self.document.active_layer()
+    }
+
+    /// Whether edits go to the active layer's pixels or its mask.
+    pub fn edit_target(&self) -> EditTarget {
+        self.edit_target
+    }
+
+    /// The active layer's pixels or mask, per the edit target.
+    pub fn paint_target(&self) -> PaintTarget {
+        let layer = self.document.active_layer();
+        match self.edit_target {
+            EditTarget::Pixels => PaintTarget::Pixels(layer),
+            EditTarget::Mask => PaintTarget::Mask(layer),
+        }
+    }
+
+    /// Whether the document differs from its last saved (or opened) state.
+    pub fn is_dirty(&self) -> bool {
+        self.undo.state_id() != self.saved_state
+            || self.stroke.is_some()
+            || self.transform.is_some()
     }
 
     /// Whether a paint stroke is in progress.
@@ -76,12 +107,22 @@ impl OpenDocument {
         }
     }
 
-    /// Abandons an in-progress stroke, restoring its pixels.
+    /// Abandons an in-progress stroke or transform, restoring the document.
     fn cancel_stroke(&mut self) {
         if let Some(stroke) = self.stroke.take() {
             let rect = stroke.cancel(&mut self.document);
             self.repainted(rect);
         }
+        if let Some(session) = self.transform.take() {
+            let rect = session.cancel(&mut self.document);
+            self.repainted(rect);
+            self.selection_revision += 1;
+        }
+    }
+
+    /// The transform session in progress, if any.
+    pub fn transform(&self) -> Option<&TransformSession> {
+        self.transform.as_ref()
     }
 
     fn changed(&mut self, change: Change) {
@@ -92,10 +133,38 @@ impl OpenDocument {
         if change.selection_changed {
             self.selection_revision += 1;
         }
-        self.active_layer = self
-            .active_layer
-            .min(self.document.layer_count().saturating_sub(1));
+        self.normalize_target();
     }
+
+    /// Falls back to editing pixels when the active layer changed or has no mask.
+    fn normalize_target(&mut self) {
+        let active = self.document.active_layer();
+        let has_mask = self
+            .document
+            .layer(active)
+            .is_some_and(|l| l.mask().is_some());
+        if !has_mask || active != self.target_layer {
+            self.edit_target = EditTarget::Pixels;
+        }
+        self.target_layer = active;
+    }
+}
+
+/// Why a file could not be opened.
+#[derive(Debug, thiserror::Error)]
+pub enum OpenError {
+    #[error(transparent)]
+    Image(#[from] IoError),
+    #[error(transparent)]
+    Project(#[from] ProjectError),
+}
+
+/// What paint tools edit on the active layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EditTarget {
+    #[default]
+    Pixels,
+    Mask,
 }
 
 /// One row of the Layers panel.
@@ -163,9 +232,157 @@ impl AppState {
     }
 
     /// Loads an image file into a new current document. On failure nothing changes.
-    pub fn open(&mut self, path: &Path) -> Result<DocId, IoError> {
-        let document = io::load_document(path)?;
+    pub fn open(&mut self, path: &Path) -> Result<DocId, OpenError> {
+        let document = if project::is_project_path(path) {
+            project::load_project(path)?
+        } else {
+            io::load_document(path)?
+        };
         Ok(self.insert(document))
+    }
+
+    /// Writes the document to a `.gac` file, adopting its name and path, and
+    /// marks it saved.
+    pub fn save(&mut self, id: DocId, path: &Path) -> Result<(), ProjectError> {
+        let open = self
+            .document(id)
+            .ok_or_else(|| ProjectError::Manifest("no such document".to_owned()))?;
+        if open.stroke.is_some() || open.transform.is_some() {
+            return Err(ProjectError::Manifest(
+                "finish the current edit before saving".to_owned(),
+            ));
+        }
+        project::save_project(&open.document, path)?;
+        self.set_document_path(id, path);
+        self.mark_saved(id);
+        Ok(())
+    }
+
+    /// The `.gac` file a document was opened from or saved to, if any.
+    pub fn project_path(&self, id: DocId) -> Option<std::path::PathBuf> {
+        self.document(id)?
+            .document
+            .source_path
+            .clone()
+            .filter(|p| project::is_project_path(p))
+    }
+
+    /// Previews layer properties live (e.g. while dragging the opacity
+    /// slider) without recording history; finish with [`Self::commit_layer_props`].
+    pub fn preview_layer_props(&mut self, id: DocId, index: usize, props: &LayerProps) {
+        if let Some(open) = self.document_mut(id) {
+            if let Some(layer) = open.document.layer_mut(index) {
+                props.apply_to(layer);
+                let bounds = open.document.bounds();
+                open.repainted(Some(bounds));
+            }
+        }
+    }
+
+    /// Records the change from `before` to the layer's current properties as one step.
+    pub fn commit_layer_props(
+        &mut self,
+        id: DocId,
+        index: usize,
+        before: LayerProps,
+    ) -> Result<(), CommandError> {
+        let open = self
+            .document(id)
+            .ok_or_else(|| CommandError::Invalid("no such document".to_owned()))?;
+        let layer = open
+            .document
+            .layer(index)
+            .ok_or(CommandError::NoSuchLayer {
+                index,
+                len: open.document.layer_count(),
+            })?;
+        let after = LayerProps::of(layer);
+        if after == before {
+            return Ok(());
+        }
+        self.execute(
+            id,
+            Box::new(layers::SetLayerProps::new(index, before, after)),
+        )
+    }
+
+    /// Starts a transform session on the active layer (Free Transform or Move).
+    pub fn begin_transform(
+        &mut self,
+        id: DocId,
+        interpolation: Interpolation,
+    ) -> Result<(), CommandError> {
+        let open = self
+            .document_mut(id)
+            .ok_or_else(|| CommandError::Invalid("no such document".to_owned()))?;
+        open.cancel_stroke();
+        open.transform = Some(TransformSession::begin(
+            &open.document,
+            interpolation,
+            None,
+        )?);
+        Ok(())
+    }
+
+    /// Updates the in-progress transform.
+    pub fn update_transform(&mut self, id: DocId, affine: Affine) {
+        if let Some(open) = self.document_mut(id) {
+            if let Some(session) = &mut open.transform {
+                let rect = session.set_affine(&mut open.document, affine);
+                open.repainted(rect);
+                if open.document.selection().is_some() {
+                    open.selection_revision += 1;
+                }
+            }
+        }
+    }
+
+    /// Changes the in-progress transform's interpolation.
+    pub fn set_transform_interpolation(&mut self, id: DocId, interpolation: Interpolation) {
+        if let Some(open) = self.document_mut(id) {
+            if let Some(session) = &mut open.transform {
+                let rect = session.set_interpolation(&mut open.document, interpolation);
+                open.repainted(rect);
+            }
+        }
+    }
+
+    /// Records the in-progress transform as one step. Returns whether a step was added.
+    pub fn commit_transform(&mut self, id: DocId, label: &'static str) -> bool {
+        let Some(open) = self.document_mut(id) else {
+            return false;
+        };
+        let Some(session) = open.transform.take() else {
+            return false;
+        };
+        let Some(patch) = session.commit(&open.document, label) else {
+            return false;
+        };
+        match open.undo.execute(&mut open.document, Box::new(patch)) {
+            Ok(change) => {
+                open.changed(change);
+                open.selection_revision += 1;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Discards the in-progress transform, restoring the layer.
+    pub fn cancel_transform(&mut self, id: DocId) {
+        self.cancel_stroke(id);
+    }
+
+    /// Edit → Flip Horizontal / Vertical. Returns whether a step was added.
+    pub fn flip(&mut self, id: DocId, horizontal: bool) -> Result<bool, CommandError> {
+        let open = self
+            .document_mut(id)
+            .ok_or_else(|| CommandError::Invalid("no such document".to_owned()))?;
+        open.cancel_stroke();
+        match transform::flip(&mut open.document, horizontal)? {
+            Some(patch) => self.execute(id, Box::new(patch)).map(|()| true),
+            None => Ok(false),
+        }
     }
 
     /// Exports the current document. Returns `Ok(false)` when there is none.
@@ -242,8 +459,13 @@ impl AppState {
             .document_mut(id)
             .ok_or_else(|| CommandError::Invalid("no such document".to_owned()))?;
         open.cancel_stroke();
+        let layer = open.document.active_layer();
+        let (target, kind) = match open.edit_target {
+            EditTarget::Pixels => (PaintTarget::Pixels(layer), kind),
+            EditTarget::Mask => (PaintTarget::Mask(layer), kind.for_mask()),
+        };
         let (stroke, dirty) =
-            ActiveStroke::begin(&mut open.document, open.active_layer, kind, brush, start)?;
+            ActiveStroke::begin_on(&mut open.document, target, kind, brush, start)?;
         open.stroke = Some(stroke);
         open.repainted(dirty);
         Ok(())
@@ -299,13 +521,55 @@ impl AppState {
         }
     }
 
-    /// Sets the layer edits target. Out-of-range indices are ignored.
+    /// Sets the layer edits target (its pixels). Out-of-range indices are ignored.
     pub fn set_active_layer(&mut self, id: DocId, index: usize) {
         if let Some(open) = self.document_mut(id) {
-            if index < open.document.layer_count() {
-                open.active_layer = index;
+            if index < open.document.layer_count() && index != open.document.active_layer() {
+                open.cancel_stroke();
+                open.document.set_active_layer(index);
+                open.edit_target = EditTarget::Pixels;
+                open.target_layer = index;
             }
         }
+    }
+
+    /// Chooses pixels or mask of the active layer as the edit target
+    /// (mask only if the layer has one).
+    pub fn set_edit_target(&mut self, id: DocId, target: EditTarget) {
+        if let Some(open) = self.document_mut(id) {
+            open.cancel_stroke();
+            open.edit_target = target;
+            open.target_layer = open.document.active_layer();
+            open.normalize_target();
+        }
+    }
+
+    /// Records the current state as saved (clean).
+    pub fn mark_saved(&mut self, id: DocId) {
+        if let Some(open) = self.document_mut(id) {
+            open.saved_state = open.undo.state_id();
+        }
+    }
+
+    /// Updates a document's name and file path (after Save As).
+    pub fn set_document_path(&mut self, id: DocId, path: &Path) {
+        if let Some(open) = self.document_mut(id) {
+            open.document.source_path = Some(path.to_path_buf());
+            open.document.name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| open.document.name.clone());
+            open.revision += 1;
+        }
+    }
+
+    /// Ids of documents with unsaved changes, in open order.
+    pub fn dirty_documents(&self) -> Vec<DocId> {
+        self.documents
+            .iter()
+            .filter(|d| d.is_dirty())
+            .map(|d| d.id)
+            .collect()
     }
 
     /// Returns and clears the regions changed since the last call.
@@ -328,7 +592,7 @@ impl AppState {
                         index,
                         name: layer.name.clone(),
                         visible: layer.visible,
-                        active: index == open.active_layer,
+                        active: index == open.document.active_layer(),
                     })
                     .collect()
             })
@@ -584,5 +848,255 @@ mod tests {
         state.cancel_all_strokes();
         assert!(!state.document(a).unwrap().is_stroking());
         assert_eq!(state.document(a).unwrap().undo_stack().undo_len(), 0);
+    }
+
+    #[test]
+    fn dirty_tracking_follows_saved_state() {
+        let mut state = AppState::new();
+        let a = state.new_document(4, 4, 72.0).unwrap();
+        assert!(
+            !state.document(a).unwrap().is_dirty(),
+            "new documents start clean"
+        );
+        state
+            .execute(a, Box::new(FillLayer::new(0, [1, 2, 3, 255])))
+            .unwrap();
+        assert!(state.document(a).unwrap().is_dirty());
+        assert_eq!(state.dirty_documents(), vec![a]);
+        state.undo(a);
+        assert!(
+            !state.document(a).unwrap().is_dirty(),
+            "undo back to the saved state"
+        );
+        state.redo(a);
+        state.mark_saved(a);
+        assert!(!state.document(a).unwrap().is_dirty());
+        state.undo(a);
+        assert!(state.document(a).unwrap().is_dirty());
+    }
+
+    #[test]
+    fn save_and_open_project_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scene.gac");
+        let mut state = AppState::new();
+        let a = state.new_document(6, 4, 96.0).unwrap();
+        add(&mut state, a, Layer::transparent("Top", 6, 4));
+        state
+            .execute(a, Box::new(FillLayer::new(1, [9, 9, 9, 200])))
+            .unwrap();
+        assert!(state.project_path(a).is_none());
+        state.save(a, &path).unwrap();
+        let open = state.document(a).unwrap();
+        assert!(!open.is_dirty());
+        assert_eq!(open.document.name, "scene.gac");
+        assert_eq!(state.project_path(a).as_deref(), Some(path.as_path()));
+        let saved = state.document(a).unwrap().document.clone();
+        let b = state.open(&path).unwrap();
+        let reopened = &state.document(b).unwrap().document;
+        assert_eq!(reopened.layers(), saved.layers());
+        assert_eq!(reopened.active_layer(), saved.active_layer());
+        assert!(!state.document(b).unwrap().is_dirty());
+        let bad = dir.path().join("bad.gac");
+        std::fs::write(&bad, b"nope").unwrap();
+        assert!(matches!(state.open(&bad), Err(OpenError::Project(_))));
+    }
+
+    #[test]
+    fn transform_sessions_commit_cancel_and_yield_to_undo() {
+        let mut state = AppState::new();
+        let a = state.new_document(10, 10, 72.0).unwrap();
+        state
+            .execute(a, Box::new(FillLayer::new(0, [255, 0, 0, 255])))
+            .unwrap();
+        let filled = state.document(a).unwrap().document.clone();
+        state.begin_transform(a, Interpolation::Nearest).unwrap();
+        let mut affine = state.document(a).unwrap().transform().unwrap().affine();
+        affine.translate = (3.0, 0.0);
+        state.update_transform(a, affine);
+        assert!(state.document(a).unwrap().is_dirty());
+        assert_eq!(
+            state
+                .document(a)
+                .unwrap()
+                .document
+                .layer(0)
+                .unwrap()
+                .pixels
+                .get_pixel(1, 1)[3],
+            0
+        );
+        state.cancel_transform(a);
+        assert_eq!(state.document(a).unwrap().document, filled);
+
+        state.begin_transform(a, Interpolation::Nearest).unwrap();
+        state.update_transform(a, affine);
+        assert!(state.commit_transform(a, "Move"));
+        assert_eq!(
+            state.document(a).unwrap().undo_stack().undo_label(),
+            Some("Move")
+        );
+        state.undo(a);
+        assert_eq!(state.document(a).unwrap().document, filled);
+
+        // Undo during a session cancels it first.
+        state.begin_transform(a, Interpolation::Nearest).unwrap();
+        state.update_transform(a, affine);
+        state.undo(a);
+        assert!(state.document(a).unwrap().transform().is_none());
+        assert!(state
+            .document(a)
+            .unwrap()
+            .document
+            .layer(0)
+            .unwrap()
+            .pixels
+            .pixels()
+            .all(|p| p[3] == 0));
+    }
+
+    #[test]
+    fn flip_and_live_layer_props_record_one_step_each() {
+        let mut state = AppState::new();
+        let a = state.new_document(4, 1, 72.0).unwrap();
+        state
+            .execute(a, Box::new(FillLayer::new(0, [255, 255, 255, 255])))
+            .unwrap();
+        let steps = state.document(a).unwrap().undo_stack().undo_len();
+        // A symmetric layer does not change when flipped.
+        assert!(!state.flip(a, true).unwrap());
+        state
+            .begin_stroke(
+                a,
+                StrokeKind::Brush {
+                    color: [0, 0, 0, 255],
+                },
+                BrushSettings {
+                    size: 1.0,
+                    pixel: true,
+                    ..Default::default()
+                },
+                (0.5, 0.5),
+            )
+            .unwrap();
+        state.end_stroke(a);
+        let steps = steps + 1;
+        assert!(state.flip(a, true).unwrap());
+        assert_eq!(
+            state
+                .document(a)
+                .unwrap()
+                .document
+                .layer(0)
+                .unwrap()
+                .pixels
+                .get_pixel(3, 0)[0],
+            0
+        );
+        assert_eq!(
+            state.document(a).unwrap().undo_stack().undo_label(),
+            Some("Flip Horizontal")
+        );
+
+        let before = LayerProps::of(state.document(a).unwrap().document.layer(0).unwrap());
+        for opacity in [0.9, 0.6, 0.3] {
+            let mut p = before.clone();
+            p.opacity = opacity;
+            state.preview_layer_props(a, 0, &p);
+        }
+        assert_eq!(
+            state.document(a).unwrap().undo_stack().undo_len(),
+            steps + 1,
+            "previews not recorded"
+        );
+        state.commit_layer_props(a, 0, before.clone()).unwrap();
+        let open = state.document(a).unwrap();
+        assert_eq!(open.undo_stack().undo_len(), steps + 2);
+        assert_eq!(open.undo_stack().undo_label(), Some("Layer Opacity"));
+        assert_eq!(open.document.layer(0).unwrap().opacity(), 0.3);
+        state.undo(a);
+        assert_eq!(
+            state
+                .document(a)
+                .unwrap()
+                .document
+                .layer(0)
+                .unwrap()
+                .opacity(),
+            1.0
+        );
+    }
+
+    #[test]
+    fn mask_edit_target_falls_back_to_pixels() {
+        let mut state = AppState::new();
+        let a = state.new_document(4, 4, 72.0).unwrap();
+        state.set_edit_target(a, EditTarget::Mask);
+        assert_eq!(
+            state.document(a).unwrap().edit_target(),
+            EditTarget::Pixels,
+            "no mask yet"
+        );
+        let cmd = layers::add_mask(&state.document(a).unwrap().document, false).unwrap();
+        state.execute(a, Box::new(cmd)).unwrap();
+        state.set_edit_target(a, EditTarget::Mask);
+        assert_eq!(
+            state.document(a).unwrap().paint_target(),
+            PaintTarget::Mask(0)
+        );
+        // A brush stroke on the mask paints gray and leaves pixels alone.
+        let pixels = state
+            .document(a)
+            .unwrap()
+            .document
+            .layer(0)
+            .unwrap()
+            .pixels
+            .clone();
+        state
+            .begin_stroke(
+                a,
+                StrokeKind::Brush {
+                    color: [0, 0, 0, 255],
+                },
+                BrushSettings::default(),
+                (2.0, 2.0),
+            )
+            .unwrap();
+        state.end_stroke(a);
+        let layer = state
+            .document(a)
+            .unwrap()
+            .document
+            .layer(0)
+            .unwrap()
+            .clone();
+        assert_eq!(layer.pixels, pixels);
+        assert_eq!(layer.mask().unwrap().get_pixel(2, 2)[0], 0);
+        state.undo(a);
+        state.undo(a);
+        assert_eq!(
+            state.document(a).unwrap().edit_target(),
+            EditTarget::Pixels,
+            "mask removed"
+        );
+    }
+
+    #[test]
+    fn edit_target_returns_to_pixels_when_active_layer_changes() {
+        let mut state = AppState::new();
+        let a = state.new_document(4, 4, 72.0).unwrap();
+        let cmd = layers::add_mask(&state.document(a).unwrap().document, false).unwrap();
+        state.execute(a, Box::new(cmd)).unwrap();
+        state.set_edit_target(a, EditTarget::Mask);
+        // Duplicate makes the (masked) copy active: editing goes back to pixels.
+        let dup = layers::duplicate_layer(&state.document(a).unwrap().document).unwrap();
+        state.execute(a, Box::new(dup)).unwrap();
+        assert_eq!(state.document(a).unwrap().active_layer(), 1);
+        assert_eq!(state.document(a).unwrap().edit_target(), EditTarget::Pixels);
+        state.set_edit_target(a, EditTarget::Mask);
+        // Undo of the duplicate changes the active layer too.
+        state.undo(a);
+        assert_eq!(state.document(a).unwrap().edit_target(), EditTarget::Pixels);
     }
 }

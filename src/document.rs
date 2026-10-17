@@ -26,6 +26,15 @@ pub enum DocumentError {
     #[error("layer index {index} is out of range (layer count {len})")]
     IndexOutOfRange { index: usize, len: usize },
     #[error(
+        "layer mask is {mask_width}x{mask_height} but the layer is {layer_width}x{layer_height}"
+    )]
+    MaskSizeMismatch {
+        mask_width: u32,
+        mask_height: u32,
+        layer_width: u32,
+        layer_height: u32,
+    },
+    #[error(
         "selection mask is {mask_width}x{mask_height} but the document is {doc_width}x{doc_height}"
     )]
     SelectionSizeMismatch {
@@ -77,12 +86,90 @@ impl PixelRect {
     }
 }
 
+/// How a layer combines with the layers below it (W3C Compositing and Blending).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum BlendMode {
+    #[default]
+    Normal,
+    Multiply,
+    Screen,
+    Overlay,
+    Add,
+    Darken,
+    Lighten,
+}
+
+impl BlendMode {
+    pub const ALL: [BlendMode; 7] = [
+        Self::Normal,
+        Self::Multiply,
+        Self::Screen,
+        Self::Overlay,
+        Self::Add,
+        Self::Darken,
+        Self::Lighten,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal",
+            Self::Multiply => "Multiply",
+            Self::Screen => "Screen",
+            Self::Overlay => "Overlay",
+            Self::Add => "Add",
+            Self::Darken => "Darken",
+            Self::Lighten => "Lighten",
+        }
+    }
+
+    /// Identifier used in project files.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Multiply => "multiply",
+            Self::Screen => "screen",
+            Self::Overlay => "overlay",
+            Self::Add => "add",
+            Self::Darken => "darken",
+            Self::Lighten => "lighten",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|m| m.key() == key)
+    }
+
+    /// The separable blend function `B(Cb, Cs)` on unpremultiplied values in [0, 1].
+    pub fn blend(self, cb: f32, cs: f32) -> f32 {
+        let screen = |b: f32, s: f32| b + s - b * s;
+        match self {
+            Self::Normal => cs,
+            Self::Multiply => cs * cb,
+            Self::Screen => screen(cb, cs),
+            Self::Overlay => {
+                if cb <= 0.5 {
+                    2.0 * cs * cb
+                } else {
+                    screen(cs, 2.0 * cb - 1.0)
+                }
+            }
+            Self::Add => (cb + cs).min(1.0),
+            Self::Darken => cb.min(cs),
+            Self::Lighten => cb.max(cs),
+        }
+    }
+}
+
 /// A single raster layer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Layer {
     pub name: String,
     pub visible: bool,
     opacity: f32,
+    pub blend_mode: BlendMode,
+    mask: Option<GrayImage>,
+    /// A disabled mask is kept but ignored when compositing.
+    pub mask_enabled: bool,
     pub pixels: RgbaImage,
 }
 
@@ -92,7 +179,43 @@ impl Layer {
             name: name.into(),
             visible: true,
             opacity: 1.0,
+            blend_mode: BlendMode::Normal,
+            mask: None,
+            mask_enabled: true,
             pixels,
+        }
+    }
+
+    /// The layer mask (0 hides, 255 shows), if any.
+    pub fn mask(&self) -> Option<&GrayImage> {
+        self.mask.as_ref()
+    }
+
+    pub fn mask_mut(&mut self) -> Option<&mut GrayImage> {
+        self.mask.as_mut()
+    }
+
+    /// Sets or removes the mask; a mask of the wrong size is rejected.
+    pub fn set_mask(&mut self, mask: Option<GrayImage>) -> Result<(), DocumentError> {
+        if let Some(m) = &mask {
+            if m.dimensions() != self.pixels.dimensions() {
+                return Err(DocumentError::MaskSizeMismatch {
+                    mask_width: m.width(),
+                    mask_height: m.height(),
+                    layer_width: self.width(),
+                    layer_height: self.height(),
+                });
+            }
+        }
+        self.mask = mask;
+        Ok(())
+    }
+
+    /// The mask value applied at a pixel (255 without an enabled mask).
+    pub fn mask_at(&self, x: u32, y: u32) -> u8 {
+        match (&self.mask, self.mask_enabled) {
+            (Some(m), true) => m.get_pixel(x, y)[0],
+            _ => 255,
         }
     }
 
@@ -134,6 +257,8 @@ pub struct Document {
     layers: Vec<Layer>,
     /// 8-bit selection mask; `None` means no selection (edits apply everywhere).
     selection: Option<GrayImage>,
+    /// Index of the layer edits target (bottom = 0).
+    active_layer: usize,
 }
 
 impl Document {
@@ -156,6 +281,7 @@ impl Document {
             dpi,
             layers: Vec::new(),
             selection: None,
+            active_layer: 0,
         })
     }
 
@@ -186,6 +312,32 @@ impl Document {
     pub fn set_dpi(&mut self, dpi: f64) -> Result<(), DocumentError> {
         validate_dpi(dpi)?;
         self.dpi = dpi;
+        Ok(())
+    }
+
+    /// Index (bottom = 0) of the layer edits target.
+    pub fn active_layer(&self) -> usize {
+        self.active_layer.min(self.layers.len().saturating_sub(1))
+    }
+
+    /// Sets the active layer; out-of-range indices are ignored.
+    pub fn set_active_layer(&mut self, index: usize) {
+        if index < self.layers.len() {
+            self.active_layer = index;
+        }
+    }
+
+    /// Replaces the whole layer stack (sizes are checked) and sets the active layer.
+    pub fn replace_layers(
+        &mut self,
+        layers: Vec<Layer>,
+        active: usize,
+    ) -> Result<(), DocumentError> {
+        for layer in &layers {
+            self.check_layer_size(layer)?;
+        }
+        self.layers = layers;
+        self.active_layer = active.min(self.layers.len().saturating_sub(1));
         Ok(())
     }
 
@@ -265,7 +417,9 @@ impl Document {
 
     pub fn remove_layer(&mut self, index: usize) -> Result<Layer, DocumentError> {
         self.check_index(index)?;
-        Ok(self.layers.remove(index))
+        let removed = self.layers.remove(index);
+        self.active_layer = self.active_layer.min(self.layers.len().saturating_sub(1));
+        Ok(removed)
     }
 
     /// Moves the layer at `from` so it ends up at index `to`, keeping the
@@ -298,11 +452,7 @@ impl Document {
         let rect = rect.intersect(self.bounds()).unwrap_or_default();
         let mut out = RgbaImage::new(rect.width, rect.height);
         for layer in self.layers.iter().filter(|l| l.visible && l.opacity > 0.0) {
-            let opacity = layer.opacity;
-            for (x, y, dst) in out.enumerate_pixels_mut() {
-                let src = *layer.pixels.get_pixel(rect.x + x, rect.y + y);
-                *dst = blend_over(*dst, src, opacity);
-            }
+            composite_layer_onto(&mut out, layer, rect);
         }
         out
     }
@@ -336,6 +486,48 @@ fn validate_dpi(dpi: f64) -> Result<(), DocumentError> {
     } else {
         Err(DocumentError::InvalidDpi(dpi))
     }
+}
+
+/// Composites `layer` (its blend mode, opacity, and enabled mask) onto `out`,
+/// which holds the region `rect` of the document.
+pub fn composite_layer_onto(out: &mut RgbaImage, layer: &Layer, rect: PixelRect) {
+    let opacity = layer.opacity;
+    let use_mask = layer.mask_enabled && layer.mask.is_some();
+    for (x, y, dst) in out.enumerate_pixels_mut() {
+        let (lx, ly) = (rect.x + x, rect.y + y);
+        let src = *layer.pixels.get_pixel(lx, ly);
+        let factor = if use_mask {
+            opacity * layer.mask_at(lx, ly) as f32 / 255.0
+        } else {
+            opacity
+        };
+        *dst = blend_pixel(*dst, src, layer.blend_mode, factor);
+    }
+}
+
+/// Composites `src` (alpha scaled by `opacity`) onto `dst` with `mode`:
+/// `Cs' = (1 − αb)·Cs + αb·B(Cb, Cs)`, then source-over.
+pub fn blend_pixel(dst: Rgba<u8>, src: Rgba<u8>, mode: BlendMode, opacity: f32) -> Rgba<u8> {
+    if mode == BlendMode::Normal || dst[3] == 0 {
+        // Normal, or nothing underneath (B is irrelevant when αb = 0).
+        return blend_over(dst, src, opacity);
+    }
+    let src_a = src[3] as f32 / 255.0 * opacity;
+    if src_a <= 0.0 {
+        return dst;
+    }
+    let dst_a = dst[3] as f32 / 255.0;
+    let out_a = src_a + dst_a * (1.0 - src_a);
+    let mut out = [0u8; 4];
+    for c in 0..3 {
+        let cb = dst[c] as f32 / 255.0;
+        let cs = src[c] as f32 / 255.0;
+        let mixed = (1.0 - dst_a) * cs + dst_a * mode.blend(cb, cs);
+        let value = (src_a * mixed + dst_a * cb * (1.0 - src_a)) / out_a;
+        out[c] = to_u8(value * 255.0);
+    }
+    out[3] = to_u8(out_a * 255.0);
+    Rgba(out)
 }
 
 /// Source-over compositing of `src` (alpha scaled by `opacity`) onto `dst`.
@@ -611,6 +803,148 @@ mod tests {
         doc.set_selection(Some(crate::selection::select_all(4, 3)))
             .unwrap();
         assert!(doc.composite().pixels().all(|p| p.0 == [0; 4]));
+    }
+
+    /// Independent f64 reference of the W3C formulas.
+    fn reference(dst: [u8; 4], src: [u8; 4], mode: BlendMode, opacity: f64) -> [u8; 4] {
+        let ab = dst[3] as f64 / 255.0;
+        let as_ = src[3] as f64 / 255.0 * opacity;
+        if ab == 0.0 {
+            return [src[0], src[1], src[2], (as_ * 255.0).round() as u8];
+        }
+        let ao = as_ + ab * (1.0 - as_);
+        let mut out = [0u8; 4];
+        for c in 0..3 {
+            let cb = dst[c] as f64 / 255.0;
+            let cs = src[c] as f64 / 255.0;
+            let b = match mode {
+                BlendMode::Normal => cs,
+                BlendMode::Multiply => cb * cs,
+                BlendMode::Screen => cb + cs - cb * cs,
+                BlendMode::Overlay => {
+                    if cb <= 0.5 {
+                        2.0 * cb * cs
+                    } else {
+                        let s2 = 2.0 * cb - 1.0;
+                        cs + s2 - cs * s2
+                    }
+                }
+                BlendMode::Add => (cb + cs).min(1.0),
+                BlendMode::Darken => cb.min(cs),
+                BlendMode::Lighten => cb.max(cs),
+            };
+            let mixed = (1.0 - ab) * cs + ab * b;
+            let co = (as_ * mixed + ab * cb * (1.0 - as_)) / ao;
+            out[c] = (co * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+        out[3] = (ao * 255.0).round() as u8;
+        out
+    }
+
+    #[test]
+    fn blend_modes_match_reference_formulas() {
+        let values = [0u8, 1, 37, 64, 127, 128, 200, 254, 255];
+        let alphas = [0u8, 1, 64, 128, 200, 255];
+        let mut checked = 0;
+        for mode in BlendMode::ALL {
+            for &b in &values {
+                for &s in &values {
+                    for &ab in &alphas {
+                        for &as_ in &alphas {
+                            for opacity in [1.0, 0.5] {
+                                let dst = [b, 255 - b, b / 2, ab];
+                                let src = [s, s / 3, 255 - s, as_];
+                                let got = blend_pixel(Rgba(dst), Rgba(src), mode, opacity as f32).0;
+                                if as_ == 0 && ab > 0 {
+                                    assert_eq!(got, dst);
+                                    continue;
+                                }
+                                let want = reference(dst, src, mode, opacity);
+                                for c in 0..4 {
+                                    assert!(
+                                        got[c].abs_diff(want[c]) <= 1,
+                                        "{mode:?} dst {dst:?} src {src:?} op {opacity}: {got:?} vs {want:?}"
+                                    );
+                                }
+                                checked += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 20_000, "{checked}");
+    }
+
+    #[test]
+    fn known_blend_values_on_opaque_backdrop() {
+        let gray = Rgba([128, 128, 128, 255]);
+        let white = Rgba([255, 255, 255, 255]);
+        let black = Rgba([0, 0, 0, 255]);
+        let red = Rgba([255, 0, 0, 255]);
+        assert_eq!(blend_pixel(white, red, BlendMode::Multiply, 1.0), red);
+        assert_eq!(blend_pixel(black, red, BlendMode::Screen, 1.0), red);
+        assert_eq!(blend_pixel(gray, gray, BlendMode::Add, 1.0).0[0], 255);
+        assert_eq!(blend_pixel(gray, white, BlendMode::Darken, 1.0), gray);
+        assert_eq!(blend_pixel(gray, black, BlendMode::Lighten, 1.0), gray);
+        // Overlay keeps black and white backdrops.
+        assert_eq!(blend_pixel(black, gray, BlendMode::Overlay, 1.0), black);
+        assert_eq!(blend_pixel(white, gray, BlendMode::Overlay, 1.0), white);
+        for mode in BlendMode::ALL {
+            assert_eq!(BlendMode::from_key(mode.key()), Some(mode));
+        }
+        assert_eq!(BlendMode::from_key("dissolve"), None);
+    }
+
+    #[test]
+    fn composite_uses_blend_mode_and_enabled_mask() {
+        let mut doc = Document::new("x", 2, 1, 72.0).unwrap();
+        doc.add_layer(Layer::new("white", solid(2, 1, [255, 255, 255, 255])))
+            .unwrap();
+        let mut top = Layer::new("red", solid(2, 1, [255, 0, 0, 255]));
+        top.blend_mode = BlendMode::Multiply;
+        let mut mask = GrayImage::new(2, 1);
+        mask.put_pixel(0, 0, image::Luma([255]));
+        top.set_mask(Some(mask)).unwrap();
+        doc.add_layer(top).unwrap();
+        let c = doc.composite();
+        assert_eq!(
+            c.get_pixel(0, 0).0,
+            [255, 0, 0, 255],
+            "multiplied where mask shows"
+        );
+        assert_eq!(c.get_pixel(1, 0).0, [255, 255, 255, 255], "hidden by mask");
+        doc.layer_mut(1).unwrap().mask_enabled = false;
+        assert_eq!(
+            doc.composite().get_pixel(1, 0).0,
+            [255, 0, 0, 255],
+            "disabled mask ignored"
+        );
+        assert!(doc
+            .layer_mut(1)
+            .unwrap()
+            .set_mask(Some(GrayImage::new(3, 3)))
+            .is_err());
+    }
+
+    #[test]
+    fn active_layer_is_kept_in_range() {
+        let mut doc = Document::new("x", 1, 1, 72.0).unwrap();
+        for name in ["a", "b", "c"] {
+            doc.add_layer(Layer::transparent(name, 1, 1)).unwrap();
+        }
+        doc.set_active_layer(2);
+        assert_eq!(doc.active_layer(), 2);
+        doc.set_active_layer(9);
+        assert_eq!(doc.active_layer(), 2);
+        doc.remove_layer(2).unwrap();
+        assert_eq!(doc.active_layer(), 1);
+        doc.replace_layers(vec![Layer::transparent("z", 1, 1)], 5)
+            .unwrap();
+        assert_eq!(doc.active_layer(), 0);
+        assert!(doc
+            .replace_layers(vec![Layer::transparent("bad", 2, 2)], 0)
+            .is_err());
     }
 
     #[test]

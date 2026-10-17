@@ -14,6 +14,7 @@ use crate::app_state::OpenDocument;
 use crate::document::{Document, PixelRect};
 use crate::selection::{self, CombineMode, Segment};
 use crate::tools::{SelectionRequest, SelectionShape, Tool, ToolOptions};
+use crate::transform::{self, Affine, Handle};
 
 /// Something the active tool asks the application to do.
 #[derive(Debug, Clone, PartialEq)]
@@ -39,6 +40,28 @@ pub enum CanvasEvent {
         start: (f32, f32),
         end: (f32, f32),
     },
+    /// Move tool drag (image coordinates).
+    MoveBegin((f32, f32)),
+    MoveDrag((f32, f32)),
+    MoveEnd,
+    /// Free Transform: a handle (or the box) was grabbed / dragged / released.
+    TransformGrab {
+        handle: Handle,
+        point: (f32, f32),
+        shift: bool,
+    },
+    TransformDrag {
+        point: (f32, f32),
+        shift: bool,
+    },
+    TransformRelease,
+}
+
+/// The Free Transform box to draw and interact with.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TransformBox {
+    pub affine: Affine,
+    pub bounds: PixelRect,
 }
 use image::{Rgba, RgbaImage};
 
@@ -514,6 +537,8 @@ pub struct CanvasState {
     panning: bool,
     rect: Option<Rect>,
     gesture: Option<Gesture>,
+    /// Free Transform handle being dragged, with the image point it was grabbed at.
+    transform_grab: Option<(Handle, (f32, f32))>,
     /// A paint stroke (or eyedropper drag) is in progress.
     painting: bool,
     clone_source: Option<Pos2>,
@@ -532,6 +557,7 @@ impl CanvasState {
             panning: false,
             rect: None,
             gesture: None,
+            transform_grab: None,
             painting: false,
             clone_source: None,
             clone_offset: None,
@@ -542,6 +568,7 @@ impl CanvasState {
     /// Abandons any selection gesture in progress (e.g. an open polygon).
     pub fn cancel_gesture(&mut self) {
         self.gesture = None;
+        self.transform_grab = None;
         self.painting = false;
     }
 
@@ -643,6 +670,7 @@ impl CanvasState {
         show_grid: bool,
         tool: Tool,
         options: &ToolOptions,
+        transform_box: Option<TransformBox>,
     ) -> Vec<CanvasEvent> {
         let doc = &open.document;
         let image = [doc.width(), doc.height()];
@@ -700,7 +728,11 @@ impl CanvasState {
         self.view = Some(view);
 
         let mut events = Vec::new();
-        if !(self.panning || space_down) || self.painting {
+        if let Some(tb) = transform_box {
+            if !(self.panning || space_down) {
+                events = self.run_transform(ui, &response, rect, &view, ppp, tb);
+            }
+        } else if !(self.panning || space_down) || self.painting {
             if tool.is_selection_tool() {
                 if let Some(request) =
                     self.run_tool(ui, &response, rect, &view, ppp, image, tool, options)
@@ -717,8 +749,35 @@ impl CanvasState {
             .is_some_and(|p| {
                 p.x >= 0.0 && p.y >= 0.0 && p.x < image[0] as f32 && p.y < image[1] as f32
             });
-        let brush_cursor = tool.is_brush_tool() && hovered && !self.panning && !space_down;
-        if brush_cursor {
+        let brush_cursor = transform_box.is_none()
+            && tool.is_brush_tool()
+            && hovered
+            && !self.panning
+            && !space_down;
+        let interacting = hovered && !self.panning && !space_down;
+        if let (Some(tb), true, Some(p)) = (transform_box, interacting, pointer) {
+            let image_point = view.view_to_image((p - rect.min).to_pos2(), ppp);
+            let tolerance = 6.0 / view.points_per_pixel(ppp);
+            let handle = self.transform_grab.map(|(h, _)| h).or_else(|| {
+                transform::hit_test(
+                    &tb.affine,
+                    tb.bounds,
+                    (image_point.x, image_point.y),
+                    tolerance,
+                )
+            });
+            ui.ctx().set_cursor_icon(match handle {
+                Some(Handle::Move) => CursorIcon::Move,
+                Some(Handle::Scale(0, _)) => CursorIcon::ResizeVertical,
+                Some(Handle::Scale(_, 0)) => CursorIcon::ResizeHorizontal,
+                Some(Handle::Scale(a, b)) if a == b => CursorIcon::ResizeNwSe,
+                Some(Handle::Scale(_, _)) => CursorIcon::ResizeNeSw,
+                Some(Handle::Rotate) => CursorIcon::Alias,
+                None => CursorIcon::Default,
+            });
+        } else if transform_box.is_none() && tool == Tool::Move && interacting {
+            ui.ctx().set_cursor_icon(CursorIcon::Move);
+        } else if brush_cursor {
             ui.ctx().set_cursor_icon(CursorIcon::None);
         } else if over_image && !self.panning && !space_down {
             ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
@@ -871,6 +930,34 @@ impl CanvasState {
             }
             None => {}
         }
+        // Free Transform box with handles and center marker.
+        if let Some(tb) = transform_box {
+            let corners: Vec<Pos2> = tb
+                .affine
+                .corners(tb.bounds)
+                .iter()
+                .map(|c| to_screen(Pos2::new(c.0, c.1)))
+                .collect();
+            let mut outline = corners.clone();
+            outline.push(corners[0]);
+            shapes.push(Shape::line(
+                outline.clone(),
+                Stroke::new(3.0, Color32::WHITE),
+            ));
+            shapes.push(Shape::line(outline, Stroke::new(1.0, Color32::BLACK)));
+            for (_, p) in transform::handle_points(&tb.affine, tb.bounds) {
+                let r = Rect::from_center_size(to_screen(Pos2::new(p.0, p.1)), Vec2::splat(8.0));
+                shapes.push(Shape::rect_filled(r, 0.0, Color32::WHITE));
+                shapes.push(Shape::rect_stroke(
+                    r,
+                    0.0,
+                    Stroke::new(1.0, Color32::BLACK),
+                    egui::StrokeKind::Inside,
+                ));
+            }
+            let center = tb.affine.map(tb.affine.pivot);
+            cross(&mut shapes, to_screen(Pos2::new(center.0, center.1)), 4.0);
+        }
         // Gradient start→end preview.
         if let Some(Gesture::Drag {
             tool: Tool::Gradient,
@@ -927,6 +1014,59 @@ impl CanvasState {
         if doc.selection().is_some() || self.gesture.is_some() {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(40));
+        }
+        events
+    }
+
+    /// Feeds pointer input to the Free Transform box.
+    #[allow(clippy::too_many_arguments)]
+    fn run_transform(
+        &mut self,
+        ui: &mut egui::Ui,
+        response: &egui::Response,
+        rect: Rect,
+        view: &ViewState,
+        ppp: f32,
+        tb: TransformBox,
+    ) -> Vec<CanvasEvent> {
+        let to_image = |screen: Pos2| {
+            let p = view.view_to_image((screen - rect.min).to_pos2(), ppp);
+            (p.x, p.y)
+        };
+        let (pressed, down, shift, press_origin, pointer) = ui.input(|i| {
+            (
+                i.pointer.primary_pressed(),
+                i.pointer.primary_down(),
+                i.modifiers.shift,
+                i.pointer.press_origin(),
+                i.pointer.interact_pos(),
+            )
+        });
+        let mut events = Vec::new();
+        if pressed && response.contains_pointer() {
+            if let Some(origin) = press_origin.or(pointer) {
+                let point = to_image(origin);
+                let tolerance = 6.0 / view.points_per_pixel(ppp);
+                if let Some(handle) = transform::hit_test(&tb.affine, tb.bounds, point, tolerance) {
+                    self.transform_grab = Some((handle, point));
+                    events.push(CanvasEvent::TransformGrab {
+                        handle,
+                        point,
+                        shift,
+                    });
+                }
+            }
+        } else if self.transform_grab.is_some() {
+            if let Some(p) = pointer {
+                events.push(CanvasEvent::TransformDrag {
+                    point: to_image(p),
+                    shift,
+                });
+            }
+            if !down {
+                self.transform_grab = None;
+                events.push(CanvasEvent::TransformRelease);
+            }
         }
         events
     }
@@ -1013,6 +1153,21 @@ impl CanvasState {
                     }
                     if !down {
                         events.push(CanvasEvent::StrokeEnd);
+                        self.painting = false;
+                    }
+                }
+            }
+            Tool::Move => {
+                if pressed_here {
+                    let start = to_image(press_origin.or(pointer).unwrap_or(rect.center()));
+                    events.push(CanvasEvent::MoveBegin(start));
+                    self.painting = true;
+                } else if self.painting {
+                    if let Some(p) = pointer {
+                        events.push(CanvasEvent::MoveDrag(to_image(p)));
+                    }
+                    if !down {
+                        events.push(CanvasEvent::MoveEnd);
                         self.painting = false;
                     }
                 }

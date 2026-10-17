@@ -7,15 +7,21 @@ use egui::{Key, KeyboardShortcut, Modifiers, TextureHandle};
 use egui_dock::tab_viewer::OnCloseResponse;
 use egui_dock::{DockArea, DockState, NodeIndex, TabViewer};
 
-use crate::app_state::{AppState, DocId};
-use crate::canvas::CanvasEvent;
+use crate::app_state::{AppState, DocId, EditTarget};
 use crate::canvas::{self, CanvasState, ViewAction};
+use crate::canvas::{CanvasEvent, TransformBox};
 use crate::document::DEFAULT_DPI;
 use crate::io::FileFormat;
-use crate::paint::{self, BucketFill, GradientColors, GradientFill, GradientKind, StrokeKind};
+use crate::layers::{self, LayerProps};
+use crate::layers_panel::{layers_panel, LayerAction, LayerOp};
+use crate::paint::{
+    self, mask_gray, BucketFill, GradientColors, GradientFill, GradientKind, StrokeKind,
+};
+use crate::project;
 use crate::selection::{self, CombineMode};
 use crate::tools::{self, Colors, SelectionRequest, Tool, ToolOptions};
-use crate::undo::{FillLayer, SetSelection};
+use crate::transform::{self, Affine, Handle, Interpolation};
+use crate::undo::{Command, FillLayer, PaintTarget, SetSelection};
 
 pub const APP_TITLE: &str = "Game Asset Creator";
 
@@ -41,7 +47,19 @@ const SHORTCUT_ACTUAL_SIZE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::
 /// Fill color used before the user picks one.
 pub const DEFAULT_FILL_COLOR: [u8; 4] = [0, 0, 0, 255];
 
-const PLACEHOLDER_TOOLS: [&str; 1] = ["Move"];
+const SHORTCUT_SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
+const SHORTCUT_SAVE_AS: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::S);
+const SHORTCUT_NEW_LAYER: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::N);
+const SHORTCUT_DUPLICATE_LAYER: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::COMMAND, Key::J);
+const SHORTCUT_MERGE_DOWN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::E);
+const SHORTCUT_LAYER_UP: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::COMMAND, Key::CloseBracket);
+const SHORTCUT_LAYER_DOWN: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::COMMAND, Key::OpenBracket);
+const SHORTCUT_FREE_TRANSFORM: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::T);
 /// Shown when painting with the Clone Stamp before choosing a source.
 pub const CLONE_SOURCE_HINT: &str = "Option/Alt-click to set a Clone Stamp source";
 const SHORTCUT_SELECT_ALL: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::A);
@@ -180,6 +198,31 @@ enum Action {
     ResetColors,
     BrushSize { grow: bool },
     SetPanelOpen(Panel, bool),
+    Save,
+    SaveAs,
+    Layer(LayerOp),
+    FreeTransform,
+    Flip { horizontal: bool },
+    CommitTransform,
+    CancelTransform,
+    Nudge(i32, i32),
+}
+
+/// A pending "save changes?" question.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsavedPrompt {
+    /// Documents still to ask about; the first is being asked now.
+    pub queue: Vec<DocId>,
+    /// Whether the app quits once every document is handled.
+    pub quitting: bool,
+}
+
+/// The user's answer to an [`UnsavedPrompt`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptAnswer {
+    Save,
+    DontSave,
+    Cancel,
 }
 
 /// The application: state, dock layout, canvases, and dialogs.
@@ -203,6 +246,19 @@ pub struct EditorApp {
     colors: Colors,
     /// Transient hint shown in the status bar.
     status_message: Option<String>,
+    /// Free Transform handle drag: handle, grab point, transform at grab.
+    transform_drag: Option<(Handle, (f32, f32), Affine)>,
+    /// Move tool drag start (image coordinates).
+    move_start: Option<(f32, f32)>,
+    /// Layers row being renamed and its text.
+    rename: Option<(usize, String)>,
+    /// Layer properties before the current opacity drag.
+    opacity_edit: Option<(DocId, usize, LayerProps)>,
+    prompt: Option<UnsavedPrompt>,
+    /// Set when the app may close (all unsaved changes handled).
+    quit_now: bool,
+    /// Document with a Free Transform session (as opposed to a Move drag).
+    free_transform: Option<DocId>,
 }
 
 impl Default for EditorApp {
@@ -230,6 +286,337 @@ impl EditorApp {
             last_current: None,
             colors: Colors::default(),
             status_message: None,
+            transform_drag: None,
+            move_start: None,
+            rename: None,
+            opacity_edit: None,
+            prompt: None,
+            quit_now: false,
+            free_transform: None,
+        }
+    }
+
+    /// Runs a Layer menu / Layers panel operation on the current document.
+    /// Returns whether it changed anything.
+    pub fn layer_op(&mut self, op: LayerOp) -> bool {
+        let Some(open) = self.state.current_document() else {
+            return false;
+        };
+        let id = open.id;
+        let doc = &open.document;
+        let command: Option<Box<dyn Command>> = match op {
+            LayerOp::New => Some(Box::new(layers::new_layer(doc))),
+            LayerOp::Duplicate => {
+                layers::duplicate_layer(doc).map(|c| Box::new(c) as Box<dyn Command>)
+            }
+            LayerOp::Delete => layers::delete_layer(doc).map(|c| Box::new(c) as Box<dyn Command>),
+            LayerOp::MoveUp => {
+                layers::move_layer(doc, true).map(|c| Box::new(c) as Box<dyn Command>)
+            }
+            LayerOp::MoveDown => {
+                layers::move_layer(doc, false).map(|c| Box::new(c) as Box<dyn Command>)
+            }
+            LayerOp::MergeDown => layers::merge_down(doc).map(|c| Box::new(c) as Box<dyn Command>),
+            LayerOp::Flatten => Some(Box::new(layers::flatten(doc))),
+            LayerOp::AddMask => {
+                layers::add_mask(doc, false).map(|c| Box::new(c) as Box<dyn Command>)
+            }
+            LayerOp::AddMaskFromSelection => {
+                layers::add_mask(doc, true).map(|c| Box::new(c) as Box<dyn Command>)
+            }
+            LayerOp::DeleteMask => {
+                layers::delete_mask(doc).map(|c| Box::new(c) as Box<dyn Command>)
+            }
+            LayerOp::ApplyMask => layers::apply_mask(doc).map(|c| Box::new(c) as Box<dyn Command>),
+            LayerOp::ToggleMask => layers::set_props(doc, doc.active_layer(), |p| {
+                p.mask_enabled = !p.mask_enabled
+            })
+            .ok()
+            .flatten()
+            .map(|c| Box::new(c) as Box<dyn Command>),
+            LayerOp::EditPixels => {
+                self.state.set_edit_target(id, EditTarget::Pixels);
+                return true;
+            }
+            LayerOp::EditMask => {
+                self.state.set_edit_target(id, EditTarget::Mask);
+                return true;
+            }
+        };
+        let Some(command) = command else {
+            return false;
+        };
+        match self.state.execute(id, command) {
+            Ok(()) => {
+                if matches!(op, LayerOp::AddMask | LayerOp::AddMaskFromSelection) {
+                    self.state.set_edit_target(id, EditTarget::Mask);
+                }
+                true
+            }
+            Err(err) => {
+                self.error = Some(format!("{}: {err}", op.label()));
+                false
+            }
+        }
+    }
+
+    /// Applies a Layers panel action.
+    pub fn layer_action(&mut self, action: LayerAction) {
+        let Some(id) = self.state.current_id() else {
+            return;
+        };
+        let active = self
+            .state
+            .current_document()
+            .map_or(0, |o| o.active_layer());
+        match action {
+            LayerAction::Select(index) => self.state.set_active_layer(id, index),
+            LayerAction::ToggleVisible(index) => {
+                self.set_layer_props(id, index, |p| p.visible = !p.visible);
+            }
+            LayerAction::StartRename(index) => {
+                let name = self
+                    .state
+                    .document(id)
+                    .and_then(|o| o.document.layer(index))
+                    .map(|l| l.name.clone())
+                    .unwrap_or_default();
+                self.rename = Some((index, name));
+            }
+            LayerAction::Rename(index, name) => {
+                self.rename = None;
+                if !name.trim().is_empty() {
+                    self.set_layer_props(id, index, |p| p.name = name.trim().to_owned());
+                }
+            }
+            LayerAction::CancelRename => self.rename = None,
+            LayerAction::EditMask(index) => {
+                self.state.set_active_layer(id, index);
+                self.state.set_edit_target(id, EditTarget::Mask);
+            }
+            LayerAction::Blend(mode) => {
+                self.set_layer_props(id, active, |p| p.blend_mode = mode);
+            }
+            LayerAction::OpacityPreview(opacity) => {
+                let Some(layer) = self
+                    .state
+                    .document(id)
+                    .and_then(|o| o.document.layer(active))
+                else {
+                    return;
+                };
+                let before = match &self.opacity_edit {
+                    Some((doc, index, props)) if *doc == id && *index == active => props.clone(),
+                    _ => LayerProps::of(layer),
+                };
+                let mut props = LayerProps::of(layer);
+                props.opacity = opacity;
+                self.opacity_edit = Some((id, active, before));
+                self.state.preview_layer_props(id, active, &props);
+            }
+            LayerAction::OpacityCommit => {
+                if let Some((doc, index, before)) = self.opacity_edit.take() {
+                    let _ = self.state.commit_layer_props(doc, index, before);
+                }
+            }
+            LayerAction::Op(op) => {
+                self.layer_op(op);
+            }
+        }
+    }
+
+    fn set_layer_props(&mut self, id: DocId, index: usize, edit: impl FnOnce(&mut LayerProps)) {
+        let Some(open) = self.state.document(id) else {
+            return;
+        };
+        if let Ok(Some(command)) = layers::set_props(&open.document, index, edit) {
+            if let Err(err) = self.state.execute(id, Box::new(command)) {
+                self.error = Some(format!("Could not change the layer: {err}"));
+            }
+        }
+    }
+
+    /// Edit → Free Transform on the current document.
+    pub fn begin_free_transform(&mut self) -> bool {
+        let Some(id) = self.state.current_id() else {
+            return false;
+        };
+        self.transform_drag = None;
+        match self
+            .state
+            .begin_transform(id, self.tool_options.transform_interpolation)
+        {
+            Ok(()) => {
+                self.free_transform = Some(id);
+                true
+            }
+            Err(err) => {
+                self.error = Some(format!("Could not transform: {err}"));
+                false
+            }
+        }
+    }
+
+    /// Whether the current document has a Free Transform or move in progress.
+    pub fn transform_active(&self) -> bool {
+        self.state
+            .current_document()
+            .is_some_and(|o| o.transform().is_some() && self.free_transform == Some(o.id))
+    }
+
+    /// Commits the current Free Transform (Enter).
+    pub fn commit_free_transform(&mut self) -> bool {
+        self.transform_drag = None;
+        self.state
+            .current_id()
+            .is_some_and(|id| self.state.commit_transform(id, "Free Transform"))
+    }
+
+    /// Cancels the current Free Transform (Escape).
+    pub fn cancel_free_transform(&mut self) {
+        self.transform_drag = None;
+        if let Some(id) = self.state.current_id() {
+            self.state.cancel_transform(id);
+        }
+    }
+
+    /// Edit → Flip Horizontal / Vertical.
+    pub fn flip_current(&mut self, horizontal: bool) -> bool {
+        let Some(id) = self.state.current_id() else {
+            return false;
+        };
+        match self.state.flip(id, horizontal) {
+            Ok(changed) => changed,
+            Err(err) => {
+                self.error = Some(format!("Could not flip: {err}"));
+                false
+            }
+        }
+    }
+
+    /// Moves the active layer content by whole pixels as one "Move" step.
+    pub fn nudge(&mut self, dx: i32, dy: i32) -> bool {
+        let Some(id) = self.state.current_id() else {
+            return false;
+        };
+        if self
+            .state
+            .begin_transform(id, Interpolation::Nearest)
+            .is_err()
+        {
+            return false;
+        }
+        let Some(mut affine) = self
+            .state
+            .document(id)
+            .and_then(|o| o.transform())
+            .map(|t| t.affine())
+        else {
+            return false;
+        };
+        affine.translate = (dx as f32, dy as f32);
+        self.state.update_transform(id, affine);
+        self.state.commit_transform(id, "Move")
+    }
+
+    /// Saves the current document to `path` as `.gac`.
+    pub fn save_to(&mut self, path: &Path) -> bool {
+        let Some(id) = self.state.current_id() else {
+            return false;
+        };
+        self.save_document_to(id, path)
+    }
+
+    fn save_document_to(&mut self, id: DocId, path: &Path) -> bool {
+        let mut path = path.to_path_buf();
+        if !project::is_project_path(&path) {
+            path.set_extension(project::EXTENSION);
+        }
+        match self.state.save(id, &path) {
+            Ok(()) => true,
+            Err(err) => {
+                self.error = Some(format!("Could not save {}:\n{err}", path.display()));
+                false
+            }
+        }
+    }
+
+    /// File → Save: writes to the document's `.gac` file, or asks where.
+    fn save_document(&mut self, id: DocId, ask: bool) -> bool {
+        let path = match self.state.project_path(id) {
+            Some(path) if !ask => Some(path),
+            _ => {
+                let name = self
+                    .state
+                    .document(id)
+                    .map(|o| o.document.name.clone())
+                    .unwrap_or_default();
+                save_project_dialog(&name)
+            }
+        };
+        path.is_some_and(|p| self.save_document_to(id, &p))
+    }
+
+    /// Closes a document, asking first if it has unsaved changes.
+    pub fn request_close(&mut self, id: DocId) {
+        if self.state.document(id).is_some_and(|o| o.is_dirty()) {
+            self.prompt = Some(UnsavedPrompt {
+                queue: vec![id],
+                quitting: false,
+            });
+        } else {
+            self.close_document(id);
+        }
+    }
+
+    /// Quits, asking about each document with unsaved changes first.
+    pub fn request_quit(&mut self) {
+        let dirty = self.state.dirty_documents();
+        if dirty.is_empty() {
+            self.quit_now = true;
+        } else {
+            self.prompt = Some(UnsavedPrompt {
+                queue: dirty,
+                quitting: true,
+            });
+        }
+    }
+
+    /// The "save changes?" question being asked, if any.
+    pub fn unsaved_prompt(&self) -> Option<&UnsavedPrompt> {
+        self.prompt.as_ref()
+    }
+
+    /// Whether the app has decided to close.
+    pub fn wants_quit(&self) -> bool {
+        self.quit_now
+    }
+
+    /// Answers the current "save changes?" question.
+    pub fn answer_prompt(&mut self, answer: PromptAnswer) {
+        let Some(mut prompt) = self.prompt.take() else {
+            return;
+        };
+        let Some(&id) = prompt.queue.first() else {
+            return;
+        };
+        match answer {
+            PromptAnswer::Cancel => return,
+            PromptAnswer::Save => {
+                if !self.save_document(id, false) {
+                    return; // Save cancelled or failed: stop.
+                }
+                self.close_document(id);
+            }
+            PromptAnswer::DontSave => self.close_document(id),
+        }
+        prompt.queue.remove(0);
+        if prompt.queue.is_empty() {
+            if prompt.quitting {
+                self.quit_now = true;
+            }
+        } else {
+            self.prompt = Some(prompt);
         }
     }
 
@@ -337,18 +724,22 @@ impl EditorApp {
                 }
             }
             CanvasEvent::Bucket(seed) => {
+                let target = open.paint_target();
+                let color = target_color(target, self.colors.foreground);
                 let o = &self.tool_options;
                 let command = BucketFill::new(
                     active,
                     seed,
-                    self.colors.foreground,
+                    color,
                     o.bucket_tolerance,
                     o.bucket_contiguous,
                     o.bucket_opacity,
-                );
+                )
+                .on_target(target);
                 let _ = self.state.execute(id, Box::new(command));
             }
             CanvasEvent::Gradient { start, end } => {
+                let target = open.paint_target();
                 let o = &self.tool_options;
                 let command = GradientFill::new(
                     active,
@@ -356,13 +747,54 @@ impl EditorApp {
                     end,
                     o.gradient_kind,
                     o.gradient_colors,
-                    self.colors.foreground,
-                    self.colors.background,
+                    target_color(target, self.colors.foreground),
+                    target_color(target, self.colors.background),
                     o.gradient_opacity,
-                );
+                )
+                .on_target(target);
                 // Drags shorter than a pixel are rejected by the command.
                 let _ = self.state.execute(id, Box::new(command));
             }
+            CanvasEvent::MoveBegin(point) => {
+                if self
+                    .state
+                    .begin_transform(id, Interpolation::Nearest)
+                    .is_ok()
+                {
+                    self.move_start = Some(point);
+                }
+            }
+            CanvasEvent::MoveDrag(point) => {
+                let (Some(start), Some(mut affine)) =
+                    (self.move_start, open.transform().map(|t| t.affine()))
+                else {
+                    return;
+                };
+                // The Move tool moves by whole pixels, so moves stay exact.
+                affine.translate = ((point.0 - start.0).round(), (point.1 - start.1).round());
+                self.state.update_transform(id, affine);
+            }
+            CanvasEvent::MoveEnd => {
+                if self.move_start.take().is_some() {
+                    self.state.commit_transform(id, "Move");
+                }
+            }
+            CanvasEvent::TransformGrab { handle, point, .. } => {
+                if let Some(t) = open.transform() {
+                    self.transform_drag = Some((handle, point, t.affine()));
+                }
+            }
+            CanvasEvent::TransformDrag { point, shift } => {
+                let (Some((handle, start, initial)), Some(t)) =
+                    (self.transform_drag, open.transform())
+                else {
+                    return;
+                };
+                let affine =
+                    transform::drag(&initial, t.content_bounds(), handle, start, point, shift);
+                self.state.update_transform(id, affine);
+            }
+            CanvasEvent::TransformRelease => self.transform_drag = None,
         }
     }
 
@@ -662,9 +1094,11 @@ impl EditorApp {
         self.forget_document(id);
     }
 
+    /// File → Close: closes the current document, asking first if it has
+    /// unsaved changes.
     pub fn close_current(&mut self) {
         if let Some(id) = self.state.current_id() {
-            self.close_document(id);
+            self.request_close(id);
         }
     }
 
@@ -708,7 +1142,11 @@ impl EditorApp {
     pub fn show(&mut self, ui: &mut egui::Ui) {
         if !self.configured_context {
             // Cmd+= / Cmd+- / Cmd+0 zoom the canvas, not the whole UI.
-            ui.ctx().options_mut(|o| o.zoom_with_keyboard = false);
+            ui.ctx().options_mut(|o| {
+                o.zoom_with_keyboard = false;
+                // Quitting goes through the app so unsaved changes are asked about.
+                o.quit_shortcuts.clear();
+            });
             self.configured_context = true;
         }
         let checker = self
@@ -716,6 +1154,16 @@ impl EditorApp {
             .get_or_insert_with(|| canvas::checker_texture(ui.ctx()))
             .clone();
         let mut actions = self.read_shortcuts(ui.ctx());
+        if ui.ctx().input(|i| i.viewport().close_requested()) && !self.quit_now {
+            // The window close button asks about unsaved changes first.
+            if !self.state.dirty_documents().is_empty() {
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                if self.prompt.is_none() {
+                    self.request_quit();
+                }
+            }
+        }
 
         // Route edited regions to the canvases' tile caches.
         let ids: Vec<DocId> = self.state.documents().iter().map(|d| d.id).collect();
@@ -731,15 +1179,33 @@ impl EditorApp {
         egui::Panel::top("menu_bar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| self.menu_bar(ui, &mut actions));
         });
+        let transform_active = self.transform_active();
         egui::Panel::top("tool_options").show(ui, |ui| {
-            tool_options_strip(ui, self.tool, &mut self.tool_options);
+            tool_options_strip(
+                ui,
+                self.tool,
+                &mut self.tool_options,
+                transform_active,
+                &mut actions,
+            );
         });
+        if transform_active {
+            // The Interpolation choice applies to the open Free Transform live.
+            let wanted = self.tool_options.transform_interpolation;
+            if let Some(open) = self.state.current_document() {
+                if open.transform().is_some_and(|t| t.interpolation != wanted) {
+                    let id = open.id;
+                    self.state.set_transform_interpolation(id, wanted);
+                }
+            }
+        }
         egui::Panel::bottom("status_bar").show(ui, |ui| {
             ui.label(self.status_text());
         });
 
         let mut closed = Vec::new();
-        let mut layer_click = None;
+        let mut close_requests = Vec::new();
+        let mut layer_actions = Vec::new();
         let mut tool_click = None;
         let mut requests = Vec::new();
         egui::CentralPanel::default()
@@ -751,7 +1217,10 @@ impl EditorApp {
                     checker: &checker,
                     show_pixel_grid: self.show_pixel_grid,
                     closed: &mut closed,
-                    layer_click: &mut layer_click,
+                    close_requests: &mut close_requests,
+                    layer_actions: &mut layer_actions,
+                    rename: &mut self.rename,
+                    free_transform: self.free_transform,
                     tool: self.tool,
                     tool_options: &self.tool_options,
                     tool_click: &mut tool_click,
@@ -778,8 +1247,11 @@ impl EditorApp {
                 .for_each(CanvasState::cancel_gesture);
             self.last_current = self.state.current_id();
         }
-        if let (Some(index), Some(id)) = (layer_click, self.state.current_id()) {
-            self.state.set_active_layer(id, index);
+        for id in close_requests {
+            self.request_close(id);
+        }
+        for action in layer_actions {
+            self.layer_action(action);
         }
         for (id, event) in requests {
             self.handle_canvas_event(id, event);
@@ -791,10 +1263,50 @@ impl EditorApp {
         self.show_new_dialog_window(ui.ctx());
         self.show_fill_dialog_window(ui.ctx());
         self.show_radius_dialog_window(ui.ctx());
+        self.show_prompt_window(ui.ctx());
         self.show_error_window(ui.ctx());
 
         for action in actions {
             self.run(action, ui.ctx());
+        }
+        if self.quit_now {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    fn show_prompt_window(&mut self, ctx: &egui::Context) {
+        let Some(prompt) = &self.prompt else {
+            return;
+        };
+        let Some(&id) = prompt.queue.first() else {
+            return;
+        };
+        let name = self
+            .state
+            .document(id)
+            .map(|o| o.document.name.clone())
+            .unwrap_or_default();
+        let mut answer = None;
+        egui::Window::new("Unsaved Changes")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(format!("Save changes to \"{name}\" before closing?"));
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        answer = Some(PromptAnswer::Save);
+                    }
+                    if ui.button("Don't Save").clicked() {
+                        answer = Some(PromptAnswer::DontSave);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        answer = Some(PromptAnswer::Cancel);
+                    }
+                });
+            });
+        if let Some(answer) = answer {
+            self.answer_prompt(answer);
         }
     }
 
@@ -806,6 +1318,9 @@ impl EditorApp {
             // Shift is ignored when matching.
             let mut bindings = vec![
                 (SHORTCUT_EXPORT, Action::Export),
+                (SHORTCUT_SAVE_AS, Action::SaveAs),
+                (SHORTCUT_SAVE, Action::Save),
+                (SHORTCUT_NEW_LAYER, Action::Layer(LayerOp::New)),
                 (SHORTCUT_NEW, Action::New),
                 (SHORTCUT_OPEN, Action::Open),
                 (SHORTCUT_CLOSE, Action::Close),
@@ -824,6 +1339,11 @@ impl EditorApp {
                     (SHORTCUT_INVERT, Action::InvertSelection),
                     (SHORTCUT_SELECT_ALL, Action::SelectAll),
                     (SHORTCUT_DESELECT, Action::Deselect),
+                    (SHORTCUT_DUPLICATE_LAYER, Action::Layer(LayerOp::Duplicate)),
+                    (SHORTCUT_MERGE_DOWN, Action::Layer(LayerOp::MergeDown)),
+                    (SHORTCUT_LAYER_UP, Action::Layer(LayerOp::MoveUp)),
+                    (SHORTCUT_LAYER_DOWN, Action::Layer(LayerOp::MoveDown)),
+                    (SHORTCUT_FREE_TRANSFORM, Action::FreeTransform),
                 ]);
             }
             let mut actions: Vec<Action> = bindings
@@ -831,6 +1351,31 @@ impl EditorApp {
                 .filter(|(shortcut, _)| input.consume_shortcut(shortcut))
                 .map(|(_, action)| action)
                 .collect();
+            if !typing && self.transform_active() {
+                if input.consume_key(Modifiers::NONE, Key::Enter) {
+                    actions.push(Action::CommitTransform);
+                }
+                if input.consume_key(Modifiers::NONE, Key::Escape) {
+                    actions.push(Action::CancelTransform);
+                }
+            }
+            if !typing
+                && !input.modifiers.command
+                && self.tool == Tool::Move
+                && !self.transform_active()
+            {
+                let step = if input.modifiers.shift { 10 } else { 1 };
+                for (key, dx, dy) in [
+                    (Key::ArrowLeft, -step, 0),
+                    (Key::ArrowRight, step, 0),
+                    (Key::ArrowUp, 0, -step),
+                    (Key::ArrowDown, 0, step),
+                ] {
+                    if input.consume_key(input.modifiers, key) {
+                        actions.push(Action::Nudge(dx, dy));
+                    }
+                }
+            }
             if !typing && !input.modifiers.command {
                 // Single-key tool shortcuts.
                 let tool_keys = [
@@ -842,6 +1387,7 @@ impl EditorApp {
                     (Key::I, Tool::Eyedropper),
                     (Key::G, Tool::after_g(self.tool)),
                     (Key::S, Tool::CloneStamp),
+                    (Key::V, Tool::Move),
                 ];
                 for (key, tool) in tool_keys {
                     if input.consume_key(Modifiers::NONE, key) {
@@ -876,6 +1422,14 @@ impl EditorApp {
             };
             item(ui, "New…", SHORTCUT_NEW, true, Action::New);
             item(ui, "Open…", SHORTCUT_OPEN, true, Action::Open);
+            item(ui, "Save", SHORTCUT_SAVE, has_document, Action::Save);
+            item(
+                ui,
+                "Save As…",
+                SHORTCUT_SAVE_AS,
+                has_document,
+                Action::SaveAs,
+            );
             item(ui, "Export…", SHORTCUT_EXPORT, has_document, Action::Export);
             ui.separator();
             item(ui, "Close", SHORTCUT_CLOSE, has_document, Action::Close);
@@ -905,7 +1459,82 @@ impl EditorApp {
             {
                 actions.push(Action::FillLayer);
             }
+            ui.separator();
+            let free_transform = egui::Button::new("Free Transform")
+                .shortcut_text(ui.ctx().format_shortcut(&SHORTCUT_FREE_TRANSFORM));
+            if ui.add_enabled(has_document, free_transform).clicked() {
+                actions.push(Action::FreeTransform);
+            }
+            if ui
+                .add_enabled(has_document, egui::Button::new("Flip Horizontal"))
+                .clicked()
+            {
+                actions.push(Action::Flip { horizontal: true });
+            }
+            if ui
+                .add_enabled(has_document, egui::Button::new("Flip Vertical"))
+                .clicked()
+            {
+                actions.push(Action::Flip { horizontal: false });
+            }
         });
+        if let Some(open) = self.state.current_document() {
+            ui.menu_button("Layer", |ui| {
+                let shortcut_of = |op: LayerOp| match op {
+                    LayerOp::New => Some(SHORTCUT_NEW_LAYER),
+                    LayerOp::Duplicate => Some(SHORTCUT_DUPLICATE_LAYER),
+                    LayerOp::MoveUp => Some(SHORTCUT_LAYER_UP),
+                    LayerOp::MoveDown => Some(SHORTCUT_LAYER_DOWN),
+                    LayerOp::MergeDown => Some(SHORTCUT_MERGE_DOWN),
+                    _ => None,
+                };
+                let groups: [&[LayerOp]; 3] = [
+                    &[
+                        LayerOp::New,
+                        LayerOp::Duplicate,
+                        LayerOp::Delete,
+                        LayerOp::MoveUp,
+                        LayerOp::MoveDown,
+                        LayerOp::MergeDown,
+                        LayerOp::Flatten,
+                    ],
+                    &[
+                        LayerOp::AddMask,
+                        LayerOp::AddMaskFromSelection,
+                        LayerOp::DeleteMask,
+                        LayerOp::ApplyMask,
+                        LayerOp::ToggleMask,
+                    ],
+                    &[LayerOp::EditPixels, LayerOp::EditMask],
+                ];
+                for (i, group) in groups.iter().enumerate() {
+                    if i > 0 {
+                        ui.separator();
+                    }
+                    for &op in *group {
+                        let label = if op == LayerOp::ToggleMask
+                            && open
+                                .document
+                                .layer(open.active_layer())
+                                .is_some_and(|l| !l.mask_enabled)
+                        {
+                            "Enable Mask"
+                        } else {
+                            op.label()
+                        };
+                        let mut button = egui::Button::new(label);
+                        if let Some(shortcut) = shortcut_of(op) {
+                            button = button.shortcut_text(ui.ctx().format_shortcut(&shortcut));
+                        }
+                        if ui.add_enabled(op.enabled(open), button).clicked() {
+                            actions.push(Action::Layer(op));
+                        }
+                    }
+                }
+            });
+        } else {
+            ui.add_enabled(false, egui::Button::new("Layer"));
+        }
         let has_selection = self
             .state
             .current_document()
@@ -1016,6 +1645,9 @@ impl EditorApp {
                         text.push_str(&format!(" — {x}, {y}"));
                     }
                 }
+                if open.edit_target() == EditTarget::Mask {
+                    text.push_str(" — Editing mask");
+                }
                 if let Some(message) = &self.status_message {
                     text.push_str(&format!(" — {message}"));
                 }
@@ -1042,7 +1674,36 @@ impl EditorApp {
                 }
             }
             Action::Close => self.close_current(),
-            Action::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Action::Quit => {
+                let _ = ctx;
+                self.request_quit();
+            }
+            Action::Save => {
+                if let Some(id) = self.state.current_id() {
+                    self.save_document(id, false);
+                }
+            }
+            Action::SaveAs => {
+                if let Some(id) = self.state.current_id() {
+                    self.save_document(id, true);
+                }
+            }
+            Action::Layer(op) => {
+                self.layer_op(op);
+            }
+            Action::FreeTransform => {
+                self.begin_free_transform();
+            }
+            Action::Flip { horizontal } => {
+                self.flip_current(horizontal);
+            }
+            Action::CommitTransform => {
+                self.commit_free_transform();
+            }
+            Action::CancelTransform => self.cancel_free_transform(),
+            Action::Nudge(dx, dy) => {
+                self.nudge(dx, dy);
+            }
             Action::Undo => {
                 self.undo_current();
             }
@@ -1284,8 +1945,13 @@ struct Viewer<'a> {
     checker: &'a TextureHandle,
     show_pixel_grid: bool,
     closed: &'a mut Vec<DocId>,
-    /// Layer index clicked in the Layers panel this frame.
-    layer_click: &'a mut Option<usize>,
+    /// Document tabs whose close button was clicked while they had unsaved changes.
+    close_requests: &'a mut Vec<DocId>,
+    /// What the user did in the Layers panel this frame.
+    layer_actions: &'a mut Vec<LayerAction>,
+    rename: &'a mut Option<(usize, String)>,
+    /// Document whose transform session is a Free Transform (draws handles).
+    free_transform: Option<DocId>,
     tool: Tool,
     tool_options: &'a ToolOptions,
     /// Tool clicked in the Tools panel this frame.
@@ -1308,7 +1974,13 @@ impl TabViewer for Viewer<'_> {
             Tab::Document(id) => self
                 .state
                 .document(*id)
-                .map(|open| open.document.name.clone())
+                .map(|open| {
+                    if open.is_dirty() {
+                        format!("{} •", open.document.name)
+                    } else {
+                        open.document.name.clone()
+                    }
+                })
                 .unwrap_or_default()
                 .into(),
         }
@@ -1317,7 +1989,10 @@ impl TabViewer for Viewer<'_> {
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Tab) {
         match *tab {
             Tab::Panel(Panel::Tools) => tools_panel(ui, self.tool, self.tool_click, self.colors),
-            Tab::Panel(Panel::Layers) => layers_panel(ui, self.state, self.layer_click),
+            Tab::Panel(Panel::Layers) => {
+                let actions = layers_panel(ui, self.state.current_document(), self.rename);
+                self.layer_actions.extend(actions);
+            }
             Tab::Panel(Panel::AssetLibrary) => {
                 ui.weak("The asset library arrives in a later version.");
             }
@@ -1327,6 +2002,10 @@ impl TabViewer for Viewer<'_> {
 
     fn on_close(&mut self, tab: &mut Tab) -> OnCloseResponse {
         if let Tab::Document(id) = tab {
+            if self.state.document(*id).is_some_and(|o| o.is_dirty()) {
+                self.close_requests.push(*id);
+                return OnCloseResponse::Ignore;
+            }
             self.closed.push(*id);
         }
         OnCloseResponse::Close
@@ -1354,6 +2033,12 @@ impl Viewer<'_> {
             self.show_pixel_grid,
             self.tool,
             self.tool_options,
+            open.transform()
+                .filter(|_| self.free_transform == Some(id))
+                .map(|t| TransformBox {
+                    affine: t.affine(),
+                    bounds: t.content_bounds(),
+                }),
         );
         self.requests.extend(events.into_iter().map(|e| (id, e)));
     }
@@ -1369,10 +2054,6 @@ fn tools_panel(ui: &mut egui::Ui, active: Tool, clicked: &mut Option<Tool>, colo
                 *clicked = Some(tool);
             }
         }
-        for name in PLACEHOLDER_TOOLS {
-            ui.add_enabled(false, egui::Button::new(name))
-                .on_disabled_hover_text("Coming soon");
-        }
     });
     ui.separator();
     ui.horizontal(|ui| {
@@ -1383,7 +2064,7 @@ fn tools_panel(ui: &mut egui::Ui, active: Tool, clicked: &mut Option<Tool>, colo
         ui.color_edit_button_srgba_unmultiplied(&mut colors.background)
             .on_hover_text("Background color");
         if ui
-            .small_button("⇄")
+            .small_button("Swap")
             .on_hover_text("Swap colors (X)")
             .clicked()
         {
@@ -1414,8 +2095,30 @@ fn percent_slider(ui: &mut egui::Ui, label: &str, value: &mut f32, min: f32) {
     }
 }
 
-fn tool_options_strip(ui: &mut egui::Ui, tool: Tool, options: &mut ToolOptions) {
+fn tool_options_strip(
+    ui: &mut egui::Ui,
+    tool: Tool,
+    options: &mut ToolOptions,
+    transform_active: bool,
+    actions: &mut Vec<Action>,
+) {
     ui.horizontal(|ui| {
+        if transform_active {
+            ui.label("Free Transform");
+            ui.separator();
+            ui.label("Interpolation");
+            for interp in [Interpolation::Bilinear, Interpolation::Nearest] {
+                ui.selectable_value(&mut options.transform_interpolation, interp, interp.label());
+            }
+            ui.separator();
+            if ui.button("Commit").on_hover_text("Enter").clicked() {
+                actions.push(Action::CommitTransform);
+            }
+            if ui.button("Cancel").on_hover_text("Escape").clicked() {
+                actions.push(Action::CancelTransform);
+            }
+            return;
+        }
         ui.label(tool.label());
         ui.separator();
         if let Some(brush) = options.brush_for_mut(tool) {
@@ -1487,22 +2190,6 @@ fn tool_options_strip(ui: &mut egui::Ui, tool: Tool, options: &mut ToolOptions) 
     });
 }
 
-fn layers_panel(ui: &mut egui::Ui, state: &AppState, clicked: &mut Option<usize>) {
-    if state.current_document().is_none() {
-        ui.weak("No document");
-        return;
-    }
-    for row in state.current_layer_rows() {
-        ui.horizontal(|ui| {
-            ui.label(if row.visible { "👁" } else { "–" })
-                .on_hover_text(if row.visible { "Visible" } else { "Hidden" });
-            if ui.selectable_label(row.active, row.name).clicked() {
-                *clicked = Some(row.index);
-            }
-        });
-    }
-}
-
 fn format_zoom(zoom: f32) -> String {
     let percent = zoom * 100.0;
     if percent >= 10.0 {
@@ -1520,12 +2207,38 @@ fn format_dpi(dpi: f64) -> String {
     }
 }
 
+/// The color a paint operation uses on `target` (gray on masks).
+fn target_color(target: PaintTarget, color: [u8; 4]) -> [u8; 4] {
+    match target {
+        PaintTarget::Pixels(_) => color,
+        PaintTarget::Mask(_) => mask_gray(color),
+    }
+}
+
+fn save_project_dialog(document_name: &str) -> Option<PathBuf> {
+    let stem = Path::new(document_name)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Untitled".to_owned());
+    let mut path = rfd::FileDialog::new()
+        .set_file_name(format!("{stem}.{}", project::EXTENSION))
+        .add_filter("Game Asset Creator project", &[project::EXTENSION])
+        .save_file()?;
+    if !project::is_project_path(&path) {
+        path.set_extension(project::EXTENSION);
+    }
+    Some(path)
+}
+
 fn open_file_dialog() -> Option<PathBuf> {
-    let all: Vec<&str> = FileFormat::ALL
+    let mut all: Vec<&str> = FileFormat::ALL
         .iter()
         .flat_map(|f| f.extensions().iter().copied())
         .collect();
-    let mut dialog = rfd::FileDialog::new().add_filter("Images", &all);
+    all.push(project::EXTENSION);
+    let mut dialog = rfd::FileDialog::new()
+        .add_filter("Images and projects", &all)
+        .add_filter("Game Asset Creator project", &[project::EXTENSION]);
     for format in FileFormat::ALL {
         dialog = dialog.add_filter(format.label(), format.extensions());
     }
