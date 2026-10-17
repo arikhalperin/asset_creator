@@ -45,8 +45,10 @@ The editing canvas shown in each document tab: an egui widget that displays the 
 
 ### Tool input
 
-- Primary-button gestures on the canvas go to the active tool (see the selection spec); Space+drag and middle-drag always pan instead, and wheel/pinch always navigate.
-- The pointer shows a crosshair over the image while a selection tool is active (grab/grabbing cursors still win while panning).
+- Primary-button gestures on the canvas go to the active tool (see the selection and paint specs); Space+drag and middle-drag always pan instead, and wheel/pinch always navigate.
+- The pointer shows a crosshair over the image while a selection tool, the eyedropper, the paint bucket, or the gradient tool is active. For Brush, Eraser, and Clone Stamp it shows a circle outline of the brush diameter at the current zoom (plus a crosshair when the circle is smaller than 4 points). Grab/grabbing cursors still win while panning.
+- Clone Stamp shows a marker at its source point, and while painting, at the point currently being sampled.
+- Paint strokes appear on the canvas as they are drawn (only the affected tiles refresh); the gradient tool previews its start-to-end line while dragging.
 - While a selection gesture is in progress, its outline (rectangle, ellipse, lasso path, or polygon edges plus a segment to the pointer) is previewed on the canvas.
 
 ### Marching ants

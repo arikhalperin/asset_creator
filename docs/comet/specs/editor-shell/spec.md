@@ -44,7 +44,7 @@ The Game Asset Creator desktop application window: eframe/egui with egui_dock pr
 
 ### Panels
 
-- Tools: Rectangle Select, Ellipse Select, Lasso, Polygon Lasso, and Magic Wand buttons (the active tool is highlighted; Rectangle Select is active at startup), followed by disabled placeholders for upcoming tools (Move, Brush, Eraser, Fill, Picker). Shortcuts: M toggles Rectangle/Ellipse Select, L toggles Lasso/Polygon Lasso, W selects Magic Wand; single-key tool shortcuts are ignored while a text field is focused or Cmd/Ctrl is held.
+- Tools: Rectangle Select, Ellipse Select, Lasso, Polygon Lasso, Magic Wand, Brush, Eraser, Eyedropper, Paint Bucket, Gradient, and Clone Stamp buttons (the active tool is highlighted; Rectangle Select is active at startup), a disabled Move placeholder, and the foreground/background color swatches. Shortcuts: M toggles Rectangle/Ellipse Select, L toggles Lasso/Polygon Lasso, W Magic Wand, B Brush, E Eraser, I Eyedropper, G toggles Gradient/Paint Bucket, S Clone Stamp, X swaps foreground and background, D resets them to black and white, [ and ] decrease and increase the current brush size; single-key shortcuts are ignored while a text field is focused or Cmd/Ctrl is held.
 - Layers: lists the current document's layers top-first, each with a visibility indicator and name; the active layer is highlighted and clicking a row makes it active; shows "No document" when none is focused.
 - Asset Library: placeholder text indicating the library arrives later.
 
@@ -60,6 +60,12 @@ The Game Asset Creator desktop application window: eframe/egui with egui_dock pr
 
 ### Tool-options strip
 
-- Always shows the combine-mode buttons Replace / Add / Subtract / Intersect (one active; Replace by default).
+- For selection tools, shows the combine-mode buttons Replace / Add / Subtract / Intersect (one active; Replace by default).
 - Ellipse Select, Lasso, and Polygon Lasso also show an Anti-alias checkbox (default on, shared by those tools).
 - Magic Wand also shows Tolerance (0–255, default 32) and Contiguous (default on).
+
+- Brush and Eraser show Size, Hardness, Opacity, and Pixel; Clone Stamp shows Size, Hardness, Opacity, and Aligned; Paint Bucket shows Tolerance, Contiguous, and Opacity; Gradient shows Type (Linear/Radial), Colors (Foreground to Background / Foreground to Transparent), and Opacity; Eyedropper shows Sample (All layers / Active layer). Each tool keeps its own option values (see the paint spec for ranges and defaults).
+
+### Color swatches
+
+- The Tools panel shows the foreground and background colors (default opaque black and opaque white). Clicking a swatch opens an RGBA color picker that edits that color; a swap button and X exchange them; a reset button and D restore black/white.
