@@ -27,7 +27,7 @@ The editing canvas shown in each document tab: an egui widget that displays the 
 
 - Behind the image bounds, a checkerboard of 8×8-point squares in light and dark gray is drawn in screen space (it does not scale with zoom); outside the image bounds the canvas shows its plain background.
 - The composite is drawn on top of the checkerboard.
-- Sampling: nearest-neighbor when magnified; linear with mipmaps when minified.
+- Sampling: nearest-neighbor when magnified; when minified, a CPU-built mip pyramid of 2× box-filtered levels is drawn from the smallest level at or above display resolution with linear filtering.
 - When zoom is strictly greater than 8.0 and Show Pixel Grid is enabled (default on, View menu toggle), 1-physical-pixel lines are drawn on every pixel boundary within the visible part of the image, in a semi-transparent color that contrasts with typical content.
 - Only tiles intersecting the visible area are drawn.
 
@@ -42,3 +42,15 @@ The editing canvas shown in each document tab: an egui widget that displays the 
 ### Status
 
 - The status bar shows the current document's zoom as a percentage, and while the pointer is over the image, the image pixel coordinate under it (`x, y`).
+
+### Tool input
+
+- Primary-button gestures on the canvas go to the active tool (see the selection spec); Space+drag and middle-drag always pan instead, and wheel/pinch always navigate.
+- The pointer shows a crosshair over the image while a selection tool is active (grab/grabbing cursors still win while panning).
+- While a selection gesture is in progress, its outline (rectangle, ellipse, lasso path, or polygon edges plus a segment to the pointer) is previewed on the canvas.
+
+### Marching ants
+
+- When the document has a selection, its boundary (the edges between pixels with mask value ≥ 128 and pixels below 128 or outside the document) is drawn as alternating black and white dashes, 4 points each, in screen space, 1 point wide.
+- The dash pattern moves continuously over time (one dash length per 0.25 s) and the canvas keeps repainting while a selection exists.
+- Only boundary segments within the visible area are drawn; the outline is recomputed only when the selection changes.

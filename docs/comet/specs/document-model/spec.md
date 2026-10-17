@@ -30,3 +30,9 @@ In-memory representation of an image being edited: a document holding metadata a
 - `composite()` returns an `RgbaImage` of the document size: visible layers blended bottom-to-top with source-over (normal) alpha compositing, each layer's alpha scaled by its opacity, starting from fully transparent.
 - Hidden layers and zero-opacity layers do not contribute.
 - A single visible, opacity-1.0 layer composites to exactly its own pixels.
+
+### Selection mask
+
+- A document has an optional selection mask: an 8-bit single-channel image of the document's size (0 = unselected, 255 = fully selected, values between are partially selected).
+- No mask means nothing is selected and edits apply to the whole document. Setting a mask whose size differs from the document fails with an error; setting a mask with no non-zero pixel stores no mask.
+- The selection is metadata: it is not composited or exported.
