@@ -3,13 +3,15 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use egui::{Key, KeyboardShortcut, Modifiers, TextureHandle, TextureOptions};
+use egui::{Key, KeyboardShortcut, Modifiers, TextureHandle};
 use egui_dock::tab_viewer::OnCloseResponse;
 use egui_dock::{DockArea, DockState, NodeIndex, TabViewer};
 
 use crate::app_state::{AppState, DocId};
+use crate::canvas::{self, CanvasState, ViewAction};
 use crate::document::DEFAULT_DPI;
 use crate::io::FileFormat;
+use crate::undo::FillLayer;
 
 pub const APP_TITLE: &str = "Game Asset Creator";
 
@@ -22,6 +24,18 @@ const SHORTCUT_EXPORT: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::E);
 const SHORTCUT_CLOSE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::W);
 const SHORTCUT_QUIT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Q);
+const SHORTCUT_UNDO: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Z);
+const SHORTCUT_REDO: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::Z);
+const SHORTCUT_REDO_ALT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Y);
+const SHORTCUT_ZOOM_IN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Equals);
+const SHORTCUT_ZOOM_IN_ALT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Plus);
+const SHORTCUT_ZOOM_OUT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Minus);
+const SHORTCUT_FIT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Num0);
+const SHORTCUT_ACTUAL_SIZE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Num1);
+
+/// Fill color used before the user picks one.
+pub const DEFAULT_FILL_COLOR: [u8; 4] = [0, 0, 0, 255];
 
 const PLACEHOLDER_TOOLS: [&str; 6] = ["Move", "Select", "Brush", "Eraser", "Fill", "Picker"];
 
@@ -100,16 +114,26 @@ enum Action {
     Export,
     Close,
     Quit,
+    Undo,
+    Redo,
+    FillLayer,
+    View(ViewAction),
     SetPanelOpen(Panel, bool),
 }
 
-/// The application: state, dock layout, cached textures, and dialogs.
+/// The application: state, dock layout, canvases, and dialogs.
 pub struct EditorApp {
     pub state: AppState,
     dock: DockState<Tab>,
-    textures: HashMap<DocId, (u64, TextureHandle)>,
+    canvases: HashMap<DocId, CanvasState>,
+    checker: Option<TextureHandle>,
+    show_pixel_grid: bool,
     new_dialog: Option<NewDocumentForm>,
+    /// Color being edited in the open Fill Layer dialog.
+    fill_dialog: Option<[u8; 4]>,
+    last_fill_color: [u8; 4],
     error: Option<String>,
+    configured_context: bool,
 }
 
 impl Default for EditorApp {
@@ -123,9 +147,93 @@ impl EditorApp {
         Self {
             state: AppState::new(),
             dock: default_layout(),
-            textures: HashMap::new(),
+            canvases: HashMap::new(),
+            checker: None,
+            show_pixel_grid: true,
             new_dialog: None,
+            fill_dialog: None,
+            last_fill_color: DEFAULT_FILL_COLOR,
             error: None,
+            configured_context: false,
+        }
+    }
+
+    /// The canvas state of an open document.
+    pub fn canvas(&self, id: DocId) -> Option<&CanvasState> {
+        self.canvases.get(&id)
+    }
+
+    pub fn show_pixel_grid(&self) -> bool {
+        self.show_pixel_grid
+    }
+
+    pub fn set_show_pixel_grid(&mut self, show: bool) {
+        self.show_pixel_grid = show;
+    }
+
+    /// Queues a zoom/fit command for the current document's canvas.
+    pub fn view_action(&mut self, action: ViewAction) {
+        if let Some(id) = self.state.current_id() {
+            if let Some(canvas) = self.canvases.get_mut(&id) {
+                canvas.request(action);
+            }
+        }
+    }
+
+    pub fn undo_current(&mut self) -> bool {
+        self.state
+            .current_id()
+            .is_some_and(|id| self.state.undo(id))
+    }
+
+    pub fn redo_current(&mut self) -> bool {
+        self.state
+            .current_id()
+            .is_some_and(|id| self.state.redo(id))
+    }
+
+    /// Opens Edit → Fill Layer… with the last used color.
+    pub fn open_fill_dialog(&mut self) {
+        if self.state.current_document().is_some() {
+            self.fill_dialog = Some(self.last_fill_color);
+        }
+    }
+
+    /// The color in the open Fill Layer dialog, if it is open.
+    pub fn fill_dialog_color(&self) -> Option<[u8; 4]> {
+        self.fill_dialog
+    }
+
+    pub fn set_fill_dialog_color(&mut self, color: [u8; 4]) {
+        if let Some(current) = &mut self.fill_dialog {
+            *current = color;
+        }
+    }
+
+    pub fn cancel_fill_dialog(&mut self) {
+        self.fill_dialog = None;
+    }
+
+    /// Fills the current document's active layer with the dialog color as
+    /// one undoable step, remembering the color. Returns whether it filled.
+    pub fn submit_fill_dialog(&mut self) -> bool {
+        let Some(color) = self.fill_dialog.take() else {
+            return false;
+        };
+        self.last_fill_color = color;
+        let Some(open) = self.state.current_document() else {
+            return false;
+        };
+        let (id, layer) = (open.id, open.active_layer());
+        match self
+            .state
+            .execute(id, Box::new(FillLayer::new(layer, color)))
+        {
+            Ok(()) => true,
+            Err(err) => {
+                self.error = Some(format!("Could not fill layer: {err}"));
+                false
+            }
         }
     }
 
@@ -261,7 +369,27 @@ impl EditorApp {
 
     /// Draws one frame of the whole UI.
     pub fn show(&mut self, ui: &mut egui::Ui) {
+        if !self.configured_context {
+            // Cmd+= / Cmd+- / Cmd+0 zoom the canvas, not the whole UI.
+            ui.ctx().options_mut(|o| o.zoom_with_keyboard = false);
+            self.configured_context = true;
+        }
+        let checker = self
+            .checker
+            .get_or_insert_with(|| canvas::checker_texture(ui.ctx()))
+            .clone();
         let mut actions = self.read_shortcuts(ui.ctx());
+
+        // Route edited regions to the canvases' tile caches.
+        let ids: Vec<DocId> = self.state.documents().iter().map(|d| d.id).collect();
+        for id in ids {
+            let dirty = self.state.take_dirty(id);
+            if let Some(canvas) = self.canvases.get_mut(&id) {
+                for rect in dirty {
+                    canvas.mark_dirty(rect);
+                }
+            }
+        }
 
         egui::Panel::top("menu_bar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| self.menu_bar(ui, &mut actions));
@@ -271,13 +399,17 @@ impl EditorApp {
         });
 
         let mut closed = Vec::new();
+        let mut layer_click = None;
         egui::CentralPanel::default()
             .frame(egui::Frame::central_panel(ui.style()).inner_margin(0.0))
             .show(ui, |ui| {
                 let mut viewer = Viewer {
                     state: &self.state,
-                    textures: &mut self.textures,
+                    canvases: &mut self.canvases,
+                    checker: &checker,
+                    show_pixel_grid: self.show_pixel_grid,
                     closed: &mut closed,
+                    layer_click: &mut layer_click,
                 };
                 DockArea::new(&mut self.dock)
                     .show_leaf_close_all_buttons(false)
@@ -291,8 +423,12 @@ impl EditorApp {
             let id = *id;
             self.state.set_current(id);
         }
+        if let (Some(index), Some(id)) = (layer_click, self.state.current_id()) {
+            self.state.set_active_layer(id, index);
+        }
 
         self.show_new_dialog_window(ui.ctx());
+        self.show_fill_dialog_window(ui.ctx());
         self.show_error_window(ui.ctx());
 
         for action in actions {
@@ -301,19 +437,35 @@ impl EditorApp {
     }
 
     fn read_shortcuts(&self, ctx: &egui::Context) -> Vec<Action> {
+        // A focused text field keeps its own editing shortcuts (undo, etc.).
+        let typing = ctx.text_edit_focused();
         ctx.input_mut(|input| {
-            // Most specific first: Cmd+Shift+E before any Cmd+E binding.
-            [
+            // Most specific first: Cmd+Shift+X before Cmd+X, since extra
+            // Shift is ignored when matching.
+            let mut bindings = vec![
                 (SHORTCUT_EXPORT, Action::Export),
                 (SHORTCUT_NEW, Action::New),
                 (SHORTCUT_OPEN, Action::Open),
                 (SHORTCUT_CLOSE, Action::Close),
                 (SHORTCUT_QUIT, Action::Quit),
-            ]
-            .into_iter()
-            .filter(|(shortcut, _)| input.consume_shortcut(shortcut))
-            .map(|(_, action)| action)
-            .collect()
+            ];
+            if !typing {
+                bindings.extend([
+                    (SHORTCUT_REDO, Action::Redo),
+                    (SHORTCUT_UNDO, Action::Undo),
+                    (SHORTCUT_REDO_ALT, Action::Redo),
+                    (SHORTCUT_ZOOM_IN, Action::View(ViewAction::ZoomIn)),
+                    (SHORTCUT_ZOOM_IN_ALT, Action::View(ViewAction::ZoomIn)),
+                    (SHORTCUT_ZOOM_OUT, Action::View(ViewAction::ZoomOut)),
+                    (SHORTCUT_FIT, Action::View(ViewAction::Fit)),
+                    (SHORTCUT_ACTUAL_SIZE, Action::View(ViewAction::ActualSize)),
+                ]);
+            }
+            bindings
+                .into_iter()
+                .filter(|(shortcut, _)| input.consume_shortcut(shortcut))
+                .map(|(_, action)| action)
+                .collect()
         })
     }
 
@@ -334,7 +486,50 @@ impl EditorApp {
             item(ui, "Close", SHORTCUT_CLOSE, has_document, Action::Close);
             item(ui, "Quit", SHORTCUT_QUIT, true, Action::Quit);
         });
+        let stack = self.state.current_document().map(|open| open.undo_stack());
+        let undo_label = stack.and_then(|s| s.undo_label()).map(str::to_owned);
+        let redo_label = stack.and_then(|s| s.redo_label()).map(str::to_owned);
+        ui.menu_button("Edit", |ui| {
+            let mut item = |ui: &mut egui::Ui, label: &str, shortcut, enabled, action| {
+                let button =
+                    egui::Button::new(label).shortcut_text(ui.ctx().format_shortcut(&shortcut));
+                if ui.add_enabled(enabled, button).clicked() {
+                    actions.push(action);
+                }
+            };
+            let undo = undo_label.map_or("Undo".to_owned(), |l| format!("Undo {l}"));
+            let redo = redo_label.map_or("Redo".to_owned(), |l| format!("Redo {l}"));
+            let can_undo = stack.is_some_and(|s| s.can_undo());
+            let can_redo = stack.is_some_and(|s| s.can_redo());
+            item(ui, &undo, SHORTCUT_UNDO, can_undo, Action::Undo);
+            item(ui, &redo, SHORTCUT_REDO, can_redo, Action::Redo);
+            ui.separator();
+            if ui
+                .add_enabled(has_document, egui::Button::new("Fill Layer…"))
+                .clicked()
+            {
+                actions.push(Action::FillLayer);
+            }
+        });
         ui.menu_button("View", |ui| {
+            let mut item = |ui: &mut egui::Ui, label: &str, shortcut, action| {
+                let button =
+                    egui::Button::new(label).shortcut_text(ui.ctx().format_shortcut(&shortcut));
+                if ui.add_enabled(has_document, button).clicked() {
+                    actions.push(Action::View(action));
+                }
+            };
+            item(ui, "Zoom In", SHORTCUT_ZOOM_IN, ViewAction::ZoomIn);
+            item(ui, "Zoom Out", SHORTCUT_ZOOM_OUT, ViewAction::ZoomOut);
+            item(ui, "Fit to Window", SHORTCUT_FIT, ViewAction::Fit);
+            item(
+                ui,
+                "Actual Size",
+                SHORTCUT_ACTUAL_SIZE,
+                ViewAction::ActualSize,
+            );
+            ui.checkbox(&mut self.show_pixel_grid, "Show Pixel Grid");
+            ui.separator();
             for panel in Panel::ALL {
                 let mut open = self.is_panel_open(panel);
                 if ui.checkbox(&mut open, panel.title()).changed() {
@@ -344,17 +539,27 @@ impl EditorApp {
         });
     }
 
-    fn status_text(&self) -> String {
+    /// The status bar text.
+    pub fn status_text(&self) -> String {
         match self.state.current_document() {
             Some(open) => {
                 let doc = &open.document;
-                format!(
+                let mut text = format!(
                     "{} — {} × {} px — {} DPI",
                     doc.name,
                     doc.width(),
                     doc.height(),
                     format_dpi(doc.dpi())
-                )
+                );
+                if let Some(canvas) = self.canvases.get(&open.id) {
+                    if let Some(view) = canvas.view() {
+                        text.push_str(&format!(" — {}", format_zoom(view.zoom)));
+                    }
+                    if let Some((x, y)) = canvas.hover_pixel() {
+                        text.push_str(&format!(" — {x}, {y}"));
+                    }
+                }
+                text
             }
             None => "No document".to_owned(),
         }
@@ -378,6 +583,14 @@ impl EditorApp {
             }
             Action::Close => self.close_current(),
             Action::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Action::Undo => {
+                self.undo_current();
+            }
+            Action::Redo => {
+                self.redo_current();
+            }
+            Action::FillLayer => self.open_fill_dialog(),
+            Action::View(action) => self.view_action(action),
             Action::SetPanelOpen(panel, open) => self.set_panel_open(panel, open),
         }
     }
@@ -425,6 +638,38 @@ impl EditorApp {
         }
     }
 
+    fn show_fill_dialog_window(&mut self, ctx: &egui::Context) {
+        let Some(mut color) = self.fill_dialog else {
+            return;
+        };
+        let mut submit = false;
+        let mut cancel = false;
+        egui::Window::new("Fill Layer")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Color");
+                    ui.color_edit_button_srgba_unmultiplied(&mut color);
+                    ui.weak(format!(
+                        "RGBA {}, {}, {}, {}",
+                        color[0], color[1], color[2], color[3]
+                    ));
+                });
+                ui.horizontal(|ui| {
+                    submit = ui.button("OK").clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+        self.set_fill_dialog_color(color);
+        if cancel {
+            self.cancel_fill_dialog();
+        } else if submit {
+            self.submit_fill_dialog();
+        }
+    }
+
     fn show_error_window(&mut self, ctx: &egui::Context) {
         let Some(message) = &self.error else {
             return;
@@ -446,6 +691,9 @@ impl EditorApp {
     /// Adds a document tab next to existing documents (or into the empty
     /// document area) and focuses it.
     fn add_document_tab(&mut self, id: DocId) {
+        if let Some(open) = self.state.document(id) {
+            self.canvases.insert(id, CanvasState::new(&open.document));
+        }
         let tab = Tab::Document(id);
         let leaf = self
             .dock
@@ -492,7 +740,7 @@ impl EditorApp {
 
     fn forget_document(&mut self, id: DocId) {
         self.state.close(id);
-        self.textures.remove(&id);
+        self.canvases.remove(&id);
     }
 }
 
@@ -522,8 +770,12 @@ pub fn default_layout() -> DockState<Tab> {
 
 struct Viewer<'a> {
     state: &'a AppState,
-    textures: &'a mut HashMap<DocId, (u64, TextureHandle)>,
+    canvases: &'a mut HashMap<DocId, CanvasState>,
+    checker: &'a TextureHandle,
+    show_pixel_grid: bool,
     closed: &'a mut Vec<DocId>,
+    /// Layer index clicked in the Layers panel this frame.
+    layer_click: &'a mut Option<usize>,
 }
 
 impl TabViewer for Viewer<'_> {
@@ -548,7 +800,7 @@ impl TabViewer for Viewer<'_> {
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Tab) {
         match *tab {
             Tab::Panel(Panel::Tools) => tools_panel(ui),
-            Tab::Panel(Panel::Layers) => layers_panel(ui, self.state),
+            Tab::Panel(Panel::Layers) => layers_panel(ui, self.state, self.layer_click),
             Tab::Panel(Panel::AssetLibrary) => {
                 ui.weak("The asset library arrives in a later version.");
             }
@@ -564,7 +816,7 @@ impl TabViewer for Viewer<'_> {
     }
 
     fn scroll_bars(&self, tab: &Tab) -> [bool; 2] {
-        // Document views manage their own scroll area.
+        // The canvas handles its own scrolling.
         match tab {
             Tab::Document(_) => [false, false],
             Tab::Panel(_) => [true, true],
@@ -574,30 +826,11 @@ impl TabViewer for Viewer<'_> {
 
 impl Viewer<'_> {
     fn document_view(&mut self, ui: &mut egui::Ui, id: DocId) {
-        let Some(open) = self.state.document(id) else {
+        let (Some(open), Some(canvas)) = (self.state.document(id), self.canvases.get_mut(&id))
+        else {
             return;
         };
-        let stale = self
-            .textures
-            .get(&id)
-            .is_none_or(|(revision, _)| *revision != open.revision);
-        if stale {
-            let composite = open.document.composite();
-            let image = egui::ColorImage::from_rgba_unmultiplied(
-                [composite.width() as usize, composite.height() as usize],
-                composite.as_raw(),
-            );
-            let texture =
-                ui.ctx()
-                    .load_texture(format!("document-{}", id.0), image, TextureOptions::NEAREST);
-            self.textures.insert(id, (open.revision, texture));
-        }
-        let texture = &self.textures[&id].1;
-        // 100%: one image pixel per physical screen pixel.
-        let size = texture.size_vec2() / ui.ctx().pixels_per_point();
-        egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
-            ui.image((texture.id(), size));
-        });
+        canvas.show(ui, open, self.checker, self.show_pixel_grid);
     }
 }
 
@@ -610,7 +843,7 @@ fn tools_panel(ui: &mut egui::Ui) {
     });
 }
 
-fn layers_panel(ui: &mut egui::Ui, state: &AppState) {
+fn layers_panel(ui: &mut egui::Ui, state: &AppState, clicked: &mut Option<usize>) {
     if state.current_document().is_none() {
         ui.weak("No document");
         return;
@@ -619,8 +852,19 @@ fn layers_panel(ui: &mut egui::Ui, state: &AppState) {
         ui.horizontal(|ui| {
             ui.label(if row.visible { "👁" } else { "–" })
                 .on_hover_text(if row.visible { "Visible" } else { "Hidden" });
-            ui.label(row.name);
+            if ui.selectable_label(row.active, row.name).clicked() {
+                *clicked = Some(row.index);
+            }
         });
+    }
+}
+
+fn format_zoom(zoom: f32) -> String {
+    let percent = zoom * 100.0;
+    if percent >= 10.0 {
+        format!("{percent:.0}%")
+    } else {
+        format!("{percent:.1}%")
     }
 }
 
