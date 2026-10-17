@@ -1,92 +1,12 @@
 //! Canvas and undo behaviour driven through headless egui frames with
 //! synthetic input, the same way the running app receives it.
 
-use egui::{Event, Key, Modifiers, MouseWheelUnit, PointerButton, Pos2, Vec2};
+use egui::{Event, Key, Modifiers, MouseWheelUnit, PointerButton, Vec2};
 use game_asset_creator::canvas::{ViewAction, MAX_ZOOM, ZOOM_STEP};
-use game_asset_creator::{Command, CommandError, DocId, Document, EditorApp, PixelRect};
+use game_asset_creator::{Command, CommandError, Document, PixelRect};
 
-const SCREEN: Vec2 = Vec2::new(1280.0, 800.0);
-/// A point inside the document area of the default layout.
-const CANVAS_POINT: Pos2 = Pos2::new(640.0, 420.0);
-
-struct Harness {
-    app: EditorApp,
-    ctx: egui::Context,
-    modifiers: Modifiers,
-    sent_modifiers: Modifiers,
-    pointer: Pos2,
-}
-
-impl Harness {
-    fn new() -> Self {
-        let mut h = Self {
-            app: EditorApp::new(),
-            ctx: egui::Context::default(),
-            modifiers: Modifiers::NONE,
-            sent_modifiers: Modifiers::NONE,
-            pointer: CANVAS_POINT,
-        };
-        h.frame(vec![]);
-        h
-    }
-
-    fn frame(&mut self, mut events: Vec<Event>) -> egui::FullOutput {
-        events.insert(0, Event::PointerMoved(self.pointer));
-        if self.modifiers != self.sent_modifiers {
-            events.insert(0, Event::ModifiersChanged(self.modifiers));
-            self.sent_modifiers = self.modifiers;
-        }
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, SCREEN)),
-            events,
-            ..Default::default()
-        };
-        let app = &mut self.app;
-        let mut output = self.ctx.run_ui(input, |ui| app.show(ui));
-        output.textures_delta.clear();
-        output
-    }
-
-    fn frames(&mut self, n: usize) {
-        for _ in 0..n {
-            self.frame(vec![]);
-        }
-    }
-
-    fn key(&mut self, key: Key, pressed: bool) -> Event {
-        Event::Key {
-            key,
-            physical_key: None,
-            pressed,
-            repeat: false,
-            modifiers: self.modifiers,
-        }
-    }
-
-    /// Presses and releases `key` with `modifiers` in one frame.
-    fn shortcut(&mut self, modifiers: Modifiers, key: Key) {
-        self.modifiers = modifiers;
-        let down = self.key(key, true);
-        let up = self.key(key, false);
-        self.frame(vec![down, up]);
-        self.modifiers = Modifiers::NONE;
-        self.frame(vec![]);
-    }
-
-    fn new_doc(&mut self, w: u32, h: u32) -> DocId {
-        let id = self.app.create_document(w, h, 72.0).unwrap();
-        self.frames(2);
-        id
-    }
-
-    fn view(&self, id: DocId) -> game_asset_creator::canvas::ViewState {
-        self.app.canvas(id).unwrap().view().expect("canvas shown")
-    }
-
-    fn uploads(&self, id: DocId) -> u64 {
-        self.app.canvas(id).unwrap().tiles().uploads()
-    }
-}
+mod common;
+use common::{Harness, SCREEN};
 
 /// Changes one pixel of layer 0 and reports a 1×1 dirty rect.
 struct SetPixel {

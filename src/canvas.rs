@@ -6,12 +6,14 @@
 //! `zoom` is physical screen pixels per image pixel, so 1.0 is Actual Size.
 
 use egui::{
-    Color32, ColorImage, CursorIcon, Key, PointerButton, Pos2, Rect, Sense, Stroke, TextureHandle,
-    TextureOptions, TextureWrapMode, Vec2,
+    Color32, ColorImage, CursorIcon, Key, Modifiers, PointerButton, Pos2, Rect, Sense, Shape,
+    Stroke, TextureHandle, TextureOptions, TextureWrapMode, Vec2,
 };
 
 use crate::app_state::OpenDocument;
 use crate::document::{Document, PixelRect};
+use crate::selection::{self, CombineMode, Segment};
+use crate::tools::{SelectionRequest, SelectionShape, Tool, ToolOptions};
 use image::{Rgba, RgbaImage};
 
 pub const MIN_ZOOM: f32 = 0.01;
@@ -28,6 +30,33 @@ pub const CHECKER_SQUARE: f32 = 8.0;
 const CHECKER_LIGHT: u8 = 0xD6;
 const CHECKER_DARK: u8 = 0xA8;
 const GRID_COLOR: Color32 = Color32::from_rgba_premultiplied(40, 40, 40, 110);
+/// Marching-ants dash and gap length in points.
+pub const ANT_DASH: f32 = 4.0;
+/// Marching-ants speed: one dash length per 0.25 s.
+pub const ANT_SPEED: f32 = ANT_DASH / 0.25;
+/// Clicking this close (points) to the first polygon vertex closes the polygon.
+pub const POLYGON_CLOSE_DISTANCE: f32 = 6.0;
+
+/// Phase of the marching-ants pattern at `time` seconds.
+pub fn ant_phase(time: f64) -> f32 {
+    ((time * ANT_SPEED as f64) % (2.0 * ANT_DASH as f64)) as f32
+}
+
+/// A selection gesture in progress (image coordinates).
+#[derive(Debug, Clone, PartialEq)]
+enum Gesture {
+    Drag {
+        tool: Tool,
+        mode: CombineMode,
+        start: Pos2,
+        current: Pos2,
+        path: Vec<Pos2>,
+    },
+    Polygon {
+        mode: CombineMode,
+        points: Vec<Pos2>,
+    },
+}
 
 /// Full-resolution tiles: nearest-neighbor when magnified, linear when
 /// minified. Mipmaps come from the CPU-built pyramid in [`TileCache`].
@@ -458,6 +487,9 @@ pub struct CanvasState {
     hover_pixel: Option<(u32, u32)>,
     panning: bool,
     rect: Option<Rect>,
+    gesture: Option<Gesture>,
+    /// Selection outline in image coordinates, keyed by selection revision.
+    outline: Option<(u64, Vec<Segment>)>,
 }
 
 impl CanvasState {
@@ -469,7 +501,27 @@ impl CanvasState {
             hover_pixel: None,
             panning: false,
             rect: None,
+            gesture: None,
+            outline: None,
         }
+    }
+
+    /// Abandons any selection gesture in progress (e.g. an open polygon).
+    pub fn cancel_gesture(&mut self) {
+        self.gesture = None;
+    }
+
+    /// Vertices of the polygon being drawn, if any.
+    pub fn polygon_points(&self) -> Option<usize> {
+        match &self.gesture {
+            Some(Gesture::Polygon { points, .. }) => Some(points.len()),
+            _ => None,
+        }
+    }
+
+    /// Whether a selection gesture is in progress.
+    pub fn has_gesture(&self) -> bool {
+        self.gesture.is_some()
     }
 
     /// `None` until the canvas has been shown once.
@@ -521,14 +573,18 @@ impl CanvasState {
         });
     }
 
-    /// Draws the canvas filling the available space and handles navigation input.
+    /// Draws the canvas filling the available space, handles navigation, and
+    /// runs the active tool. Returns a finished selection gesture, if any.
+    #[allow(clippy::too_many_arguments)]
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
         open: &OpenDocument,
         checker: &TextureHandle,
         show_grid: bool,
-    ) {
+        tool: Tool,
+        options: &ToolOptions,
+    ) -> Option<SelectionRequest> {
         let doc = &open.document;
         let image = [doc.width(), doc.height()];
         let ppp = ui.ctx().pixels_per_point();
@@ -584,6 +640,21 @@ impl CanvasState {
         }
         self.view = Some(view);
 
+        let request = if self.panning || space_down {
+            None
+        } else {
+            self.run_tool(ui, &response, rect, &view, ppp, image, tool, options)
+        };
+        let over_image = pointer
+            .filter(|_| hovered)
+            .map(|p| view.view_to_image((p - rect.min).to_pos2(), ppp))
+            .is_some_and(|p| {
+                p.x >= 0.0 && p.y >= 0.0 && p.x < image[0] as f32 && p.y < image[1] as f32
+            });
+        if over_image && !self.panning && !space_down {
+            ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
+        }
+
         self.hover_pixel = pointer
             .filter(|_| hovered)
             .map(|p| view.view_to_image((p - rect.min).to_pos2(), ppp))
@@ -597,7 +668,7 @@ impl CanvasState {
         let image_rect = view.image_rect(image, ppp).translate(rect.min.to_vec2());
         let visible = image_rect.intersect(rect);
         if !visible.is_positive() {
-            return;
+            return request;
         }
 
         // Screen-space checkerboard: one texture repeat covers two squares.
@@ -656,7 +727,281 @@ impl CanvasState {
                 );
             }
         }
+
+        // --- selection outline and gesture preview ----------------------
+        let time = ui.input(|i| i.time);
+        let phase = ant_phase(time);
+        let to_screen = |p: Pos2| {
+            (image_rect.min.to_vec2() + p.to_vec2() * view.points_per_pixel(ppp)).to_pos2()
+        };
+        let mut shapes = Vec::new();
+        if let Some(mask) = doc.selection() {
+            if self.outline.as_ref().map(|(rev, _)| *rev) != Some(open.selection_revision) {
+                self.outline = Some((open.selection_revision, selection::outline(mask)));
+            }
+            let clip = rect.expand(1.0);
+            for &((x0, y0), (x1, y1)) in &self.outline.as_ref().expect("computed above").1 {
+                let a = to_screen(Pos2::new(x0 as f32, y0 as f32));
+                let b = to_screen(Pos2::new(x1 as f32, y1 as f32));
+                if !clip.intersects(Rect::from_two_pos(a, b)) {
+                    continue;
+                }
+                ants(&mut shapes, &[a, b], phase);
+            }
+        } else {
+            self.outline = None;
+        }
+        match &self.gesture {
+            Some(Gesture::Drag {
+                tool,
+                start,
+                current,
+                path,
+                ..
+            }) => {
+                let path: Vec<Pos2> = match tool {
+                    Tool::RectSelect => {
+                        let r = Rect::from_two_pos(to_screen(*start), to_screen(*current));
+                        vec![
+                            r.left_top(),
+                            r.right_top(),
+                            r.right_bottom(),
+                            r.left_bottom(),
+                            r.left_top(),
+                        ]
+                    }
+                    Tool::EllipseSelect => {
+                        let r = Rect::from_two_pos(to_screen(*start), to_screen(*current));
+                        (0..=64)
+                            .map(|i| {
+                                let a = i as f32 / 64.0 * std::f32::consts::TAU;
+                                r.center()
+                                    + Vec2::new(
+                                        a.cos() * r.width() / 2.0,
+                                        a.sin() * r.height() / 2.0,
+                                    )
+                            })
+                            .collect()
+                    }
+                    _ => {
+                        let mut p: Vec<Pos2> = path.iter().map(|p| to_screen(*p)).collect();
+                        if let Some(first) = p.first().copied() {
+                            p.push(first);
+                        }
+                        p
+                    }
+                };
+                ants(&mut shapes, &path, phase);
+            }
+            Some(Gesture::Polygon { points, .. }) => {
+                let mut path: Vec<Pos2> = points.iter().map(|p| to_screen(*p)).collect();
+                if let Some(pointer) = pointer.filter(|_| hovered) {
+                    path.push(pointer);
+                }
+                ants(&mut shapes, &path, phase);
+            }
+            None => {}
+        }
+        if !shapes.is_empty() {
+            painter.extend(shapes);
+        }
+        if doc.selection().is_some() || self.gesture.is_some() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(40));
+        }
+        request
     }
+
+    /// Feeds pointer and key input to the active selection tool.
+    #[allow(clippy::too_many_arguments)]
+    fn run_tool(
+        &mut self,
+        ui: &mut egui::Ui,
+        response: &egui::Response,
+        rect: Rect,
+        view: &ViewState,
+        ppp: f32,
+        image: [u32; 2],
+        tool: Tool,
+        options: &ToolOptions,
+    ) -> Option<SelectionRequest> {
+        let to_image = |screen: Pos2| view.view_to_image((screen - rect.min).to_pos2(), ppp);
+        let (modifiers, press_origin, pointer) = ui.input(|i| {
+            (
+                i.modifiers,
+                i.pointer.press_origin(),
+                i.pointer.interact_pos(),
+            )
+        });
+        let mode_now = CombineMode::from_modifiers(modifiers.shift, modifiers.alt, options.mode);
+        let tuple = |p: Pos2| (p.x, p.y);
+
+        // A gesture from another tool is abandoned when the tool changes.
+        let stale = match &self.gesture {
+            Some(Gesture::Drag { tool: t, .. }) => *t != tool,
+            Some(Gesture::Polygon { .. }) => tool != Tool::PolygonLasso,
+            None => false,
+        };
+        if stale {
+            self.gesture = None;
+        }
+
+        match tool {
+            Tool::RectSelect | Tool::EllipseSelect | Tool::Lasso => {
+                if response.drag_started_by(PointerButton::Primary) {
+                    if let Some(origin) = press_origin {
+                        let start = to_image(origin);
+                        self.gesture = Some(Gesture::Drag {
+                            tool,
+                            mode: mode_now,
+                            start,
+                            current: start,
+                            path: vec![start],
+                        });
+                    }
+                }
+                if let (Some(Gesture::Drag { current, path, .. }), Some(p)) =
+                    (&mut self.gesture, pointer)
+                {
+                    if response.dragged_by(PointerButton::Primary)
+                        || response.drag_stopped_by(PointerButton::Primary)
+                    {
+                        let p = to_image(p);
+                        *current = p;
+                        let min_step = 1.0 / view.points_per_pixel(ppp);
+                        if path.last().is_none_or(|last| last.distance(p) >= min_step) {
+                            path.push(p);
+                        }
+                    }
+                }
+                if response.drag_stopped_by(PointerButton::Primary) {
+                    if let Some(Gesture::Drag {
+                        tool,
+                        mode,
+                        start,
+                        current,
+                        path,
+                    }) = self.gesture.take()
+                    {
+                        let shape = match tool {
+                            Tool::RectSelect => SelectionShape::Rect(tuple(start), tuple(current)),
+                            Tool::EllipseSelect => {
+                                SelectionShape::Ellipse(tuple(start), tuple(current))
+                            }
+                            _ => SelectionShape::Polygon(path.into_iter().map(tuple).collect()),
+                        };
+                        return Some(SelectionRequest { tool, shape, mode });
+                    }
+                }
+                if response.clicked_by(PointerButton::Primary) {
+                    return Some(SelectionRequest {
+                        tool,
+                        shape: SelectionShape::Clear,
+                        mode: mode_now,
+                    });
+                }
+                None
+            }
+            Tool::MagicWand => {
+                if !response.clicked_by(PointerButton::Primary) {
+                    return None;
+                }
+                let p = to_image(pointer?);
+                if p.x < 0.0 || p.y < 0.0 || p.x >= image[0] as f32 || p.y >= image[1] as f32 {
+                    return None;
+                }
+                Some(SelectionRequest {
+                    tool,
+                    shape: SelectionShape::Wand(p.x as u32, p.y as u32),
+                    mode: mode_now,
+                })
+            }
+            Tool::PolygonLasso => {
+                let close = |gesture: Option<Gesture>| match gesture {
+                    Some(Gesture::Polygon { mode, points }) if points.len() >= 3 => {
+                        Some(SelectionRequest {
+                            tool,
+                            shape: SelectionShape::Polygon(points.into_iter().map(tuple).collect()),
+                            mode,
+                        })
+                    }
+                    _ => None,
+                };
+                if self.gesture.is_some() {
+                    let (enter, backspace, escape) = ui.input_mut(|i| {
+                        (
+                            i.consume_key(Modifiers::NONE, Key::Enter),
+                            i.consume_key(Modifiers::NONE, Key::Backspace),
+                            i.consume_key(Modifiers::NONE, Key::Escape),
+                        )
+                    });
+                    if escape {
+                        self.gesture = None;
+                        return None;
+                    }
+                    if enter {
+                        return close(self.gesture.take());
+                    }
+                    if backspace {
+                        if let Some(Gesture::Polygon { points, .. }) = &mut self.gesture {
+                            points.pop();
+                            if points.is_empty() {
+                                self.gesture = None;
+                            }
+                        }
+                    }
+                }
+                // egui reports a third quick click as a triple-click (it only
+                // checks distance to the previous click), so accept both.
+                let multi_click = response.double_clicked_by(PointerButton::Primary)
+                    || response.triple_clicked_by(PointerButton::Primary);
+                if multi_click && self.gesture.is_some() {
+                    return close(self.gesture.take());
+                }
+                if response.clicked_by(PointerButton::Primary) {
+                    let screen = pointer?;
+                    let p = to_image(screen);
+                    match &mut self.gesture {
+                        Some(Gesture::Polygon { points, .. }) => {
+                            let first = view.image_to_view(points[0], ppp) + rect.min.to_vec2();
+                            // Clicking the first vertex closes the polygon; with
+                            // fewer than three vertices, closing cancels it.
+                            if first.distance(screen) <= POLYGON_CLOSE_DISTANCE {
+                                return close(self.gesture.take());
+                            }
+                            points.push(p);
+                        }
+                        _ => {
+                            self.gesture = Some(Gesture::Polygon {
+                                mode: mode_now,
+                                points: vec![p],
+                            });
+                        }
+                    }
+                }
+                None
+            }
+        }
+    }
+}
+
+/// Appends marching-ants shapes for a polyline: a white line with black
+/// dashes on top, shifted by `phase` (screen-anchored so dashes line up).
+fn ants(shapes: &mut Vec<Shape>, path: &[Pos2], phase: f32) {
+    if path.len() < 2 {
+        return;
+    }
+    shapes.push(Shape::line(path.to_vec(), Stroke::new(1.0, Color32::WHITE)));
+    let anchor = path[0].x + path[0].y;
+    let offset = (phase - anchor).rem_euclid(2.0 * ANT_DASH);
+    Shape::dashed_line_many_with_offset(
+        path,
+        Stroke::new(1.0, Color32::BLACK),
+        &[ANT_DASH],
+        &[ANT_DASH],
+        offset,
+        shapes,
+    );
 }
 
 /// Image pixels covered by the visible part of the canvas.

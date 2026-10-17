@@ -4,6 +4,8 @@ pub mod app_state;
 pub mod canvas;
 pub mod document;
 pub mod io;
+pub mod selection;
+pub mod tools;
 pub mod ui;
 pub mod undo;
 
