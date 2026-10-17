@@ -5,7 +5,10 @@ use image::{GrayImage, Luma, Rgba, RgbaImage};
 
 use crate::document::{blend_over, Document, PixelRect};
 use crate::selection;
-use crate::undo::{apply_masked, blend_by_mask, Command, CommandError, SavedRegion};
+use crate::undo::{
+    apply_masked_target, blend_by_mask, target_crop, target_image, write_target_pixel,
+    write_target_region, Command, CommandError, PaintTarget, SavedRegion,
+};
 
 pub const MIN_BRUSH_SIZE: f32 = 1.0;
 pub const MAX_BRUSH_SIZE: f32 = 500.0;
@@ -318,7 +321,28 @@ pub enum StrokeKind {
     },
 }
 
+/// The gray (luminance) a color stands for on a mask, alpha kept.
+pub fn mask_gray(color: [u8; 4]) -> [u8; 4] {
+    let l =
+        (0.299 * color[0] as f32 + 0.587 * color[1] as f32 + 0.114 * color[2] as f32).round() as u8;
+    [l, l, l, color[3]]
+}
+
 impl StrokeKind {
+    /// The stroke as applied to a mask: colors become gray and the eraser
+    /// paints white (reveals).
+    pub fn for_mask(self) -> Self {
+        match self {
+            Self::Brush { color } => Self::Brush {
+                color: mask_gray(color),
+            },
+            Self::Eraser => Self::Brush {
+                color: [255, 255, 255, 255],
+            },
+            Self::Clone { offset } => Self::Clone { offset },
+        }
+    }
+
     pub fn label(&self) -> &'static str {
         match self {
             Self::Brush { .. } => "Brush Stroke",
@@ -344,7 +368,7 @@ pub fn eraser_pixel(old: Rgba<u8>, amount: u8) -> Rgba<u8> {
 #[derive(Debug, Clone)]
 pub struct ActiveStroke {
     kind: StrokeKind,
-    layer: usize,
+    target: PaintTarget,
     brush: BrushSettings,
     snapshot: RgbaImage,
     mask: StrokeMask,
@@ -363,15 +387,22 @@ impl ActiveStroke {
         brush: BrushSettings,
         start: Point,
     ) -> Result<(Self, Option<PixelRect>), CommandError> {
-        let len = doc.layer_count();
-        let snapshot = doc
-            .layer(layer)
-            .ok_or(CommandError::NoSuchLayer { index: layer, len })?
-            .pixels
-            .clone();
+        Self::begin_on(doc, PaintTarget::Pixels(layer), kind, brush, start)
+    }
+
+    /// [`Self::begin`] on a layer's pixels or mask. On a mask the kind's
+    /// colors should already be gray (see [`StrokeKind::for_mask`]).
+    pub fn begin_on(
+        doc: &mut Document,
+        target: PaintTarget,
+        kind: StrokeKind,
+        brush: BrushSettings,
+        start: Point,
+    ) -> Result<(Self, Option<PixelRect>), CommandError> {
+        let snapshot = target_image(doc, target)?;
         let mut stroke = Self {
             kind,
-            layer,
+            target,
             brush,
             mask: StrokeMask::new(doc.width(), doc.height()),
             tail: StrokeMask::new(doc.width(), doc.height()),
@@ -400,15 +431,12 @@ impl ActiveStroke {
         let end = self.sampler.end_point();
         let patch = self.mask.bounds().and_then(|rect| {
             let rect = rect.intersect(doc.editable_bounds())?;
-            let layer = doc.layer(self.layer)?;
             let before =
                 image::imageops::crop_imm(&self.snapshot, rect.x, rect.y, rect.width, rect.height)
                     .to_image();
-            let after =
-                image::imageops::crop_imm(&layer.pixels, rect.x, rect.y, rect.width, rect.height)
-                    .to_image();
+            let after = target_crop(doc, self.target, rect)?;
             (before != after)
-                .then(|| PixelPatch::new(self.kind.label(), self.layer, rect, before, after))
+                .then(|| PixelPatch::on_target(self.kind.label(), self.target, rect, before, after))
         });
         (patch, dirty, end)
     }
@@ -422,9 +450,7 @@ impl ActiveStroke {
         let before =
             image::imageops::crop_imm(&self.snapshot, rect.x, rect.y, rect.width, rect.height)
                 .to_image();
-        if let Some(layer) = doc.layer_mut(self.layer) {
-            image::imageops::replace(&mut layer.pixels, &before, rect.x as i64, rect.y as i64);
-        }
+        write_target_region(doc, self.target, rect, &before);
         Some(rect)
     }
 
@@ -451,7 +477,7 @@ impl ActiveStroke {
         let rect = region?;
         let opacity = self.brush.opacity.clamp(0.0, 1.0);
         let (w, h) = (doc.width() as i64, doc.height() as i64);
-        let (selection, layer) = doc.selection_and_layer_mut(self.layer);
+        let (selection, layer) = doc.selection_and_layer_mut(self.target.layer());
         let layer = layer?;
         for y in rect.y..rect.bottom() {
             for x in rect.x..rect.right() {
@@ -477,9 +503,14 @@ impl ActiveStroke {
                     }
                 };
                 let sel = selection.map_or(255, |m| m.get_pixel(x, y)[0]);
-                layer
-                    .pixels
-                    .put_pixel(x, y, blend_by_mask(old, painted, sel));
+                write_target_pixel(
+                    layer,
+                    self.target,
+                    x,
+                    y,
+                    old,
+                    blend_by_mask(old, painted, sel),
+                );
             }
         }
         Some(rect)
@@ -490,7 +521,7 @@ impl ActiveStroke {
 #[derive(Debug, Clone)]
 pub struct PixelPatch {
     label: &'static str,
-    layer: usize,
+    target: PaintTarget,
     rect: PixelRect,
     before: RgbaImage,
     after: RgbaImage,
@@ -504,9 +535,20 @@ impl PixelPatch {
         before: RgbaImage,
         after: RgbaImage,
     ) -> Self {
+        Self::on_target(label, PaintTarget::Pixels(layer), rect, before, after)
+    }
+
+    /// A patch of a layer's pixels or mask (regions in target RGBA form).
+    pub fn on_target(
+        label: &'static str,
+        target: PaintTarget,
+        rect: PixelRect,
+        before: RgbaImage,
+        after: RgbaImage,
+    ) -> Self {
         Self {
             label,
-            layer,
+            target,
             rect,
             before,
             after,
@@ -515,16 +557,16 @@ impl PixelPatch {
 
     fn write(&self, doc: &mut Document, pixels: &RgbaImage) -> Result<(), CommandError> {
         let len = doc.layer_count();
-        let layer = doc.layer_mut(self.layer).ok_or(CommandError::NoSuchLayer {
-            index: self.layer,
-            len,
-        })?;
-        image::imageops::replace(
-            &mut layer.pixels,
-            pixels,
-            self.rect.x as i64,
-            self.rect.y as i64,
-        );
+        let layer = doc
+            .layer(self.target.layer())
+            .ok_or(CommandError::NoSuchLayer {
+                index: self.target.layer(),
+                len,
+            })?;
+        if matches!(self.target, PaintTarget::Mask(_)) && layer.mask().is_none() {
+            return Err(CommandError::Invalid("the layer has no mask".to_owned()));
+        }
+        write_target_region(doc, self.target, self.rect, pixels);
         Ok(())
     }
 }
@@ -555,7 +597,7 @@ impl Command for PixelPatch {
 
 /// Paint Bucket: fills the magic-wand region at `seed` with `color` at `opacity`.
 pub struct BucketFill {
-    layer: usize,
+    target: PaintTarget,
     seed: (u32, u32),
     color: Rgba<u8>,
     tolerance: u8,
@@ -574,7 +616,7 @@ impl BucketFill {
         opacity: f32,
     ) -> Self {
         Self {
-            layer,
+            target: PaintTarget::Pixels(layer),
             seed,
             color: Rgba(color),
             tolerance,
@@ -585,25 +627,28 @@ impl BucketFill {
     }
 }
 
+impl BucketFill {
+    /// Fills a layer's pixels or mask (pass a gray color for a mask).
+    pub fn on_target(mut self, target: PaintTarget) -> Self {
+        self.target = target;
+        self
+    }
+}
+
 impl Command for BucketFill {
     fn label(&self) -> &str {
         "Paint Bucket"
     }
 
     fn apply(&mut self, doc: &mut Document) -> Result<(), CommandError> {
-        let len = doc.layer_count();
-        let layer = doc.layer(self.layer).ok_or(CommandError::NoSuchLayer {
-            index: self.layer,
-            len,
-        })?;
+        let image = target_image(doc, self.target)?;
         if self.seed.0 >= doc.width() || self.seed.1 >= doc.height() {
             return Err(CommandError::Invalid("click outside the image".to_owned()));
         }
-        let region =
-            selection::magic_wand(&layer.pixels, self.seed, self.tolerance, self.contiguous);
+        let region = selection::magic_wand(&image, self.seed, self.tolerance, self.contiguous);
         let amount = (self.opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
         let color = self.color;
-        self.saved = Some(apply_masked(doc, self.layer, |x, y, old| {
+        self.saved = Some(apply_masked_target(doc, self.target, |x, y, old| {
             if region.get_pixel(x, y)[0] == 0 {
                 old
             } else {
@@ -679,7 +724,7 @@ pub fn mix_premultiplied(a: Rgba<u8>, b: Rgba<u8>, t: f32) -> Rgba<u8> {
 
 /// Gradient tool: paints a linear or radial gradient over the layer.
 pub struct GradientFill {
-    layer: usize,
+    target: PaintTarget,
     start: Point,
     end: Point,
     kind: GradientKind,
@@ -709,7 +754,7 @@ impl GradientFill {
             }
         };
         Self {
-            layer,
+            target: PaintTarget::Pixels(layer),
             start,
             end,
             kind,
@@ -718,6 +763,12 @@ impl GradientFill {
             opacity,
             saved: None,
         }
+    }
+
+    /// Paints on a layer's pixels or mask (pass gray colors for a mask).
+    pub fn on_target(mut self, target: PaintTarget) -> Self {
+        self.target = target;
+        self
     }
 
     /// The gradient color at pixel `(x, y)` before opacity.
@@ -746,7 +797,7 @@ impl Command for GradientFill {
             saved: None,
             ..*self
         };
-        self.saved = Some(apply_masked(doc, self.layer, |x, y, old| {
+        self.saved = Some(apply_masked_target(doc, self.target, |x, y, old| {
             blend_over(old, gradient.color_at(x, y), opacity)
         })?);
         Ok(())

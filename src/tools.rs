@@ -4,6 +4,7 @@
 use crate::document::Document;
 use crate::paint::{BrushSettings, GradientColors, GradientKind};
 use crate::selection::{self, CombineMode};
+use crate::transform::Interpolation;
 use crate::undo::SetSelection;
 
 /// The selectable tools.
@@ -21,10 +22,12 @@ pub enum Tool {
     PaintBucket,
     Gradient,
     CloneStamp,
+    Move,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 11] = [
+    pub const ALL: [Tool; 12] = [
+        Self::Move,
         Self::RectSelect,
         Self::EllipseSelect,
         Self::Lasso,
@@ -51,6 +54,7 @@ impl Tool {
             Self::PaintBucket => "Paint Bucket",
             Self::Gradient => "Gradient",
             Self::CloneStamp => "Clone Stamp",
+            Self::Move => "Move",
         }
     }
 
@@ -91,6 +95,7 @@ impl Tool {
             Self::Eyedropper => "I",
             Self::PaintBucket | Self::Gradient => "G",
             Self::CloneStamp => "S",
+            Self::Move => "V",
         }
     }
 
@@ -182,6 +187,8 @@ pub struct ToolOptions {
     pub gradient_opacity: f32,
     /// Eyedropper reads the visible composite (true) or the active layer.
     pub sample_all_layers: bool,
+    /// Free Transform resampling.
+    pub transform_interpolation: Interpolation,
 }
 
 impl ToolOptions {
@@ -223,6 +230,7 @@ impl Default for ToolOptions {
             gradient_colors: GradientColors::ForegroundToBackground,
             gradient_opacity: 1.0,
             sample_all_layers: true,
+            transform_interpolation: Interpolation::Bilinear,
         }
     }
 }

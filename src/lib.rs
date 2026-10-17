@@ -4,9 +4,13 @@ pub mod app_state;
 pub mod canvas;
 pub mod document;
 pub mod io;
+pub mod layers;
+pub mod layers_panel;
 pub mod paint;
+pub mod project;
 pub mod selection;
 pub mod tools;
+pub mod transform;
 pub mod ui;
 pub mod undo;
 

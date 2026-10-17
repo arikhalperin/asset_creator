@@ -62,13 +62,23 @@ impl Change {
     }
 }
 
+/// A recorded command with its id and the memory cost recorded when it
+/// entered history.
+struct Entry {
+    id: u64,
+    cost: usize,
+    command: Box<dyn Command>,
+}
+
 /// Undo and redo history for one document.
 pub struct UndoStack {
-    /// Commands with the memory cost recorded when they entered history.
-    undo: VecDeque<(usize, Box<dyn Command>)>,
-    redo: Vec<(usize, Box<dyn Command>)>,
+    undo: VecDeque<Entry>,
+    redo: Vec<Entry>,
     budget: usize,
     memory: usize,
+    next_id: u64,
+    /// Id of the newest step dropped by the memory budget (0 = none).
+    floor_id: u64,
 }
 
 impl Default for UndoStack {
@@ -100,6 +110,8 @@ impl UndoStack {
             redo: Vec::new(),
             budget,
             memory: 0,
+            next_id: 1,
+            floor_id: 0,
         }
     }
 
@@ -112,15 +124,18 @@ impl UndoStack {
     ) -> Result<Change, CommandError> {
         command.apply(doc)?;
         let change = Change::of(command.as_ref(), doc);
-        for (cost, _) in self.redo.drain(..) {
-            self.memory -= cost;
+        for entry in self.redo.drain(..) {
+            self.memory -= entry.cost;
         }
         let cost = command.memory_cost();
         self.memory += cost;
-        self.undo.push_back((cost, command));
+        let id = self.next_id;
+        self.next_id += 1;
+        self.undo.push_back(Entry { id, cost, command });
         while self.memory > self.budget && self.undo.len() > 1 {
-            if let Some((cost, _)) = self.undo.pop_front() {
-                self.memory -= cost;
+            if let Some(oldest) = self.undo.pop_front() {
+                self.memory -= oldest.cost;
+                self.floor_id = oldest.id;
             }
         }
         Ok(change)
@@ -128,23 +143,23 @@ impl UndoStack {
 
     /// Reverts the most recent command. Returns the region it changed.
     pub fn undo(&mut self, doc: &mut Document) -> Option<Change> {
-        let (cost, mut command) = self.undo.pop_back()?;
-        command.revert(doc);
-        let change = Change::of(command.as_ref(), doc);
-        self.redo.push((cost, command));
+        let mut entry = self.undo.pop_back()?;
+        entry.command.revert(doc);
+        let change = Change::of(entry.command.as_ref(), doc);
+        self.redo.push(entry);
         Some(change)
     }
 
     /// Re-applies the most recently undone command. Returns the region it changed.
     pub fn redo(&mut self, doc: &mut Document) -> Option<Change> {
-        let (cost, mut command) = self.redo.pop()?;
-        if command.apply(doc).is_err() {
+        let mut entry = self.redo.pop()?;
+        if entry.command.apply(doc).is_err() {
             // The document no longer fits this command; forget it.
-            self.memory -= cost;
+            self.memory -= entry.cost;
             return None;
         }
-        let change = Change::of(command.as_ref(), doc);
-        self.undo.push_back((cost, command));
+        let change = Change::of(entry.command.as_ref(), doc);
+        self.undo.push_back(entry);
         Some(change)
     }
 
@@ -157,11 +172,11 @@ impl UndoStack {
     }
 
     pub fn undo_label(&self) -> Option<&str> {
-        self.undo.back().map(|(_, c)| c.label())
+        self.undo.back().map(|e| e.command.label())
     }
 
     pub fn redo_label(&self) -> Option<&str> {
-        self.redo.last().map(|(_, c)| c.label())
+        self.redo.last().map(|e| e.command.label())
     }
 
     pub fn undo_len(&self) -> usize {
@@ -172,16 +187,133 @@ impl UndoStack {
         self.redo.len()
     }
 
+    /// Identifies the current state: the id of the most recently applied
+    /// step (0 for the initial state). Equal ids mean identical documents.
+    pub fn state_id(&self) -> u64 {
+        self.undo.back().map_or(self.floor_id, |e| e.id)
+    }
+
     /// Bytes currently retained by recorded commands.
     pub fn memory_used(&self) -> usize {
         self.memory
     }
 }
 
-/// A layer region saved before an edit, for exact revert.
+/// What a pixel edit writes to: a layer's pixels or its mask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PaintTarget {
+    Pixels(usize),
+    Mask(usize),
+}
+
+impl PaintTarget {
+    pub fn layer(self) -> usize {
+        match self {
+            Self::Pixels(i) | Self::Mask(i) => i,
+        }
+    }
+}
+
+/// The target as an RGBA image; a mask reads as opaque gray.
+pub fn target_image(doc: &Document, target: PaintTarget) -> Result<RgbaImage, CommandError> {
+    let len = doc.layer_count();
+    let layer = doc.layer(target.layer()).ok_or(CommandError::NoSuchLayer {
+        index: target.layer(),
+        len,
+    })?;
+    match target {
+        PaintTarget::Pixels(_) => Ok(layer.pixels.clone()),
+        PaintTarget::Mask(_) => {
+            let mask = layer
+                .mask()
+                .ok_or_else(|| CommandError::Invalid("the layer has no mask".to_owned()))?;
+            Ok(mask_to_rgba(mask))
+        }
+    }
+}
+
+/// A mask as opaque gray RGBA.
+pub fn mask_to_rgba(mask: &GrayImage) -> RgbaImage {
+    RgbaImage::from_fn(mask.width(), mask.height(), |x, y| {
+        let v = mask.get_pixel(x, y)[0];
+        Rgba([v, v, v, 255])
+    })
+}
+
+/// The mask value an RGBA result stands for: flattened over `old` (opaque gray).
+pub fn rgba_to_mask_value(old: u8, value: Rgba<u8>) -> u8 {
+    crate::document::blend_over(Rgba([old, old, old, 255]), value, 1.0)[0]
+}
+
+/// Writes one pixel of the target; `old` is the pixel's value (in target
+/// RGBA form) before the edit, used to flatten mask results.
+pub fn write_target_pixel(
+    layer: &mut crate::document::Layer,
+    target: PaintTarget,
+    x: u32,
+    y: u32,
+    old: Rgba<u8>,
+    value: Rgba<u8>,
+) {
+    match target {
+        PaintTarget::Pixels(_) => layer.pixels.put_pixel(x, y, value),
+        PaintTarget::Mask(_) => {
+            if let Some(mask) = layer.mask_mut() {
+                mask.put_pixel(x, y, image::Luma([rgba_to_mask_value(old[0], value)]));
+            }
+        }
+    }
+}
+
+/// A region of the target in RGBA form (a mask reads as opaque gray).
+pub fn target_crop(doc: &Document, target: PaintTarget, rect: PixelRect) -> Option<RgbaImage> {
+    let layer = doc.layer(target.layer())?;
+    match target {
+        PaintTarget::Pixels(_) => Some(
+            image::imageops::crop_imm(&layer.pixels, rect.x, rect.y, rect.width, rect.height)
+                .to_image(),
+        ),
+        PaintTarget::Mask(_) => {
+            let mask = layer.mask()?;
+            Some(RgbaImage::from_fn(rect.width, rect.height, |x, y| {
+                let v = mask.get_pixel(rect.x + x, rect.y + y)[0];
+                Rgba([v, v, v, 255])
+            }))
+        }
+    }
+}
+
+/// Writes a region (in target RGBA form) back to the target.
+pub fn write_target_region(
+    doc: &mut Document,
+    target: PaintTarget,
+    rect: PixelRect,
+    pixels: &RgbaImage,
+) {
+    let Some(layer) = doc.layer_mut(target.layer()) else {
+        return;
+    };
+    match target {
+        PaintTarget::Pixels(_) => {
+            image::imageops::replace(&mut layer.pixels, pixels, rect.x as i64, rect.y as i64);
+        }
+        PaintTarget::Mask(_) => {
+            if let Some(mask) = layer.mask_mut() {
+                for (x, y, p) in pixels.enumerate_pixels() {
+                    let (mx, my) = (rect.x + x, rect.y + y);
+                    if mx < mask.width() && my < mask.height() {
+                        mask.put_pixel(mx, my, image::Luma([p[0]]));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A target region saved before an edit, for exact revert.
 #[derive(Debug, Clone)]
 pub struct SavedRegion {
-    pub layer: usize,
+    pub target: PaintTarget,
     pub rect: PixelRect,
     pixels: RgbaImage,
 }
@@ -189,14 +321,7 @@ pub struct SavedRegion {
 impl SavedRegion {
     /// Writes the saved pixels back.
     pub fn restore(&self, doc: &mut Document) {
-        if let Some(layer) = doc.layer_mut(self.layer) {
-            image::imageops::replace(
-                &mut layer.pixels,
-                &self.pixels,
-                self.rect.x as i64,
-                self.rect.y as i64,
-            );
-        }
+        write_target_region(doc, self.target, self.rect, &self.pixels);
     }
 
     pub fn bytes(&self) -> usize {
@@ -237,27 +362,35 @@ pub fn apply_masked(
     layer: usize,
     edit: impl Fn(u32, u32, Rgba<u8>) -> Rgba<u8>,
 ) -> Result<SavedRegion, CommandError> {
-    let len = doc.layer_count();
+    apply_masked_target(doc, PaintTarget::Pixels(layer), edit)
+}
+
+/// [`apply_masked`] for a layer's pixels or mask. On a mask, `old` is the
+/// mask value as opaque gray and results are flattened back to gray.
+pub fn apply_masked_target(
+    doc: &mut Document,
+    target: PaintTarget,
+    edit: impl Fn(u32, u32, Rgba<u8>) -> Rgba<u8>,
+) -> Result<SavedRegion, CommandError> {
+    let image = target_image(doc, target)?;
     let rect = doc.editable_bounds();
-    let (mask, target) = doc.selection_and_layer_mut(layer);
-    let target = target.ok_or(CommandError::NoSuchLayer { index: layer, len })?;
-    let saved = image::imageops::crop_imm(&target.pixels, rect.x, rect.y, rect.width, rect.height)
-        .to_image();
+    let saved =
+        image::imageops::crop_imm(&image, rect.x, rect.y, rect.width, rect.height).to_image();
+    let (selection, layer) = doc.selection_and_layer_mut(target.layer());
+    let layer = layer.expect("checked by target_image");
     for y in rect.y..rect.bottom() {
         for x in rect.x..rect.right() {
-            let coverage = mask.map_or(255, |m| m.get_pixel(x, y)[0]);
+            let coverage = selection.map_or(255, |m| m.get_pixel(x, y)[0]);
             if coverage == 0 {
                 continue;
             }
-            let old = *target.pixels.get_pixel(x, y);
+            let old = *image.get_pixel(x, y);
             let new = edit(x, y, old);
-            target
-                .pixels
-                .put_pixel(x, y, blend_by_mask(old, new, coverage));
+            write_target_pixel(layer, target, x, y, old, blend_by_mask(old, new, coverage));
         }
     }
     Ok(SavedRegion {
-        layer,
+        target,
         rect,
         pixels: saved,
     })
@@ -636,5 +769,34 @@ mod tests {
         let bad = SetSelection::new("Bad", Some(GrayImage::new(2, 2)));
         assert!(stack.execute(&mut doc, Box::new(bad)).is_err());
         assert!(!stack.can_undo());
+    }
+
+    #[test]
+    fn state_ids_identify_history_positions() {
+        let mut doc = doc_with_pattern();
+        let mut stack = UndoStack::new();
+        assert_eq!(stack.state_id(), 0);
+        stack.execute(&mut doc, mark(1, 1)).unwrap();
+        let first = stack.state_id();
+        stack.execute(&mut doc, mark(1, 2)).unwrap();
+        assert_ne!(stack.state_id(), first);
+        stack.undo(&mut doc);
+        assert_eq!(stack.state_id(), first);
+        stack.undo(&mut doc);
+        assert_eq!(stack.state_id(), 0);
+        stack.redo(&mut doc);
+        assert_eq!(stack.state_id(), first);
+        // A new branch gets a new id even at the same depth.
+        stack.undo(&mut doc);
+        stack.execute(&mut doc, mark(1, 3)).unwrap();
+        assert_ne!(stack.state_id(), first);
+        assert_ne!(stack.state_id(), 0);
+
+        // Dropped history: undoing everything left does not return to state 0.
+        let mut small = UndoStack::with_budget(10);
+        small.execute(&mut doc, mark(8, 4)).unwrap();
+        small.execute(&mut doc, mark(8, 5)).unwrap();
+        small.undo(&mut doc);
+        assert_ne!(small.state_id(), 0);
     }
 }

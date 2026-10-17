@@ -56,3 +56,8 @@ The editing canvas shown in each document tab: an egui widget that displays the 
 - When the document has a selection, its boundary (the edges between pixels with mask value ≥ 128 and pixels below 128 or outside the document) is drawn as alternating black and white dashes, 4 points each, in screen space, 1 point wide.
 - The dash pattern moves continuously over time (one dash length per 0.25 s) and the canvas keeps repainting while a selection exists.
 - Only boundary segments within the visible area are drawn; the outline is recomputed only when the selection changes.
+
+### Move tool and Free Transform
+
+- With the Move tool, dragging on the canvas moves the active layer's content (or the selected content) live; the pointer shows a move cursor.
+- During Free Transform the canvas draws the transformed bounding box with eight square handles (corners and edge midpoints) and a center marker; the pointer shows move, resize, or rotate cursors depending on where it is (inside the box, on a handle, or just outside a corner).

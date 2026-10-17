@@ -10,6 +10,17 @@ fn main() -> eframe::Result {
             .with_title(APP_TITLE)
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([640.0, 400.0]),
+        event_loop_builder: Some(Box::new(|builder| {
+            #[cfg(target_os = "macos")]
+            {
+                // winit's default app menu binds Cmd+Q to an immediate
+                // terminate; without it Cmd+Q reaches the app, which asks
+                // about unsaved changes first.
+                use winit::platform::macos::EventLoopBuilderExtMacOS;
+                builder.with_default_menu(false);
+            }
+            let _ = builder;
+        })),
         ..Default::default()
     };
     eframe::run_native(
