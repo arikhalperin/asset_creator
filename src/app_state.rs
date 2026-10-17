@@ -9,6 +9,7 @@ use std::path::Path;
 
 use crate::document::{Document, DocumentError, PixelRect};
 use crate::io::{self, IoError};
+use crate::paint::{ActiveStroke, BrushSettings, StrokeKind};
 use crate::undo::{Change, Command, CommandError, UndoStack};
 
 /// Stable identifier of an open document.
@@ -28,6 +29,8 @@ pub struct OpenDocument {
     dirty: Vec<PixelRect>,
     /// Bumps whenever the selection changes.
     pub selection_revision: u64,
+    stroke: Option<ActiveStroke>,
+    last_stroke_end: Option<(f32, f32)>,
 }
 
 impl OpenDocument {
@@ -41,6 +44,8 @@ impl OpenDocument {
             active_layer,
             dirty: Vec::new(),
             selection_revision: 0,
+            stroke: None,
+            last_stroke_end: None,
         }
     }
 
@@ -49,8 +54,34 @@ impl OpenDocument {
         self.active_layer
     }
 
+    /// Whether a paint stroke is in progress.
+    pub fn is_stroking(&self) -> bool {
+        self.stroke.is_some()
+    }
+
+    /// Where the previous finished stroke ended (for Shift+click lines).
+    pub fn last_stroke_end(&self) -> Option<(f32, f32)> {
+        self.last_stroke_end
+    }
+
     pub fn undo_stack(&self) -> &UndoStack {
         &self.undo
+    }
+
+    /// Marks a live-stroke region for refresh without recording history.
+    fn repainted(&mut self, rect: Option<PixelRect>) {
+        if let Some(rect) = rect {
+            self.revision += 1;
+            self.dirty.push(rect);
+        }
+    }
+
+    /// Abandons an in-progress stroke, restoring its pixels.
+    fn cancel_stroke(&mut self) {
+        if let Some(stroke) = self.stroke.take() {
+            let rect = stroke.cancel(&mut self.document);
+            self.repainted(rect);
+        }
     }
 
     fn changed(&mut self, change: Change) {
@@ -161,6 +192,7 @@ impl AppState {
         let open = self
             .document_mut(id)
             .ok_or_else(|| CommandError::Invalid("no such document".to_owned()))?;
+        open.cancel_stroke();
         let dirty = open.undo.execute(&mut open.document, command)?;
         open.changed(dirty);
         Ok(())
@@ -171,6 +203,7 @@ impl AppState {
         let Some(open) = self.document_mut(id) else {
             return false;
         };
+        open.cancel_stroke();
         match open.undo.undo(&mut open.document) {
             Some(dirty) => {
                 open.changed(dirty);
@@ -185,12 +218,84 @@ impl AppState {
         let Some(open) = self.document_mut(id) else {
             return false;
         };
+        open.cancel_stroke();
         match open.undo.redo(&mut open.document) {
             Some(dirty) => {
                 open.changed(dirty);
                 true
             }
             None => false,
+        }
+    }
+
+    /// Starts a paint stroke on the active layer at `start`. The document
+    /// shows the stroke live; [`Self::end_stroke`] records it as one undo
+    /// step and [`Self::cancel_stroke`] discards it.
+    pub fn begin_stroke(
+        &mut self,
+        id: DocId,
+        kind: StrokeKind,
+        brush: BrushSettings,
+        start: (f32, f32),
+    ) -> Result<(), CommandError> {
+        let open = self
+            .document_mut(id)
+            .ok_or_else(|| CommandError::Invalid("no such document".to_owned()))?;
+        open.cancel_stroke();
+        let (stroke, dirty) =
+            ActiveStroke::begin(&mut open.document, open.active_layer, kind, brush, start)?;
+        open.stroke = Some(stroke);
+        open.repainted(dirty);
+        Ok(())
+    }
+
+    /// Extends the in-progress stroke to `p`.
+    pub fn continue_stroke(&mut self, id: DocId, p: (f32, f32)) {
+        if let Some(open) = self.document_mut(id) {
+            if let Some(stroke) = &mut open.stroke {
+                let dirty = stroke.add_point(&mut open.document, p);
+                open.repainted(dirty);
+            }
+        }
+    }
+
+    /// Finishes the stroke and records it. Returns whether an undo step was added.
+    pub fn end_stroke(&mut self, id: DocId) -> bool {
+        let Some(open) = self.document_mut(id) else {
+            return false;
+        };
+        let Some(stroke) = open.stroke.take() else {
+            return false;
+        };
+        let (patch, dirty, end) = stroke.finish(&mut open.document);
+        open.repainted(dirty);
+        open.last_stroke_end = end;
+        match patch {
+            Some(patch) => {
+                // The document already shows the stroke; applying writes the same pixels.
+                match open.undo.execute(&mut open.document, Box::new(patch)) {
+                    Ok(change) => {
+                        open.changed(change);
+                        true
+                    }
+                    Err(_) => false,
+                }
+            }
+            None => false,
+        }
+    }
+
+    /// Discards the in-progress stroke on a document, restoring its pixels.
+    pub fn cancel_stroke(&mut self, id: DocId) {
+        if let Some(open) = self.document_mut(id) {
+            open.cancel_stroke();
+        }
+    }
+
+    /// Discards in-progress strokes on every document.
+    pub fn cancel_all_strokes(&mut self) {
+        for open in &mut self.documents {
+            open.cancel_stroke();
         }
     }
 
@@ -404,5 +509,80 @@ mod tests {
         let b = state.new_document(2, 2, 72.0).unwrap();
         assert_eq!(state.current_id(), Some(b));
         assert_eq!(state.current_layer_rows().len(), 1);
+    }
+
+    #[test]
+    fn stroke_lifecycle_records_one_step() {
+        let mut state = AppState::new();
+        let a = state.new_document(50, 20, 72.0).unwrap();
+        let original = state.document(a).unwrap().document.clone();
+        let black = StrokeKind::Brush {
+            color: [0, 0, 0, 255],
+        };
+        state
+            .begin_stroke(a, black, BrushSettings::default(), (5.0, 10.0))
+            .unwrap();
+        assert!(state.document(a).unwrap().is_stroking());
+        state.continue_stroke(a, (25.0, 10.0));
+        state.continue_stroke(a, (45.0, 10.0));
+        assert!(!state.take_dirty(a).is_empty(), "live repaint marks tiles");
+        assert!(
+            !state.document(a).unwrap().undo_stack().can_undo(),
+            "not recorded yet"
+        );
+        assert!(state.end_stroke(a));
+        let open = state.document(a).unwrap();
+        assert!(!open.is_stroking());
+        assert_eq!(open.undo_stack().undo_label(), Some("Brush Stroke"));
+        assert_eq!(open.undo_stack().undo_len(), 1);
+        assert_eq!(open.last_stroke_end(), Some((45.0, 10.0)));
+        assert_eq!(
+            open.document.layer(0).unwrap().pixels.get_pixel(25, 10).0,
+            [0, 0, 0, 255]
+        );
+        assert!(state.undo(a));
+        assert_eq!(state.document(a).unwrap().document, original);
+    }
+
+    #[test]
+    fn cancelled_or_interrupted_strokes_record_nothing() {
+        let mut state = AppState::new();
+        let a = state.new_document(30, 30, 72.0).unwrap();
+        state
+            .execute(a, Box::new(FillLayer::new(0, [9, 9, 9, 255])))
+            .unwrap();
+        let filled = state.document(a).unwrap().document.clone();
+        let black = StrokeKind::Brush {
+            color: [0, 0, 0, 255],
+        };
+        state
+            .begin_stroke(a, black, BrushSettings::default(), (15.0, 15.0))
+            .unwrap();
+        state.cancel_stroke(a);
+        assert_eq!(state.document(a).unwrap().document, filled);
+        assert!(!state.end_stroke(a));
+
+        // Undo during a stroke abandons the stroke first, then undoes the fill.
+        state
+            .begin_stroke(a, black, BrushSettings::default(), (15.0, 15.0))
+            .unwrap();
+        assert!(state.undo(a));
+        assert!(!state.document(a).unwrap().is_stroking());
+        assert!(state
+            .document(a)
+            .unwrap()
+            .document
+            .layer(0)
+            .unwrap()
+            .pixels
+            .pixels()
+            .all(|p| p[3] == 0));
+
+        state
+            .begin_stroke(a, black, BrushSettings::default(), (15.0, 15.0))
+            .unwrap();
+        state.cancel_all_strokes();
+        assert!(!state.document(a).unwrap().is_stroking());
+        assert_eq!(state.document(a).unwrap().undo_stack().undo_len(), 0);
     }
 }
