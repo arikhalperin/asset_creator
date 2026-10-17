@@ -338,7 +338,8 @@ fn validate_dpi(dpi: f64) -> Result<(), DocumentError> {
     }
 }
 
-fn blend_over(dst: Rgba<u8>, src: Rgba<u8>, opacity: f32) -> Rgba<u8> {
+/// Source-over compositing of `src` (alpha scaled by `opacity`) onto `dst`.
+pub fn blend_over(dst: Rgba<u8>, src: Rgba<u8>, opacity: f32) -> Rgba<u8> {
     let src_a = src[3] as f32 / 255.0 * opacity;
     if dst[3] == 0 {
         // Nothing underneath: keep the source colour untouched.

@@ -30,6 +30,12 @@ Command-pattern undo/redo framework through which every document edit flows.
 
 - `FillLayer { layer, color }` fills the given layer with the RGBA color through the masked-apply helper; its label is "Fill Layer".
 
+### Paint commands
+
+- Each paint operation is exactly one undo step: a whole stroke from button press to release (labels "Brush Stroke", "Eraser Stroke", "Clone Stamp"), one bucket click ("Paint Bucket"), one gradient drag ("Gradient").
+- Paint results are computed per pixel and applied through the masked-apply helper, so they respect the selection; they store the previous and new pixels of the affected region (stroke bounds ∩ editable bounds) and report that region as dirty.
+- While a stroke is in progress the document shows it live; the step is recorded when the stroke ends. A stroke abandoned before release (tool or document switch) restores the previous pixels and records nothing.
+
 ### Selection commands
 
 - Every selection change is a command: new selections from tools (labels "Rectangle Select", "Ellipse Select", "Lasso Select", "Polygon Select", "Magic Wand"), "Select All", "Deselect", "Invert Selection", "Grow Selection", "Shrink Selection", "Feather Selection".

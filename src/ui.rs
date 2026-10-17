@@ -8,11 +8,13 @@ use egui_dock::tab_viewer::OnCloseResponse;
 use egui_dock::{DockArea, DockState, NodeIndex, TabViewer};
 
 use crate::app_state::{AppState, DocId};
+use crate::canvas::CanvasEvent;
 use crate::canvas::{self, CanvasState, ViewAction};
 use crate::document::DEFAULT_DPI;
 use crate::io::FileFormat;
+use crate::paint::{self, BucketFill, GradientColors, GradientFill, GradientKind, StrokeKind};
 use crate::selection::{self, CombineMode};
-use crate::tools::{self, SelectionRequest, Tool, ToolOptions};
+use crate::tools::{self, Colors, SelectionRequest, Tool, ToolOptions};
 use crate::undo::{FillLayer, SetSelection};
 
 pub const APP_TITLE: &str = "Game Asset Creator";
@@ -39,7 +41,9 @@ const SHORTCUT_ACTUAL_SIZE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::
 /// Fill color used before the user picks one.
 pub const DEFAULT_FILL_COLOR: [u8; 4] = [0, 0, 0, 255];
 
-const PLACEHOLDER_TOOLS: [&str; 5] = ["Move", "Brush", "Eraser", "Fill", "Picker"];
+const PLACEHOLDER_TOOLS: [&str; 1] = ["Move"];
+/// Shown when painting with the Clone Stamp before choosing a source.
+pub const CLONE_SOURCE_HINT: &str = "Option/Alt-click to set a Clone Stamp source";
 const SHORTCUT_SELECT_ALL: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::A);
 const SHORTCUT_DESELECT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::D);
 const SHORTCUT_INVERT: KeyboardShortcut =
@@ -172,6 +176,9 @@ enum Action {
     InvertSelection,
     Radius(RadiusOp),
     SetTool(Tool),
+    SwapColors,
+    ResetColors,
+    BrushSize { grow: bool },
     SetPanelOpen(Panel, bool),
 }
 
@@ -193,6 +200,9 @@ pub struct EditorApp {
     radius_dialog: Option<RadiusDialog>,
     /// Current document last frame, to cancel gestures when it changes.
     last_current: Option<DocId>,
+    colors: Colors,
+    /// Transient hint shown in the status bar.
+    status_message: Option<String>,
 }
 
 impl Default for EditorApp {
@@ -218,6 +228,8 @@ impl EditorApp {
             tool_options: ToolOptions::default(),
             radius_dialog: None,
             last_current: None,
+            colors: Colors::default(),
+            status_message: None,
         }
     }
 
@@ -229,9 +241,128 @@ impl EditorApp {
     pub fn set_tool(&mut self, tool: Tool) {
         if tool != self.tool {
             self.tool = tool;
+            self.status_message = None;
+            self.state.cancel_all_strokes();
             self.canvases
                 .values_mut()
                 .for_each(CanvasState::cancel_gesture);
+        }
+    }
+
+    pub fn colors(&self) -> &Colors {
+        &self.colors
+    }
+
+    pub fn colors_mut(&mut self) -> &mut Colors {
+        &mut self.colors
+    }
+
+    /// The transient status-bar hint, if any.
+    pub fn status_message(&self) -> Option<&str> {
+        self.status_message.as_deref()
+    }
+
+    /// Carries out what a canvas tool asked for on document `id`.
+    pub fn handle_canvas_event(&mut self, id: DocId, event: CanvasEvent) {
+        let Some(open) = self.state.document(id) else {
+            return;
+        };
+        let active = open.active_layer();
+        match event {
+            CanvasEvent::Selection(request) => {
+                if Some(id) == self.state.current_id() {
+                    self.apply_selection_request(&request);
+                }
+            }
+            CanvasEvent::StrokeBegin { point, straight } => {
+                let start = if straight {
+                    open.last_stroke_end().unwrap_or(point)
+                } else {
+                    point
+                };
+                let Some(brush) = self.tool_options.brush_for(self.tool).copied() else {
+                    return;
+                };
+                let kind = match self.tool {
+                    Tool::Brush => StrokeKind::Brush {
+                        color: self.colors.foreground,
+                    },
+                    Tool::Eraser => StrokeKind::Eraser,
+                    Tool::CloneStamp => {
+                        let Some(canvas) = self.canvases.get_mut(&id) else {
+                            return;
+                        };
+                        let Some(source) = canvas.clone_source() else {
+                            self.status_message = Some(CLONE_SOURCE_HINT.to_owned());
+                            return;
+                        };
+                        let offset = match canvas.clone_offset() {
+                            Some(offset) if self.tool_options.clone_aligned => offset,
+                            _ => (source.0 - start.0, source.1 - start.1),
+                        };
+                        canvas.set_clone_offset(offset);
+                        StrokeKind::Clone { offset }
+                    }
+                    _ => return,
+                };
+                self.status_message = None;
+                if let Err(err) = self.state.begin_stroke(id, kind, brush, start) {
+                    self.error = Some(format!("Could not paint: {err}"));
+                    return;
+                }
+                if straight {
+                    self.state.continue_stroke(id, point);
+                }
+            }
+            CanvasEvent::StrokeMove(p) => self.state.continue_stroke(id, p),
+            CanvasEvent::StrokeEnd => {
+                self.state.end_stroke(id);
+            }
+            CanvasEvent::CloneSource(p) => {
+                if let Some(canvas) = self.canvases.get_mut(&id) {
+                    canvas.set_clone_source(p);
+                }
+                self.status_message = None;
+            }
+            CanvasEvent::Pick { pixel, background } => {
+                let all = self.tool_options.sample_all_layers;
+                if let Some(color) =
+                    paint::sample_color(&open.document, active, pixel.0, pixel.1, all)
+                {
+                    if background {
+                        self.colors.background = color;
+                    } else {
+                        self.colors.foreground = color;
+                    }
+                }
+            }
+            CanvasEvent::Bucket(seed) => {
+                let o = &self.tool_options;
+                let command = BucketFill::new(
+                    active,
+                    seed,
+                    self.colors.foreground,
+                    o.bucket_tolerance,
+                    o.bucket_contiguous,
+                    o.bucket_opacity,
+                );
+                let _ = self.state.execute(id, Box::new(command));
+            }
+            CanvasEvent::Gradient { start, end } => {
+                let o = &self.tool_options;
+                let command = GradientFill::new(
+                    active,
+                    start,
+                    end,
+                    o.gradient_kind,
+                    o.gradient_colors,
+                    self.colors.foreground,
+                    self.colors.background,
+                    o.gradient_opacity,
+                );
+                // Drags shorter than a pixel are rejected by the command.
+                let _ = self.state.execute(id, Box::new(command));
+            }
         }
     }
 
@@ -624,6 +755,7 @@ impl EditorApp {
                     tool: self.tool,
                     tool_options: &self.tool_options,
                     tool_click: &mut tool_click,
+                    colors: &mut self.colors,
                     requests: &mut requests,
                 };
                 DockArea::new(&mut self.dock)
@@ -639,7 +771,8 @@ impl EditorApp {
             self.state.set_current(id);
         }
         if self.state.current_id() != self.last_current {
-            // Switching documents abandons an open polygon or drag.
+            // Switching documents abandons an open polygon, drag, or stroke.
+            self.state.cancel_all_strokes();
             self.canvases
                 .values_mut()
                 .for_each(CanvasState::cancel_gesture);
@@ -648,10 +781,8 @@ impl EditorApp {
         if let (Some(index), Some(id)) = (layer_click, self.state.current_id()) {
             self.state.set_active_layer(id, index);
         }
-        for (id, request) in requests {
-            if Some(id) == self.state.current_id() {
-                self.apply_selection_request(&request);
-            }
+        for (id, event) in requests {
+            self.handle_canvas_event(id, event);
         }
         if let Some(tool) = tool_click {
             self.set_tool(tool);
@@ -706,10 +837,26 @@ impl EditorApp {
                     (Key::M, Tool::after_m(self.tool)),
                     (Key::L, Tool::after_l(self.tool)),
                     (Key::W, Tool::MagicWand),
+                    (Key::B, Tool::Brush),
+                    (Key::E, Tool::Eraser),
+                    (Key::I, Tool::Eyedropper),
+                    (Key::G, Tool::after_g(self.tool)),
+                    (Key::S, Tool::CloneStamp),
                 ];
                 for (key, tool) in tool_keys {
                     if input.consume_key(Modifiers::NONE, key) {
                         actions.push(Action::SetTool(tool));
+                    }
+                }
+                let other_keys = [
+                    (Key::X, Action::SwapColors),
+                    (Key::D, Action::ResetColors),
+                    (Key::OpenBracket, Action::BrushSize { grow: false }),
+                    (Key::CloseBracket, Action::BrushSize { grow: true }),
+                ];
+                for (key, action) in other_keys {
+                    if input.consume_key(Modifiers::NONE, key) {
+                        actions.push(action);
                     }
                 }
             }
@@ -869,6 +1016,9 @@ impl EditorApp {
                         text.push_str(&format!(" — {x}, {y}"));
                     }
                 }
+                if let Some(message) = &self.status_message {
+                    text.push_str(&format!(" — {message}"));
+                }
                 text
             }
             None => "No document".to_owned(),
@@ -912,6 +1062,13 @@ impl EditorApp {
             }
             Action::Radius(op) => self.open_radius_dialog(op),
             Action::SetTool(tool) => self.set_tool(tool),
+            Action::SwapColors => self.colors.swap(),
+            Action::ResetColors => self.colors.reset(),
+            Action::BrushSize { grow } => {
+                if let Some(brush) = self.tool_options.brush_for_mut(self.tool) {
+                    brush.size = brush.stepped_size(grow);
+                }
+            }
             Action::SetPanelOpen(panel, open) => self.set_panel_open(panel, open),
         }
     }
@@ -1134,7 +1291,8 @@ struct Viewer<'a> {
     /// Tool clicked in the Tools panel this frame.
     tool_click: &'a mut Option<Tool>,
     /// Finished selection gestures this frame.
-    requests: &'a mut Vec<(DocId, SelectionRequest)>,
+    requests: &'a mut Vec<(DocId, CanvasEvent)>,
+    colors: &'a mut Colors,
 }
 
 impl TabViewer for Viewer<'_> {
@@ -1158,7 +1316,7 @@ impl TabViewer for Viewer<'_> {
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Tab) {
         match *tab {
-            Tab::Panel(Panel::Tools) => tools_panel(ui, self.tool, self.tool_click),
+            Tab::Panel(Panel::Tools) => tools_panel(ui, self.tool, self.tool_click, self.colors),
             Tab::Panel(Panel::Layers) => layers_panel(ui, self.state, self.layer_click),
             Tab::Panel(Panel::AssetLibrary) => {
                 ui.weak("The asset library arrives in a later version.");
@@ -1189,20 +1347,19 @@ impl Viewer<'_> {
         else {
             return;
         };
-        if let Some(request) = canvas.show(
+        let events = canvas.show(
             ui,
             open,
             self.checker,
             self.show_pixel_grid,
             self.tool,
             self.tool_options,
-        ) {
-            self.requests.push((id, request));
-        }
+        );
+        self.requests.extend(events.into_iter().map(|e| (id, e)));
     }
 }
 
-fn tools_panel(ui: &mut egui::Ui, active: Tool, clicked: &mut Option<Tool>) {
+fn tools_panel(ui: &mut egui::Ui, active: Tool, clicked: &mut Option<Tool>, colors: &mut Colors) {
     ui.horizontal_wrapped(|ui| {
         for tool in Tool::ALL {
             let response = ui
@@ -1217,12 +1374,102 @@ fn tools_panel(ui: &mut egui::Ui, active: Tool, clicked: &mut Option<Tool>) {
                 .on_disabled_hover_text("Coming soon");
         }
     });
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.label("FG");
+        ui.color_edit_button_srgba_unmultiplied(&mut colors.foreground)
+            .on_hover_text("Foreground color");
+        ui.label("BG");
+        ui.color_edit_button_srgba_unmultiplied(&mut colors.background)
+            .on_hover_text("Background color");
+        if ui
+            .small_button("⇄")
+            .on_hover_text("Swap colors (X)")
+            .clicked()
+        {
+            colors.swap();
+        }
+        if ui
+            .small_button("Reset")
+            .on_hover_text("Black and white (D)")
+            .clicked()
+        {
+            colors.reset();
+        }
+    });
+}
+
+fn percent_slider(ui: &mut egui::Ui, label: &str, value: &mut f32, min: f32) {
+    ui.label(label);
+    let mut percent = (*value * 100.0).round();
+    if ui
+        .add(
+            egui::DragValue::new(&mut percent)
+                .range(min..=100.0)
+                .suffix("%"),
+        )
+        .changed()
+    {
+        *value = percent / 100.0;
+    }
 }
 
 fn tool_options_strip(ui: &mut egui::Ui, tool: Tool, options: &mut ToolOptions) {
     ui.horizontal(|ui| {
         ui.label(tool.label());
         ui.separator();
+        if let Some(brush) = options.brush_for_mut(tool) {
+            ui.label("Size");
+            ui.add(
+                egui::DragValue::new(&mut brush.size)
+                    .range(paint::MIN_BRUSH_SIZE..=paint::MAX_BRUSH_SIZE)
+                    .speed(0.5)
+                    .max_decimals(0),
+            );
+            percent_slider(ui, "Hardness", &mut brush.hardness, 0.0);
+            percent_slider(ui, "Opacity", &mut brush.opacity, 1.0);
+            if tool != Tool::CloneStamp {
+                ui.checkbox(&mut brush.pixel, "Pixel");
+            }
+        }
+        match tool {
+            Tool::CloneStamp => {
+                ui.checkbox(&mut options.clone_aligned, "Aligned");
+            }
+            Tool::PaintBucket => {
+                ui.label("Tolerance");
+                ui.add(egui::DragValue::new(&mut options.bucket_tolerance).range(0..=255));
+                ui.checkbox(&mut options.bucket_contiguous, "Contiguous");
+                percent_slider(ui, "Opacity", &mut options.bucket_opacity, 1.0);
+            }
+            Tool::Gradient => {
+                ui.label("Type");
+                ui.selectable_value(&mut options.gradient_kind, GradientKind::Linear, "Linear");
+                ui.selectable_value(&mut options.gradient_kind, GradientKind::Radial, "Radial");
+                ui.separator();
+                ui.label("Colors");
+                ui.selectable_value(
+                    &mut options.gradient_colors,
+                    GradientColors::ForegroundToBackground,
+                    "FG → BG",
+                );
+                ui.selectable_value(
+                    &mut options.gradient_colors,
+                    GradientColors::ForegroundToTransparent,
+                    "FG → Transparent",
+                );
+                percent_slider(ui, "Opacity", &mut options.gradient_opacity, 1.0);
+            }
+            Tool::Eyedropper => {
+                ui.label("Sample");
+                ui.selectable_value(&mut options.sample_all_layers, true, "All layers");
+                ui.selectable_value(&mut options.sample_all_layers, false, "Active layer");
+            }
+            _ => {}
+        }
+        if !tool.is_selection_tool() {
+            return;
+        }
         ui.label("Mode");
         for mode in CombineMode::ALL {
             ui.selectable_value(&mut options.mode, mode, mode.label());

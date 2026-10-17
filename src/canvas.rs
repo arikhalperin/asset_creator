@@ -14,6 +14,32 @@ use crate::app_state::OpenDocument;
 use crate::document::{Document, PixelRect};
 use crate::selection::{self, CombineMode, Segment};
 use crate::tools::{SelectionRequest, SelectionShape, Tool, ToolOptions};
+
+/// Something the active tool asks the application to do.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CanvasEvent {
+    Selection(SelectionRequest),
+    /// Start a paint stroke at `point`; `straight` (Shift+click) paints a line
+    /// from the previous stroke's end and is followed by `StrokeEnd`.
+    StrokeBegin {
+        point: (f32, f32),
+        straight: bool,
+    },
+    StrokeMove((f32, f32)),
+    StrokeEnd,
+    /// Option/Alt+click with the Clone Stamp.
+    CloneSource((f32, f32)),
+    /// Eyedropper sample of an image pixel.
+    Pick {
+        pixel: (u32, u32),
+        background: bool,
+    },
+    Bucket((u32, u32)),
+    Gradient {
+        start: (f32, f32),
+        end: (f32, f32),
+    },
+}
 use image::{Rgba, RgbaImage};
 
 pub const MIN_ZOOM: f32 = 0.01;
@@ -488,6 +514,10 @@ pub struct CanvasState {
     panning: bool,
     rect: Option<Rect>,
     gesture: Option<Gesture>,
+    /// A paint stroke (or eyedropper drag) is in progress.
+    painting: bool,
+    clone_source: Option<Pos2>,
+    clone_offset: Option<Vec2>,
     /// Selection outline in image coordinates, keyed by selection revision.
     outline: Option<(u64, Vec<Segment>)>,
 }
@@ -502,6 +532,9 @@ impl CanvasState {
             panning: false,
             rect: None,
             gesture: None,
+            painting: false,
+            clone_source: None,
+            clone_offset: None,
             outline: None,
         }
     }
@@ -509,6 +542,32 @@ impl CanvasState {
     /// Abandons any selection gesture in progress (e.g. an open polygon).
     pub fn cancel_gesture(&mut self) {
         self.gesture = None;
+        self.painting = false;
+    }
+
+    /// Whether a paint stroke or eyedropper drag is in progress.
+    pub fn is_painting(&self) -> bool {
+        self.painting
+    }
+
+    /// The Clone Stamp source point (image coordinates), if set.
+    pub fn clone_source(&self) -> Option<(f32, f32)> {
+        self.clone_source.map(|p| (p.x, p.y))
+    }
+
+    /// Sets the Clone Stamp source and forgets the aligned offset.
+    pub fn set_clone_source(&mut self, point: (f32, f32)) {
+        self.clone_source = Some(Pos2::new(point.0, point.1));
+        self.clone_offset = None;
+    }
+
+    /// Offset from painted pixel to source pixel, once a clone stroke started.
+    pub fn clone_offset(&self) -> Option<(f32, f32)> {
+        self.clone_offset.map(|v| (v.x, v.y))
+    }
+
+    pub fn set_clone_offset(&mut self, offset: (f32, f32)) {
+        self.clone_offset = Some(Vec2::new(offset.0, offset.1));
     }
 
     /// Vertices of the polygon being drawn, if any.
@@ -584,7 +643,7 @@ impl CanvasState {
         show_grid: bool,
         tool: Tool,
         options: &ToolOptions,
-    ) -> Option<SelectionRequest> {
+    ) -> Vec<CanvasEvent> {
         let doc = &open.document;
         let image = [doc.width(), doc.height()];
         let ppp = ui.ctx().pixels_per_point();
@@ -640,18 +699,28 @@ impl CanvasState {
         }
         self.view = Some(view);
 
-        let request = if self.panning || space_down {
-            None
-        } else {
-            self.run_tool(ui, &response, rect, &view, ppp, image, tool, options)
-        };
+        let mut events = Vec::new();
+        if !(self.panning || space_down) || self.painting {
+            if tool.is_selection_tool() {
+                if let Some(request) =
+                    self.run_tool(ui, &response, rect, &view, ppp, image, tool, options)
+                {
+                    events.push(CanvasEvent::Selection(request));
+                }
+            } else if !space_down || self.painting {
+                events = self.run_paint_tool(ui, &response, rect, &view, ppp, image, tool);
+            }
+        }
         let over_image = pointer
             .filter(|_| hovered)
             .map(|p| view.view_to_image((p - rect.min).to_pos2(), ppp))
             .is_some_and(|p| {
                 p.x >= 0.0 && p.y >= 0.0 && p.x < image[0] as f32 && p.y < image[1] as f32
             });
-        if over_image && !self.panning && !space_down {
+        let brush_cursor = tool.is_brush_tool() && hovered && !self.panning && !space_down;
+        if brush_cursor {
+            ui.ctx().set_cursor_icon(CursorIcon::None);
+        } else if over_image && !self.panning && !space_down {
             ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
         }
 
@@ -668,7 +737,7 @@ impl CanvasState {
         let image_rect = view.image_rect(image, ppp).translate(rect.min.to_vec2());
         let visible = image_rect.intersect(rect);
         if !visible.is_positive() {
-            return request;
+            return events;
         }
 
         // Screen-space checkerboard: one texture repeat covers two squares.
@@ -802,6 +871,56 @@ impl CanvasState {
             }
             None => {}
         }
+        // Gradient start→end preview.
+        if let Some(Gesture::Drag {
+            tool: Tool::Gradient,
+            start,
+            current,
+            ..
+        }) = &self.gesture
+        {
+            let (a, b) = (to_screen(*start), to_screen(*current));
+            shapes.push(Shape::line_segment(
+                [a, b],
+                Stroke::new(3.0, Color32::WHITE),
+            ));
+            shapes.push(Shape::line_segment(
+                [a, b],
+                Stroke::new(1.0, Color32::BLACK),
+            ));
+            shapes.push(Shape::circle_stroke(
+                a,
+                3.0,
+                Stroke::new(1.0, Color32::BLACK),
+            ));
+        }
+        // Clone source marker, following the brush while painting.
+        if tool == Tool::CloneStamp {
+            let marker = match (self.painting, self.clone_offset, pointer) {
+                (true, Some(offset), Some(p)) => Some(p + offset * view.points_per_pixel(ppp)),
+                _ => self.clone_source.map(to_screen),
+            };
+            if let Some(m) = marker {
+                cross(&mut shapes, m, 6.0);
+            }
+        }
+        // Brush outline cursor.
+        if let (true, Some(p), Some(brush)) = (brush_cursor, pointer, options.brush_for(tool)) {
+            let radius = brush.size / 2.0 * view.points_per_pixel(ppp);
+            shapes.push(Shape::circle_stroke(
+                p,
+                radius + 0.5,
+                Stroke::new(1.0, Color32::WHITE),
+            ));
+            shapes.push(Shape::circle_stroke(
+                p,
+                radius,
+                Stroke::new(1.0, Color32::BLACK),
+            ));
+            if radius * 2.0 < 4.0 {
+                cross(&mut shapes, p, 5.0);
+            }
+        }
         if !shapes.is_empty() {
             painter.extend(shapes);
         }
@@ -809,7 +928,149 @@ impl CanvasState {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(40));
         }
-        request
+        events
+    }
+
+    /// Feeds pointer input to the active paint tool.
+    #[allow(clippy::too_many_arguments)]
+    fn run_paint_tool(
+        &mut self,
+        ui: &mut egui::Ui,
+        response: &egui::Response,
+        rect: Rect,
+        view: &ViewState,
+        ppp: f32,
+        image: [u32; 2],
+        tool: Tool,
+    ) -> Vec<CanvasEvent> {
+        let to_image = |screen: Pos2| {
+            let p = view.view_to_image((screen - rect.min).to_pos2(), ppp);
+            (p.x, p.y)
+        };
+        let in_image = |p: (f32, f32)| {
+            p.0 >= 0.0 && p.1 >= 0.0 && p.0 < image[0] as f32 && p.1 < image[1] as f32
+        };
+        let pixel = |p: (f32, f32)| (p.0 as u32, p.1 as u32);
+        let (pressed, down, modifiers, press_origin, pointer, moves) = ui.input(|i| {
+            let moves: Vec<Pos2> = i
+                .events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::PointerMoved(p) => Some(*p),
+                    _ => None,
+                })
+                .collect();
+            (
+                i.pointer.primary_pressed(),
+                i.pointer.primary_down(),
+                i.modifiers,
+                i.pointer.press_origin(),
+                i.pointer.interact_pos(),
+                moves,
+            )
+        });
+        let pressed_here = pressed && response.contains_pointer();
+        let mut events = Vec::new();
+
+        // The gradient drag is the only paint gesture using `self.gesture`.
+        if !matches!(
+            &self.gesture,
+            Some(Gesture::Drag {
+                tool: Tool::Gradient,
+                ..
+            })
+        ) || tool != Tool::Gradient
+        {
+            self.gesture = None;
+        }
+
+        match tool {
+            Tool::Brush | Tool::Eraser | Tool::CloneStamp => {
+                if pressed_here {
+                    let start = to_image(press_origin.or(pointer).unwrap_or(rect.center()));
+                    if tool == Tool::CloneStamp && modifiers.alt {
+                        events.push(CanvasEvent::CloneSource(start));
+                        return events;
+                    }
+                    events.push(CanvasEvent::StrokeBegin {
+                        point: start,
+                        straight: modifiers.shift,
+                    });
+                    if modifiers.shift {
+                        events.push(CanvasEvent::StrokeEnd);
+                    } else {
+                        self.painting = true;
+                    }
+                } else if self.painting {
+                    // Every intermediate pointer position this frame, for smooth strokes.
+                    let samples = if moves.is_empty() {
+                        pointer.into_iter().collect()
+                    } else {
+                        moves
+                    };
+                    for p in samples {
+                        events.push(CanvasEvent::StrokeMove(to_image(p)));
+                    }
+                    if !down {
+                        events.push(CanvasEvent::StrokeEnd);
+                        self.painting = false;
+                    }
+                }
+            }
+            Tool::Eyedropper => {
+                if pressed_here {
+                    self.painting = true;
+                }
+                if self.painting {
+                    if let Some(p) = pointer.map(to_image).filter(|p| in_image(*p)) {
+                        events.push(CanvasEvent::Pick {
+                            pixel: pixel(p),
+                            background: modifiers.alt,
+                        });
+                    }
+                    if !down {
+                        self.painting = false;
+                    }
+                }
+            }
+            Tool::PaintBucket => {
+                if response.clicked_by(PointerButton::Primary) {
+                    if let Some(p) = pointer.map(to_image).filter(|p| in_image(*p)) {
+                        events.push(CanvasEvent::Bucket(pixel(p)));
+                    }
+                }
+            }
+            Tool::Gradient => {
+                if response.drag_started_by(PointerButton::Primary) {
+                    if let Some(origin) = press_origin {
+                        let start = to_image(origin);
+                        let start = Pos2::new(start.0, start.1);
+                        self.gesture = Some(Gesture::Drag {
+                            tool,
+                            mode: CombineMode::Replace,
+                            start,
+                            current: start,
+                            path: Vec::new(),
+                        });
+                    }
+                }
+                if let (Some(Gesture::Drag { current, .. }), Some(p)) = (&mut self.gesture, pointer)
+                {
+                    let p = to_image(p);
+                    *current = Pos2::new(p.0, p.1);
+                }
+                if response.drag_stopped_by(PointerButton::Primary) {
+                    if let Some(Gesture::Drag { start, current, .. }) = self.gesture.take() {
+                        events.push(CanvasEvent::Gradient {
+                            start: (start.x, start.y),
+                            end: (current.x, current.y),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+        events
     }
 
     /// Feeds pointer and key input to the active selection tool.
@@ -981,7 +1242,26 @@ impl CanvasState {
                 }
                 None
             }
+            _ => None,
         }
+    }
+}
+
+/// A small black-and-white crosshair centered on `p`.
+fn cross(shapes: &mut Vec<Shape>, p: Pos2, half: f32) {
+    for (stroke, extra) in [
+        (Stroke::new(3.0, Color32::WHITE), 1.0),
+        (Stroke::new(1.0, Color32::BLACK), 0.0),
+    ] {
+        let h = half + extra;
+        shapes.push(Shape::line_segment(
+            [p - Vec2::new(h, 0.0), p + Vec2::new(h, 0.0)],
+            stroke,
+        ));
+        shapes.push(Shape::line_segment(
+            [p - Vec2::new(0.0, h), p + Vec2::new(0.0, h)],
+            stroke,
+        ));
     }
 }
 
