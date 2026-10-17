@@ -6,6 +6,10 @@ Painting tools that edit the active layer: Brush, Eraser, Eyedropper, Paint Buck
 
 ## Requirements
 
+### Edit target
+
+- Paint tools edit the active layer's pixels, or its mask when the mask is the edit target (see the layers spec). On a mask, colors are converted to gray using luminance `0.299 R + 0.587 G + 0.114 B` (alpha kept as blending strength): Brush, Paint Bucket, and Gradient write gray values; the Eraser paints white (reveals); the Clone Stamp copies mask values; the eyedropper still samples colors. Mask edits respect the selection and are undoable like pixel edits.
+
 ### Colors
 
 - The application has a foreground and a background color (RGBA, default opaque black / opaque white), shared by all documents. Changing them is not a document edit and is not undoable.

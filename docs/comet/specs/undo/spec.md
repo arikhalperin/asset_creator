@@ -45,3 +45,12 @@ Command-pattern undo/redo framework through which every document edit flows.
 
 - Each open document has an active layer index, defaulting to the top layer when opened or created, always kept within range.
 - The active layer can be set by index; edits such as Fill Layer target it.
+
+### Layer commands
+
+- Layer operations (new, duplicate, delete, reorder, merge down, flatten, rename, visibility, opacity, blend mode, mask add/delete/apply/enable) and transforms (move, free transform, flip) are each one undo step that restores the exact previous layer stack, pixels, masks, properties, active layer, and selection.
+- Continuous property edits (dragging the opacity slider) and transform sessions preview live without recording history; the step is recorded when the edit ends, and an abandoned edit restores the previous state.
+
+### Saved state
+
+- Every recorded step has a unique id; the document is clean when the id of its most recent applied step equals the id recorded at the last save (or at open/creation). Undoing back to the saved step makes the document clean again.

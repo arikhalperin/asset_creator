@@ -1,0 +1,639 @@
+schema: comet.native.v4
+name: layer-system
+language: en
+phase: archive
+status: done
+state_version: 15
+brief: brief.md
+document_constraints_version: 1
+shape_confirmation_hash: d598d602c3c7fc0a5a3d69a9494bf5b5e02f4900ef5b3d734041029d09650b6f
+spec_changes:
+  - capability: canvas
+    operation: modify
+    source: specs/canvas/spec.md
+  - capability: document-model
+    operation: modify
+    source: specs/document-model/spec.md
+  - capability: editor-shell
+    operation: modify
+    source: specs/editor-shell/spec.md
+  - capability: layers
+    operation: create
+    source: specs/layers/spec.md
+  - capability: paint
+    operation: modify
+    source: specs/paint/spec.md
+  - capability: project-file
+    operation: create
+    source: specs/project-file/spec.md
+  - capability: transform
+    operation: create
+    source: specs/transform/spec.md
+  - capability: undo
+    operation: modify
+    source: specs/undo/spec.md
+workspace:
+  isolation: branch
+  change_branch: comet/layer-system
+  target_branch: master
+  finish: merge
+loop:
+  stage: done
+  goal_cycle: 2
+  iteration: 2
+  attempt: 1
+  retry_epoch: 0
+  failed_iteration_count: 1
+  no_progress_count: 0
+  execution_failure_count: 0
+  previous_unresolved_ids: []
+  next_action: null
+acceptance:
+  - id: A1
+    source: brief.md
+    text: "A1: The Layers panel and Layer menu offer New (Cmd+Shift+N), Duplicate
+      (Cmd+J), Delete (disabled with one layer), Move Up (Cmd+]), Move Down
+      (Cmd+[), Merge Down (Cmd+E, disabled on the bottom layer), and Flatten;
+      each is one undo step with the active layer updated as specified."
+    result: passed
+    reason:
+      text: Layer menu and panel list all seven ops with Cmd+Shift+N/J/]/[/E bound
+        (Cmd+Shift+E Export checked first). Enabled states come from
+        layers::delete_layer/merge_down/move_layer, so Delete is off with one
+        layer and Merge Down off on the bottom. Each op is one command
+        (InsertLayer/DeleteLayer/MoveLayer/ReplaceLayers) that stores and
+        restores the active layer. Unit tests and the headless
+        layer_shortcuts_and_menu_operations test check names, active index,
+        labels, and undo. Naming uses the smallest unused 'Layer N' (user
+        reconfirmed).
+      truncated: false
+  - id: A2
+    source: brief.md
+    text: "A2: Each Layers row toggles visibility with its eye control and renames
+      on double-click; the active layer's blend mode and opacity (0–100 %) are
+      edited above the rows, opacity previewing live during a drag and recorded
+      as one step when it ends; every property change is undoable."
+    result: passed
+    reason:
+      text: "Each row has an eye small_button (ToggleVisible), double-click
+        StartRename, inline edit with Enter/Escape, and empty names rejected.
+        Blend combo and opacity slider sit above the rows. egui's Slider senses
+        drag only, so the press starts the drag: previews during the drag, one
+        commit on drag_stopped. Key edits commit at once. SetLayerProps is one
+        undoable step per change. Tests cover the opacity preview producing one
+        'Layer Opacity' step plus undo, rename, hide, and blend. Eye icons and
+        layer rows were seen rendering in the live app."
+      truncated: false
+  - id: A3
+    source: brief.md
+    text: "A3: The seven blend modes (Normal, Multiply, Screen, Overlay, Add,
+      Darken, Lighten) composite exactly per the W3C Compositing and Blending
+      formulas including alpha: tests compare the compositor with an independent
+      f64 reference over a grid of colors and alphas (within ±1 per channel),
+      and a single Normal layer still composites to its exact pixels."
+    result: passed
+    reason:
+      text: blend_pixel follows the W3C formulas (mixed = (1-ab)Cs + ab*B, then
+        source-over); Normal and empty-backdrop pixels use exact blend_over.
+        blend_modes_match_reference_formulas checks all 7 modes against an
+        independent f64 reference, over 9x9 colors, 6x6 alphas, and 2 opacities
+        (>20k cases), within +/-1. Known-value tests are included; existing
+        single-Normal-layer exactness tests still pass.
+      truncated: false
+  - id: A4
+    source: brief.md
+    text: 'A4: Merge Down composites the active layer (with its mode, opacity, and
+      mask) into the layer below, which keeps its name and properties; Flatten
+      produces one "Background" layer equal to the composite with transparency
+      kept. Verified by tests against the composite.'
+    result: passed
+    reason:
+      text: merge_down applies the lower layer's enabled mask to its pixels, then
+        composites the upper layer with its mode, opacity, and mask (hidden
+        contributes nothing). The result keeps the lower layer's properties,
+        drops its mask, and the lower layer becomes active. flatten makes one
+        'Background' layer from doc.composite(). Tests compare the merge to the
+        pair composite, cover masks and a hidden upper layer, and check flatten
+        equals the composite with transparency kept; undo is exact.
+      truncated: false
+  - id: A5
+    source: brief.md
+    text: "A5: Masks: Add Layer Mask (reveal all), Add Mask from Selection, Delete
+      Mask, Apply Mask, and Disable/Enable Mask work as specified; an enabled
+      mask multiplies the layer's alpha in the composite and a disabled one is
+      ignored; all undoable."
+    result: passed
+    reason:
+      text: add_mask (reveal-all, or from the selection; disabled without a selection
+        or when a mask exists), delete_mask, apply_mask (multiplies alpha), and
+        a mask_enabled toggle are all ReplaceLayers/SetLayerProps steps.
+        composite_layer_onto multiplies by the mask only when it is enabled.
+        masks_add_delete_apply_toggle and
+        composite_uses_blend_mode_and_enabled_mask check behaviour and undo.
+      truncated: false
+  - id: A6
+    source: brief.md
+    text: "A6: Clicking a layer's Mask chip makes the mask the edit target
+      (highlighted; status bar \"Editing mask\"); Brush, Paint Bucket, and
+      Gradient then write gray (luminance) values into the mask, the Eraser
+      reveals (white), and the Clone Stamp copies mask values, all respecting
+      the selection and undoable, while the layer's pixels stay unchanged."
+    result: passed
+    reason:
+      text: "The Mask chip and Edit Layer Mask set EditTarget::Mask (chip highlighted;
+        status 'Editing mask' is tested). Strokes use StrokeKind::for_mask:
+        luminance gray, and the Eraser paints white. Bucket and Gradient take
+        target_color plus on_target. Clone copies from a gray snapshot of the
+        mask. All go through apply_masked_target, so the selection applies. The
+        headless test covers Brush and Eraser on a mask with pixels unchanged.
+        My own probe (a scratch crate) confirmed Bucket writes 81 gray only
+        inside the selection and undoes, Gradient fills a gray ramp only inside
+        the selection, and Clone copies mask values; layer pixels were unchanged
+        in all three. Changing the active layer resets the target to pixels (new
+        unit test)."
+      truncated: false
+  - id: A7
+    source: brief.md
+    text: "A7: Move tool (V): dragging moves the active layer's content (or the
+      selected content, with the selection moving along) live; releasing records
+      one \"Move\" step; arrow keys nudge 1 px (Shift: 10 px); pixels pushed
+      past the canvas edge are clipped on commit."
+    result: passed
+    reason:
+      text: V selects Move. A drag begins a TransformSession and moves by whole pixels
+        live; release commits one 'Move' step. Arrows nudge 1 px (10 with
+        Shift), one step each. Content is selection-aware, and the selection
+        moves along. Off-canvas pixels are clipped on commit but recoverable
+        mid-session (tested). move_tool_drag_and_nudges checks pixels, labels,
+        and step counts.
+      truncated: false
+  - id: A8
+    source: brief.md
+    text: 'A8: Free Transform (Cmd+T) shows a bounding box with eight handles around
+      the content; dragging inside moves, handles scale (Shift on a corner keeps
+      proportions), dragging just outside a corner rotates (Shift snaps 15°);
+      Interpolation (Bilinear default, Nearest), Commit, and Cancel appear in
+      the tool-options strip; Enter commits one "Free Transform" step, Escape or
+      switching tool/document cancels and restores; the layer mask and selection
+      transform with the content.'
+    result: passed
+    reason:
+      text: Cmd+T starts a session. The canvas draws the box, 8 handles, and a center
+        mark; hit_test picks move, scale, or rotate (just outside a corner);
+        drag() handles anchored scaling, Shift-proportional corners, and
+        15-degree Shift snap (unit tested). The options strip shows
+        Interpolation (Bilinear default, Nearest; applied live, tested), Commit,
+        and Cancel. Enter commits one 'Free Transform' step. Escape, tool
+        switch, document switch, and undo cancel and restore (tested headless,
+        except the document switch, which is code-inspected). Mask and selection
+        transform with the content (tested). Handles were driven with synthetic
+        events; the rotate cursor is egui Alias.
+      truncated: false
+  - id: A9
+    source: brief.md
+    text: "A9: The transform preview is interactive: a release-mode benchmark of
+      Free Transform updates on a 1024×1024 layer averages under 16 ms per
+      update, and each update re-renders only the old ∪ new transformed bounds.
+      Resampling tests: identity and whole-pixel translation are exact, Nearest
+      90° rotations and 2× scaling are exact, Bilinear produces intermediate
+      values."
+    result: passed
+    reason:
+      text: "rerender repaints only union(last_bounds, new_bounds), using a
+        precomputed inverse map and row-parallel threads. The release benchmark
+        (asserts <16 ms on 1024x1024) passed in Runtime checks. Resampling
+        tests: identity and whole-pixel translation exact for both modes,
+        Nearest 90-degree rotation and 2x scale exact, and Bilinear gives the
+        intermediate 128 with premultiplied edges."
+      truncated: false
+  - id: A10
+    source: brief.md
+    text: "A10: Flip Horizontal / Flip Vertical mirror the content (selection bounds
+      or whole canvas) as one step; flipping twice restores the original
+      exactly."
+    result: passed
+    reason:
+      text: flip() mirrors about the selection bounds or the whole canvas with Nearest
+        and returns one patch recorded through the undo stack ('Flip
+        Horizontal/Vertical'). flips_are_exact_and_involutive confirms flipping
+        twice restores the original; the app-level flip is tested too.
+      truncated: false
+  - id: A11
+    source: brief.md
+    text: "A11: Move, Free Transform, and Flip respect the selection: only the
+      selected content (mask-weighted) moves and the vacated area keeps only the
+      unselected remainder; without a selection the whole layer moves."
+    result: passed
+    reason:
+      text: TransformSession splits the layer into content (alpha x selection) and
+        remainder (the exact alpha complement) and recombines them additively.
+        The vacated area keeps the unselected remainder; without a selection the
+        whole layer moves. Move, Free Transform, and Flip all use the session.
+        session_moves_selected_content_and_selection is tested, and a zero move
+        under a soft selection is exact with no step recorded (new test).
+      truncated: false
+  - id: A12
+    source: brief.md
+    text: 'A12: `.gac` files are ZIP archives with `manifest.json` (format
+      "game-asset-creator", version 1, size, DPI, active layer, bottom-to-top
+      layers with name, visibility, opacity, blend mode, image path, mask path,
+      mask enabled; selection path) plus `layers/N.png`, `masks/N.png`, and
+      `selection.png`, verified by a test that inspects a saved archive.'
+    result: passed
+    reason:
+      text: write_project produces manifest.json (format, version 1, width, height,
+        dpi, active_layer, bottom-to-top layers with name, visible, opacity,
+        blend_mode, image, mask, mask_enabled; selection) plus layers/N.png
+        (RGBA), masks/N.png (gray), and selection.png.
+        archive_layout_and_manifest opens the saved ZIP and checks entry names,
+        manifest fields, and PNG color types.
+      truncated: false
+  - id: A13
+    source: brief.md
+    text: "A13: File → Save (Cmd+S) and Save As… (Cmd+Shift+S) write `.gac`
+      atomically and update the document's name and path; Save on a document
+      without a `.gac` file behaves as Save As; File → Open accepts `.gac`;
+      loading reproduces a multi-layer document exactly (pixels, names,
+      visibility, opacity, blend modes, masks and enabled state, DPI, size,
+      selection, active layer); corrupt, foreign, wrong-version, incomplete, or
+      mismatched files show an error and open nothing."
+    result: passed
+    reason:
+      text: Save writes to the .gac path, or runs Save As when the document has none.
+        Save As uses an rfd .gac dialog, then updates name and path.
+        save_project writes a temp file then renames it (no leftover; tested).
+        Open's filter and AppState.open accept .gac. The round trip is exact for
+        every property including selection and active layer. Rejection is tested
+        for not-a-zip, missing manifest, foreign format, version 2, missing
+        entry, size mismatch, bad blend mode, active layer out of range, and no
+        layers; the app shows an error and opens no tab (tested). The native
+        Save As dialog was not exercised.
+      truncated: false
+  - id: A14
+    source: brief.md
+    text: "A14: Unsaved changes: a tab title ends with \" •\" while its document
+      differs from the last saved/opened state (undoing back to it clears the
+      marker); closing such a document asks Save / Don't Save / Cancel; quitting
+      (menu, Cmd+Q, window close button) asks for each such document in turn and
+      Cancel aborts quitting."
+    result: passed
+    reason:
+      text: "The tab title gets ' •' from state ids, and undoing back to the saved id
+        clears it (tested). Close and the tab X go through request_close with
+        Save / Don't Save / Cancel. Quit (menu), the window close button
+        (CancelClose), and Cmd+Q all reach request_quit, which queues each dirty
+        document; Cancel aborts. The iteration-1 failure is fixed: main.rs sets
+        EventLoopBuilderExtMacOS::with_default_menu(false) on the only winit
+        (0.30.13, same as eframe) and egui quit_shortcuts are cleared. Live
+        check on macOS: the running app has 0 native menu bars (another egui app
+        shows the default menu). Sending Cmd+N, Return, Cmd+Shift+N, then Cmd+Q
+        through System Events left the app running, with the 'Unsaved Changes -
+        Save / Don't Save / Cancel' dialog over 'Untitled-1 •' (screenshot). The
+        new headless cmd_q test also passes."
+      truncated: false
+  - id: A15
+    source: brief.md
+    text: 'A15: Compositing everywhere (canvas, export, eyedropper "All layers")
+      honours visibility, opacity, blend modes, and enabled masks; paint tools
+      continue to target the active layer (or its mask).'
+    result: passed
+    reason:
+      text: Canvas tiles (composite_region), export (doc.composite), and the 'All
+        layers' eyedropper (composite_region) all use composite_layer_onto,
+        which honours visibility, opacity, blend mode, and enabled mask. Paint
+        tools target the active layer's pixels or mask through PaintTarget.
+      truncated: false
+  - id: A16
+    source: brief.md
+    text: "A16: Every new operation undoes and redoes exactly (pixels, masks,
+      properties, layer order, active layer, selection), and the canvas
+      refreshes the affected tiles after each."
+    result: passed
+    reason:
+      text: Layer commands swap whole layer runs, so pixels, masks, properties, order,
+        and active layer are restored. Transform patches store pixels, mask, and
+        selection before and after. Undo/redo exactness is tested per command
+        family. Every command reports a dirty rect (whole document for layer
+        ops, the patch rect for transforms), and previews call repainted(),
+        which feeds the canvas tile cache.
+      truncated: false
+builder_handoff:
+  candidate_id: a4fc90ef-5c89-4cb7-a15e-5748976165cd
+  identity_provider: skill-coordinated
+  builder_execution_ref: skill-coordinated:builder:c274fed1-6d37-4dff-b109-f7d331dc11f2
+  iteration: 2
+  summary:
+    text: "Repair for A14 plus two verifier risks. (1) Cmd+Q data loss on macOS:
+      main.rs now disables winit's default app menu via
+      NativeOptions.event_loop_builder +
+      EventLoopBuilderExtMacOS::with_default_menu(false) (winit 0.30 added as a
+      macOS-only dependency, same version eframe uses), and egui's built-in
+      quit_shortcuts are cleared so Cmd+Q always reaches the app's request_quit
+      and its Save/Don't Save/Cancel prompts; new test
+      cmd_q_goes_through_the_unsaved_prompt. (2) Edit target now returns to
+      pixels whenever the active layer changes (Duplicate, Delete, undo, etc.),
+      per the layers spec; new unit test. (3) Moving content under a soft
+      selection: the lifted content and remainder now split alpha exactly and
+      are recombined additively in premultiplied space, so a zero move is exact
+      and records no step; new unit test. Everything else unchanged from
+      iteration 1: Document: BlendMode (7 W3C modes, key/from_key), layer mask +
+      mask_enabled, active layer moved into Document,
+      blend_pixel/composite_layer_onto with W3C compositing (Normal and
+      empty-backdrop paths unchanged). New src/layers.rs: InsertLayer
+      (New/Duplicate), DeleteLayer, MoveLayer, ReplaceLayers (Merge Down,
+      Flatten, mask add/delete/apply), SetLayerProps
+      (rename/visibility/opacity/blend/mask enable) with labels; next_layer_name
+      = smallest unused 'Layer N' (spec wording adjusted accordingly). undo.rs:
+      step ids + state_id (dirty tracking, survives dropped history),
+      PaintTarget (pixels or mask) with target_image/target_crop/write_target_*
+      and apply_masked_target; paint.rs
+      strokes/PixelPatch/BucketFill/GradientFill accept mask targets
+      (StrokeKind::for_mask, mask_gray luminance; eraser reveals). New
+      src/transform.rs: Affine (exact multiples of 90 deg), nearest/bilinear
+      (premultiplied) sampling, TransformSession (selection-aware lift, mask +
+      selection transform, renders only old ∪ new bounds with a precomputed
+      inverse map and row-parallel threads, commit -> TransformPatch, cancel),
+      flip, handle hit-test and drag math (corner/edge scale with fixed anchor,
+      Shift proportional, rotate with 15 deg snap). New src/project.rs: .gac ZIP
+      (manifest.json + layers/N.png RGBA + masks/N.png gray + selection.png),
+      atomic save, strict load validation. AppState: OpenError, open .gac, save,
+      project_path, edit target (pixels/mask), dirty tracking (saved state id),
+      live layer-prop preview + commit, transform
+      begin/update/interpolation/commit/cancel (cancelled by
+      execute/undo/redo/tool/doc switch), flip; .gac load keeps saved active
+      layer. New src/layers_panel.rs (rows with eye toggle, double-click rename,
+      Mask chip, blend combo, opacity slider preview/commit, stack buttons). UI:
+      Layer menu + shortcuts (Cmd+Shift+N, Cmd+J, Cmd+]/[, Cmd+E), Edit Free
+      Transform (Cmd+T) / Flip H/V, Move tool (V) with drag and arrow nudges,
+      Free Transform box/handles/cursors in canvas, options strip
+      Interpolation/Commit/Cancel (interpolation applies live), File Save/Save
+      As (Cmd+S / Cmd+Shift+S), Open accepts .gac, tab title ' •' when dirty,
+      Save/Don't Save/Cancel prompts on close (menu and tab X) and quit (menu,
+      Cmd+Q, window close via CancelClose), status 'Editing mask'. Also fixed
+      the C4 swap-colors button glyph (rendered as a box) to a text label."
+    truncated: false
+  addressed_acceptance_ids:
+    - A14
+    - A5
+    - A7
+    - A11
+    - A1
+    - A2
+    - A3
+    - A4
+    - A6
+    - A8
+    - A9
+    - A10
+    - A12
+    - A13
+    - A15
+    - A16
+  checks:
+    - name:
+        text: cargo test
+        truncated: false
+      result: passed
+      note:
+        text: 210 tests (127 unit, 11 layers UI incl. Cmd+Q prompt path); 2 ignored
+          benchmarks
+        truncated: false
+    - name:
+        text: release benchmarks
+        truncated: false
+      result: passed
+      note:
+        text: pan/zoom 0.29 ms/frame on 4000x4000; Free Transform update 4.57 ms on
+          1024x1024
+        truncated: false
+    - name:
+        text: cargo clippy --all-targets -- -D warnings
+        truncated: false
+      result: passed
+      note: null
+    - name:
+        text: cargo fmt --check
+        truncated: false
+      result: passed
+      note: null
+    - name:
+        text: manual launch (Cmd+Q)
+        truncated: false
+      result: not-run
+      note:
+        text: Cannot send Cmd+Q to the live app or focus it from this environment (no
+          accessibility access); fix verified against winit 0.30.13 source
+          (default menu binds Cmd+Q to terminate:) and the headless prompt test.
+        truncated: false
+  checks_truncated: false
+  known_limits:
+    - text: Layers panel widgets (eye button, double-click rename, Mask chip, blend
+        combo, slider) are exercised through LayerAction in tests, not by
+        clicking the rendered widgets; the Layers panel and prompts are rendered
+        headlessly.
+      truncated: false
+    - text: Free Transform handles were dragged with synthetic pointer events in
+        tests; not dragged by hand in the live app.
+      truncated: false
+    - text: Rotate cursor uses egui's Alias icon (egui has no rotate cursor).
+      truncated: false
+    - text: With a selection, the layer mask moves where the transformed selection
+        lands (lerp by transformed selection); without one the whole mask moves
+        (areas exposed from beyond the edge reveal).
+      truncated: false
+    - text: Undo history steps of layer stack operations clone the affected layers
+        (Flatten stores the whole previous stack).
+      truncated: false
+    - text: Save on an untitled document opens a native save dialog (not exercised in
+        tests; tests use save_to).
+      truncated: false
+    - text: Without winit's default menu the macOS app menu (Hide/Quit items) is gone;
+        quitting is via File > Quit, Cmd+Q, or the window close button.
+      truncated: false
+  known_limits_truncated: false
+  review: null
+  submitted_at: 2026-10-17T11:29:24.951Z
+blockers: []
+verification:
+  candidate_id: a4fc90ef-5c89-4cb7-a15e-5748976165cd
+  identity_provider: skill-coordinated
+  verifier_execution_ref: skill-coordinated:verifier:23eaf469-1621-4887-b984-526b8ee64ba3
+  iteration: 2
+  attempt: 1
+  assurance: skill-coordinated
+  verdict: pass
+  checks:
+    - id: cargo-test
+      name:
+        text: cargo test
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 30643
+    - id: bench-canvas
+      name:
+        text: release pan/zoom benchmark
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: canvas
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 10883
+    - id: bench-transform
+      name:
+        text: release transform benchmark
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --lib
+          truncated: false
+        - text: bench_transform
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 17152
+    - id: cargo-clippy
+      name:
+        text: cargo clippy
+        truncated: false
+      argv_display:
+        - text: clippy
+          truncated: false
+        - text: --all-targets
+          truncated: false
+        - text: --
+          truncated: false
+        - text: -D
+          truncated: false
+        - text: warnings
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 816
+    - id: cargo-fmt
+      name:
+        text: cargo fmt check
+        truncated: false
+      argv_display:
+        - text: fmt
+          truncated: false
+        - text: --check
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 265
+  summary:
+    text: "All 16 acceptance items pass. The A14 fix is confirmed live on macOS: the
+      app has no native default menu, and Cmd+Q on a dirty document shows the
+      Save / Don't Save / Cancel prompt instead of quitting. cargo test re-run
+      passed (all suites). Code review and an ad-hoc probe confirm the
+      iteration-2 edit-target, soft-selection, and mask-painting behaviour."
+    truncated: false
+  risks:
+    - text: "macOS: Quit from the Dock or a system logout still sends terminate: and
+        winit 0.30 has no applicationShouldTerminate hook, so these still skip
+        the unsaved prompt. Neither is in A14's list; worth a follow-up."
+      truncated: false
+    - text: "macOS: with the default menu disabled, the native app menu is gone,
+        including Hide, Services, and the app-menu Quit."
+      truncated: false
+    - text: The menu bar order is File, Edit, Layer, Select, View; the editor-shell
+        spec lists File, Edit, Select, Layer, View. Cosmetic.
+      truncated: false
+    - text: No committed tests cover Bucket, Gradient, or Clone on a mask; the
+        verifier confirmed them with an ad-hoc probe only.
+      truncated: false
+    - text: "Not exercised live: the window close button, real-mouse handle drags, the
+        native Save As dialog, and the Cancel button in the live prompt (System
+        Events clicks did not register; Cancel is covered by headless tests).
+        The rotate cursor is egui's Alias icon."
+      truncated: false
+  risks_truncated: false
+  completed_at: 2026-10-17T11:39:27.126Z
+history:
+  - goal_cycle: 1
+    iteration: 1
+    attempt: 0
+    outcome: recovery
+    unresolved_ids: []
+    summary:
+      text: Native Shape artifacts changed
+      truncated: false
+    completed_at: 2026-10-17T10:50:22.882Z
+  - goal_cycle: 2
+    iteration: 1
+    attempt: 1
+    outcome: fail
+    unresolved_ids:
+      - A14
+    summary:
+      text: "15 of 16 acceptance items pass on code and automated evidence (cargo
+        test, release transform benchmark, clippy, fmt all passed). A14 fails:
+        on macOS, Cmd+Q is caught by winit's default app menu (terminate:) and
+        quits without asking Save / Don't Save / Cancel. The headless Cmd+Q test
+        never takes that path. Fix: disable the default menu (or intercept
+        termination), then re-verify."
+      truncated: false
+    completed_at: 2026-10-17T11:24:51.034Z
+  - goal_cycle: 2
+    iteration: 2
+    attempt: 1
+    outcome: pass
+    unresolved_ids: []
+    summary:
+      text: "All 16 acceptance items pass. The A14 fix is confirmed live on macOS: the
+        app has no native default menu, and Cmd+Q on a dirty document shows the
+        Save / Don't Save / Cancel prompt instead of quitting. cargo test re-run
+        passed (all suites). Code review and an ad-hoc probe confirm the
+        iteration-2 edit-target, soft-selection, and mask-painting behaviour."
+      truncated: false
+    completed_at: 2026-10-17T11:39:27.126Z
+history_overflow:
+  dropped_entries: 0
+  first_dropped_at: null
+  last_dropped_at: null
+  outcome_counts:
+    pass: 0
+    fail: 0
+    blocked: 0
+    execution-error: 0
+    recovery: 0
+verification_result: pass
+verification_report: verification.md
+archived: true
+created_at: 2026-10-17T09:48:09.661Z

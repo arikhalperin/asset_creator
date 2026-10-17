@@ -15,7 +15,8 @@ In-memory representation of an image being edited: a document holding metadata a
 
 ### Layer
 
-- A `Layer` has `name`, `visible` (default true), `opacity` in [0.0, 1.0] (default 1.0, clamped on set), and a `pixels: image::RgbaImage` buffer.
+- A `Layer` has `name`, `visible` (default true), `opacity` in [0.0, 1.0] (default 1.0, clamped on set), `blend_mode` (default Normal), an optional 8-bit `mask` of the layer size with `mask_enabled` (default true), and a `pixels: image::RgbaImage` buffer.
+- Setting a mask whose size differs from the layer fails with an error.
 - Adding or inserting a layer whose buffer size differs from the document size fails with an error and leaves the stack unchanged.
 
 ### Layer stack operations
@@ -27,9 +28,10 @@ In-memory representation of an image being edited: a document holding metadata a
 
 ### Compositing
 
-- `composite()` returns an `RgbaImage` of the document size: visible layers blended bottom-to-top with source-over (normal) alpha compositing, each layer's alpha scaled by its opacity, starting from fully transparent.
+- `composite()` returns an `RgbaImage` of the document size: visible layers composited bottom-to-top starting from fully transparent. Each layer's source alpha is its pixel alpha × opacity × (mask value / 255 when a mask is present and enabled).
+- Blend modes follow the W3C Compositing and Blending Level 1 formulas on unpremultiplied colors in [0, 1] (`Cb` backdrop, `Cs` source): Normal `B = Cs`; Multiply `Cs·Cb`; Screen `Cb + Cs − Cs·Cb`; Overlay `HardLight(Cs, Cb)` with roles swapped (`Cb ≤ 0.5 ? 2·Cs·Cb : Screen(Cs, 2·Cb − 1)`); Add `min(1, Cb + Cs)`; Darken `min(Cb, Cs)`; Lighten `max(Cb, Cs)`. The blended source color is `(1 − αb)·Cs + αb·B(Cb, Cs)`, then composited source-over: `αo = αs + αb·(1 − αs)`, `Co = (αs·Cs' + αb·Cb·(1 − αs)) / αo`. Results are rounded to 8 bits.
+- Where the backdrop is fully transparent, the source pixel's color is kept unchanged (alpha scaled), so a single visible, opacity-1.0 Normal layer without a mask composites to exactly its own pixels.
 - Hidden layers and zero-opacity layers do not contribute.
-- A single visible, opacity-1.0 layer composites to exactly its own pixels.
 
 ### Selection mask
 
