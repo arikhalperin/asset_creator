@@ -9,7 +9,7 @@ use std::path::Path;
 
 use crate::document::{Document, DocumentError, PixelRect};
 use crate::io::{self, IoError};
-use crate::undo::{Command, CommandError, UndoStack};
+use crate::undo::{Change, Command, CommandError, UndoStack};
 
 /// Stable identifier of an open document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -26,6 +26,8 @@ pub struct OpenDocument {
     undo: UndoStack,
     active_layer: usize,
     dirty: Vec<PixelRect>,
+    /// Bumps whenever the selection changes.
+    pub selection_revision: u64,
 }
 
 impl OpenDocument {
@@ -38,6 +40,7 @@ impl OpenDocument {
             undo: UndoStack::new(),
             active_layer,
             dirty: Vec::new(),
+            selection_revision: 0,
         }
     }
 
@@ -50,9 +53,14 @@ impl OpenDocument {
         &self.undo
     }
 
-    fn changed(&mut self, rect: PixelRect) {
+    fn changed(&mut self, change: Change) {
         self.revision += 1;
-        self.dirty.push(rect);
+        if !change.dirty.is_empty() {
+            self.dirty.push(change.dirty);
+        }
+        if change.selection_changed {
+            self.selection_revision += 1;
+        }
         self.active_layer = self
             .active_layer
             .min(self.document.layer_count().saturating_sub(1));

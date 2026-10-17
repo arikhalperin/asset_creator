@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use image::{Rgba, RgbaImage};
+use image::{GrayImage, Rgba, RgbaImage};
 use thiserror::Error;
 
 /// DPI used when a file carries no resolution information.
@@ -25,6 +25,15 @@ pub enum DocumentError {
     },
     #[error("layer index {index} is out of range (layer count {len})")]
     IndexOutOfRange { index: usize, len: usize },
+    #[error(
+        "selection mask is {mask_width}x{mask_height} but the document is {doc_width}x{doc_height}"
+    )]
+    SelectionSizeMismatch {
+        mask_width: u32,
+        mask_height: u32,
+        doc_width: u32,
+        doc_height: u32,
+    },
 }
 
 /// An axis-aligned rectangle in image pixel coordinates.
@@ -123,6 +132,8 @@ pub struct Document {
     height: u32,
     dpi: f64,
     layers: Vec<Layer>,
+    /// 8-bit selection mask; `None` means no selection (edits apply everywhere).
+    selection: Option<GrayImage>,
 }
 
 impl Document {
@@ -144,6 +155,7 @@ impl Document {
             height,
             dpi,
             layers: Vec::new(),
+            selection: None,
         })
     }
 
@@ -175,6 +187,45 @@ impl Document {
         validate_dpi(dpi)?;
         self.dpi = dpi;
         Ok(())
+    }
+
+    /// The selection mask, if anything is selected.
+    pub fn selection(&self) -> Option<&GrayImage> {
+        self.selection.as_ref()
+    }
+
+    /// Replaces the selection. A mask with no non-zero pixel clears it; a mask
+    /// of the wrong size is rejected and leaves the selection unchanged.
+    pub fn set_selection(&mut self, mask: Option<GrayImage>) -> Result<(), DocumentError> {
+        if let Some(mask) = &mask {
+            if mask.dimensions() != (self.width, self.height) {
+                return Err(DocumentError::SelectionSizeMismatch {
+                    mask_width: mask.width(),
+                    mask_height: mask.height(),
+                    doc_width: self.width,
+                    doc_height: self.height,
+                });
+            }
+        }
+        self.selection = mask.and_then(crate::selection::normalize);
+        Ok(())
+    }
+
+    /// The region edits can affect: the selection's bounding box, or the
+    /// whole document without a selection.
+    pub fn editable_bounds(&self) -> PixelRect {
+        match &self.selection {
+            Some(mask) => crate::selection::bounds(mask).unwrap_or_default(),
+            None => self.bounds(),
+        }
+    }
+
+    /// The selection together with mutable access to one layer.
+    pub fn selection_and_layer_mut(
+        &mut self,
+        index: usize,
+    ) -> (Option<&GrayImage>, Option<&mut Layer>) {
+        (self.selection.as_ref(), self.layers.get_mut(index))
     }
 
     /// Layers bottom-to-top.
@@ -534,6 +585,31 @@ mod tests {
         assert_eq!((clipped.width(), clipped.height()), (1, 1));
         let outside = doc.composite_region(PixelRect::new(9, 9, 2, 2));
         assert_eq!((outside.width(), outside.height()), (0, 0));
+    }
+
+    #[test]
+    fn selection_mask_is_validated_and_normalized() {
+        let mut doc = Document::new("x", 4, 3, 72.0).unwrap();
+        assert!(doc.selection().is_none());
+        assert_eq!(doc.editable_bounds(), PixelRect::new(0, 0, 4, 3));
+
+        let mut mask = GrayImage::new(4, 3);
+        mask.put_pixel(1, 2, image::Luma([200]));
+        doc.set_selection(Some(mask.clone())).unwrap();
+        assert_eq!(doc.selection(), Some(&mask));
+        assert_eq!(doc.editable_bounds(), PixelRect::new(1, 2, 1, 1));
+
+        let err = doc.set_selection(Some(GrayImage::new(3, 3))).unwrap_err();
+        assert!(matches!(err, DocumentError::SelectionSizeMismatch { .. }));
+        assert_eq!(doc.selection(), Some(&mask), "unchanged after rejection");
+
+        doc.set_selection(Some(GrayImage::new(4, 3))).unwrap();
+        assert!(doc.selection().is_none(), "empty mask clears");
+        // Selection is not composited.
+        doc.add_layer(Layer::transparent("l", 4, 3)).unwrap();
+        doc.set_selection(Some(crate::selection::select_all(4, 3)))
+            .unwrap();
+        assert!(doc.composite().pixels().all(|p| p.0 == [0; 4]));
     }
 
     #[test]

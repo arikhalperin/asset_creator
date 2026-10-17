@@ -11,7 +11,9 @@ use crate::app_state::{AppState, DocId};
 use crate::canvas::{self, CanvasState, ViewAction};
 use crate::document::DEFAULT_DPI;
 use crate::io::FileFormat;
-use crate::undo::FillLayer;
+use crate::selection::{self, CombineMode};
+use crate::tools::{self, SelectionRequest, Tool, ToolOptions};
+use crate::undo::{FillLayer, SetSelection};
 
 pub const APP_TITLE: &str = "Game Asset Creator";
 
@@ -37,7 +39,54 @@ const SHORTCUT_ACTUAL_SIZE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::
 /// Fill color used before the user picks one.
 pub const DEFAULT_FILL_COLOR: [u8; 4] = [0, 0, 0, 255];
 
-const PLACEHOLDER_TOOLS: [&str; 6] = ["Move", "Select", "Brush", "Eraser", "Fill", "Picker"];
+const PLACEHOLDER_TOOLS: [&str; 5] = ["Move", "Brush", "Eraser", "Fill", "Picker"];
+const SHORTCUT_SELECT_ALL: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::A);
+const SHORTCUT_DESELECT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::D);
+const SHORTCUT_INVERT: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::I);
+
+/// Select → Grow / Shrink / Feather.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RadiusOp {
+    Grow,
+    Shrink,
+    Feather,
+}
+
+impl RadiusOp {
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Grow => "Grow Selection",
+            Self::Shrink => "Shrink Selection",
+            Self::Feather => "Feather Selection",
+        }
+    }
+
+    pub fn default_radius(self) -> u32 {
+        match self {
+            Self::Grow | Self::Shrink => 2,
+            Self::Feather => 5,
+        }
+    }
+}
+
+/// State of the Grow/Shrink/Feather radius dialog.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RadiusDialog {
+    pub op: RadiusOp,
+    pub radius: String,
+    pub error: Option<String>,
+}
+
+impl RadiusDialog {
+    /// The radius if it is a whole number from 1 to 100.
+    pub fn parse(&self) -> Result<u32, String> {
+        match self.radius.trim().parse::<u32>() {
+            Ok(r) if (1..=100).contains(&r) => Ok(r),
+            _ => Err("Radius must be a whole number from 1 to 100".to_owned()),
+        }
+    }
+}
 
 /// The dockable side panels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -118,6 +167,11 @@ enum Action {
     Redo,
     FillLayer,
     View(ViewAction),
+    SelectAll,
+    Deselect,
+    InvertSelection,
+    Radius(RadiusOp),
+    SetTool(Tool),
     SetPanelOpen(Panel, bool),
 }
 
@@ -134,6 +188,11 @@ pub struct EditorApp {
     last_fill_color: [u8; 4],
     error: Option<String>,
     configured_context: bool,
+    tool: Tool,
+    tool_options: ToolOptions,
+    radius_dialog: Option<RadiusDialog>,
+    /// Current document last frame, to cancel gestures when it changes.
+    last_current: Option<DocId>,
 }
 
 impl Default for EditorApp {
@@ -155,7 +214,154 @@ impl EditorApp {
             last_fill_color: DEFAULT_FILL_COLOR,
             error: None,
             configured_context: false,
+            tool: Tool::default(),
+            tool_options: ToolOptions::default(),
+            radius_dialog: None,
+            last_current: None,
         }
+    }
+
+    pub fn tool(&self) -> Tool {
+        self.tool
+    }
+
+    /// Switches tools, abandoning any gesture in progress.
+    pub fn set_tool(&mut self, tool: Tool) {
+        if tool != self.tool {
+            self.tool = tool;
+            self.canvases
+                .values_mut()
+                .for_each(CanvasState::cancel_gesture);
+        }
+    }
+
+    pub fn tool_options(&self) -> &ToolOptions {
+        &self.tool_options
+    }
+
+    pub fn tool_options_mut(&mut self) -> &mut ToolOptions {
+        &mut self.tool_options
+    }
+
+    /// Applies a finished selection gesture to the current document.
+    /// Returns whether the selection changed.
+    pub fn apply_selection_request(&mut self, request: &SelectionRequest) -> bool {
+        let Some(open) = self.state.current_document() else {
+            return false;
+        };
+        let command = tools::selection_command(
+            &open.document,
+            open.active_layer(),
+            request,
+            &self.tool_options,
+        );
+        self.execute_selection(command)
+    }
+
+    fn execute_selection(&mut self, command: Option<SetSelection>) -> bool {
+        let (Some(command), Some(id)) = (command, self.state.current_id()) else {
+            return false;
+        };
+        match self.state.execute(id, Box::new(command)) {
+            Ok(()) => true,
+            Err(err) => {
+                self.error = Some(format!("Could not change the selection: {err}"));
+                false
+            }
+        }
+    }
+
+    /// Select → All.
+    pub fn select_all(&mut self) -> bool {
+        let Some(open) = self.state.current_document() else {
+            return false;
+        };
+        let doc = &open.document;
+        let all = selection::select_all(doc.width(), doc.height());
+        let command =
+            (doc.selection() != Some(&all)).then(|| SetSelection::new("Select All", Some(all)));
+        self.execute_selection(command)
+    }
+
+    /// Select → None.
+    pub fn deselect(&mut self) -> bool {
+        let has_selection = self
+            .state
+            .current_document()
+            .is_some_and(|open| open.document.selection().is_some());
+        self.execute_selection(has_selection.then(|| SetSelection::new("Deselect", None)))
+    }
+
+    /// Select → Invert.
+    pub fn invert_selection(&mut self) -> bool {
+        let Some(open) = self.state.current_document() else {
+            return false;
+        };
+        let doc = &open.document;
+        let inverted = selection::invert(doc.selection(), doc.width(), doc.height());
+        self.execute_selection(Some(SetSelection::new("Invert Selection", inverted)))
+    }
+
+    /// Opens the Grow/Shrink/Feather dialog when there is a selection.
+    pub fn open_radius_dialog(&mut self, op: RadiusOp) {
+        let has_selection = self
+            .state
+            .current_document()
+            .is_some_and(|open| open.document.selection().is_some());
+        if has_selection {
+            self.radius_dialog = Some(RadiusDialog {
+                op,
+                radius: op.default_radius().to_string(),
+                error: None,
+            });
+        }
+    }
+
+    pub fn radius_dialog(&self) -> Option<&RadiusDialog> {
+        self.radius_dialog.as_ref()
+    }
+
+    pub fn set_radius_text(&mut self, text: &str) {
+        if let Some(dialog) = &mut self.radius_dialog {
+            dialog.radius = text.to_owned();
+        }
+    }
+
+    pub fn cancel_radius_dialog(&mut self) {
+        self.radius_dialog = None;
+    }
+
+    /// Applies the dialog's operation. Invalid input keeps the dialog open
+    /// with an inline error. Returns whether the selection changed.
+    pub fn submit_radius_dialog(&mut self) -> bool {
+        let Some(dialog) = self.radius_dialog.take() else {
+            return false;
+        };
+        let radius = match dialog.parse() {
+            Ok(r) => r,
+            Err(message) => {
+                self.radius_dialog = Some(RadiusDialog {
+                    error: Some(message),
+                    ..dialog
+                });
+                return false;
+            }
+        };
+        let Some(mask) = self
+            .state
+            .current_document()
+            .and_then(|o| o.document.selection())
+        else {
+            return false;
+        };
+        let result = match dialog.op {
+            RadiusOp::Grow => selection::grow(mask, radius),
+            RadiusOp::Shrink => selection::shrink(mask, radius),
+            RadiusOp::Feather => selection::feather(mask, radius),
+        };
+        let command =
+            (result.as_ref() != Some(mask)).then(|| SetSelection::new(dialog.op.title(), result));
+        self.execute_selection(command)
     }
 
     /// The canvas state of an open document.
@@ -394,12 +600,17 @@ impl EditorApp {
         egui::Panel::top("menu_bar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| self.menu_bar(ui, &mut actions));
         });
+        egui::Panel::top("tool_options").show(ui, |ui| {
+            tool_options_strip(ui, self.tool, &mut self.tool_options);
+        });
         egui::Panel::bottom("status_bar").show(ui, |ui| {
             ui.label(self.status_text());
         });
 
         let mut closed = Vec::new();
         let mut layer_click = None;
+        let mut tool_click = None;
+        let mut requests = Vec::new();
         egui::CentralPanel::default()
             .frame(egui::Frame::central_panel(ui.style()).inner_margin(0.0))
             .show(ui, |ui| {
@@ -410,6 +621,10 @@ impl EditorApp {
                     show_pixel_grid: self.show_pixel_grid,
                     closed: &mut closed,
                     layer_click: &mut layer_click,
+                    tool: self.tool,
+                    tool_options: &self.tool_options,
+                    tool_click: &mut tool_click,
+                    requests: &mut requests,
                 };
                 DockArea::new(&mut self.dock)
                     .show_leaf_close_all_buttons(false)
@@ -423,12 +638,28 @@ impl EditorApp {
             let id = *id;
             self.state.set_current(id);
         }
+        if self.state.current_id() != self.last_current {
+            // Switching documents abandons an open polygon or drag.
+            self.canvases
+                .values_mut()
+                .for_each(CanvasState::cancel_gesture);
+            self.last_current = self.state.current_id();
+        }
         if let (Some(index), Some(id)) = (layer_click, self.state.current_id()) {
             self.state.set_active_layer(id, index);
+        }
+        for (id, request) in requests {
+            if Some(id) == self.state.current_id() {
+                self.apply_selection_request(&request);
+            }
+        }
+        if let Some(tool) = tool_click {
+            self.set_tool(tool);
         }
 
         self.show_new_dialog_window(ui.ctx());
         self.show_fill_dialog_window(ui.ctx());
+        self.show_radius_dialog_window(ui.ctx());
         self.show_error_window(ui.ctx());
 
         for action in actions {
@@ -459,13 +690,30 @@ impl EditorApp {
                     (SHORTCUT_ZOOM_OUT, Action::View(ViewAction::ZoomOut)),
                     (SHORTCUT_FIT, Action::View(ViewAction::Fit)),
                     (SHORTCUT_ACTUAL_SIZE, Action::View(ViewAction::ActualSize)),
+                    (SHORTCUT_INVERT, Action::InvertSelection),
+                    (SHORTCUT_SELECT_ALL, Action::SelectAll),
+                    (SHORTCUT_DESELECT, Action::Deselect),
                 ]);
             }
-            bindings
+            let mut actions: Vec<Action> = bindings
                 .into_iter()
                 .filter(|(shortcut, _)| input.consume_shortcut(shortcut))
                 .map(|(_, action)| action)
-                .collect()
+                .collect();
+            if !typing && !input.modifiers.command {
+                // Single-key tool shortcuts.
+                let tool_keys = [
+                    (Key::M, Tool::after_m(self.tool)),
+                    (Key::L, Tool::after_l(self.tool)),
+                    (Key::W, Tool::MagicWand),
+                ];
+                for (key, tool) in tool_keys {
+                    if input.consume_key(Modifiers::NONE, key) {
+                        actions.push(Action::SetTool(tool));
+                    }
+                }
+            }
+            actions
         })
     }
 
@@ -510,6 +758,68 @@ impl EditorApp {
             {
                 actions.push(Action::FillLayer);
             }
+        });
+        let has_selection = self
+            .state
+            .current_document()
+            .is_some_and(|open| open.document.selection().is_some());
+        ui.menu_button("Select", |ui| {
+            let mut item = |ui: &mut egui::Ui,
+                            label: &str,
+                            shortcut: Option<KeyboardShortcut>,
+                            enabled,
+                            action| {
+                let mut button = egui::Button::new(label);
+                if let Some(shortcut) = shortcut {
+                    button = button.shortcut_text(ui.ctx().format_shortcut(&shortcut));
+                }
+                if ui.add_enabled(enabled, button).clicked() {
+                    actions.push(action);
+                }
+            };
+            item(
+                ui,
+                "All",
+                Some(SHORTCUT_SELECT_ALL),
+                has_document,
+                Action::SelectAll,
+            );
+            item(
+                ui,
+                "None",
+                Some(SHORTCUT_DESELECT),
+                has_selection,
+                Action::Deselect,
+            );
+            item(
+                ui,
+                "Invert",
+                Some(SHORTCUT_INVERT),
+                has_document,
+                Action::InvertSelection,
+            );
+            ui.separator();
+            item(
+                ui,
+                "Grow…",
+                None,
+                has_selection,
+                Action::Radius(RadiusOp::Grow),
+            );
+            item(
+                ui,
+                "Shrink…",
+                None,
+                has_selection,
+                Action::Radius(RadiusOp::Shrink),
+            );
+            item(
+                ui,
+                "Feather…",
+                None,
+                has_selection,
+                Action::Radius(RadiusOp::Feather),
+            );
         });
         ui.menu_button("View", |ui| {
             let mut item = |ui: &mut egui::Ui, label: &str, shortcut, action| {
@@ -591,6 +901,17 @@ impl EditorApp {
             }
             Action::FillLayer => self.open_fill_dialog(),
             Action::View(action) => self.view_action(action),
+            Action::SelectAll => {
+                self.select_all();
+            }
+            Action::Deselect => {
+                self.deselect();
+            }
+            Action::InvertSelection => {
+                self.invert_selection();
+            }
+            Action::Radius(op) => self.open_radius_dialog(op),
+            Action::SetTool(tool) => self.set_tool(tool),
             Action::SetPanelOpen(panel, open) => self.set_panel_open(panel, open),
         }
     }
@@ -667,6 +988,38 @@ impl EditorApp {
             self.cancel_fill_dialog();
         } else if submit {
             self.submit_fill_dialog();
+        }
+    }
+
+    fn show_radius_dialog_window(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.radius_dialog.clone() else {
+            return;
+        };
+        let mut submit = false;
+        let mut cancel = false;
+        egui::Window::new(dialog.op.title())
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Radius (px)");
+                    ui.text_edit_singleline(&mut dialog.radius);
+                });
+                if let Some(error) = &dialog.error {
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                }
+                ui.horizontal(|ui| {
+                    submit = ui.button("OK").clicked() || ui.input(|i| i.key_pressed(Key::Enter));
+                    cancel =
+                        ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape));
+                });
+            });
+        self.radius_dialog = Some(dialog);
+        if cancel {
+            self.cancel_radius_dialog();
+        } else if submit {
+            self.submit_radius_dialog();
         }
     }
 
@@ -776,6 +1129,12 @@ struct Viewer<'a> {
     closed: &'a mut Vec<DocId>,
     /// Layer index clicked in the Layers panel this frame.
     layer_click: &'a mut Option<usize>,
+    tool: Tool,
+    tool_options: &'a ToolOptions,
+    /// Tool clicked in the Tools panel this frame.
+    tool_click: &'a mut Option<Tool>,
+    /// Finished selection gestures this frame.
+    requests: &'a mut Vec<(DocId, SelectionRequest)>,
 }
 
 impl TabViewer for Viewer<'_> {
@@ -799,7 +1158,7 @@ impl TabViewer for Viewer<'_> {
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Tab) {
         match *tab {
-            Tab::Panel(Panel::Tools) => tools_panel(ui),
+            Tab::Panel(Panel::Tools) => tools_panel(ui, self.tool, self.tool_click),
             Tab::Panel(Panel::Layers) => layers_panel(ui, self.state, self.layer_click),
             Tab::Panel(Panel::AssetLibrary) => {
                 ui.weak("The asset library arrives in a later version.");
@@ -830,15 +1189,53 @@ impl Viewer<'_> {
         else {
             return;
         };
-        canvas.show(ui, open, self.checker, self.show_pixel_grid);
+        if let Some(request) = canvas.show(
+            ui,
+            open,
+            self.checker,
+            self.show_pixel_grid,
+            self.tool,
+            self.tool_options,
+        ) {
+            self.requests.push((id, request));
+        }
     }
 }
 
-fn tools_panel(ui: &mut egui::Ui) {
+fn tools_panel(ui: &mut egui::Ui, active: Tool, clicked: &mut Option<Tool>) {
     ui.horizontal_wrapped(|ui| {
+        for tool in Tool::ALL {
+            let response = ui
+                .selectable_label(tool == active, tool.label())
+                .on_hover_text(format!("{} ({})", tool.label(), tool.shortcut()));
+            if response.clicked() {
+                *clicked = Some(tool);
+            }
+        }
         for name in PLACEHOLDER_TOOLS {
             ui.add_enabled(false, egui::Button::new(name))
                 .on_disabled_hover_text("Coming soon");
+        }
+    });
+}
+
+fn tool_options_strip(ui: &mut egui::Ui, tool: Tool, options: &mut ToolOptions) {
+    ui.horizontal(|ui| {
+        ui.label(tool.label());
+        ui.separator();
+        ui.label("Mode");
+        for mode in CombineMode::ALL {
+            ui.selectable_value(&mut options.mode, mode, mode.label());
+        }
+        if tool.uses_antialias() {
+            ui.separator();
+            ui.checkbox(&mut options.antialias, "Anti-alias");
+        }
+        if tool == Tool::MagicWand {
+            ui.separator();
+            ui.label("Tolerance");
+            ui.add(egui::DragValue::new(&mut options.tolerance).range(0..=255));
+            ui.checkbox(&mut options.contiguous, "Contiguous");
         }
     });
 }

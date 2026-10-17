@@ -14,7 +14,7 @@ The Game Asset Creator desktop application window: eframe/egui with egui_dock pr
 
 ### Layout
 
-- Menu bar with File, Edit, and View menus; status bar at the bottom showing the focused document's name, size, DPI, zoom percentage, and the pointer's pixel coordinate when over the image (or "No document").
+- Menu bar with File, Edit, Select, and View menus; a tool-options strip below the menu bar; status bar at the bottom showing the focused document's name, size, DPI, zoom percentage, and the pointer's pixel coordinate when over the image (or "No document").
 - A dock area (egui_dock) containing three panel tabs — Tools, Layers, Asset Library — and the document tabs. Panels and documents can be dragged, re-docked, and closed.
 
 ### File menu
@@ -44,7 +44,7 @@ The Game Asset Creator desktop application window: eframe/egui with egui_dock pr
 
 ### Panels
 
-- Tools: disabled placeholder buttons for upcoming tools (Move, Select, Brush, Eraser, Fill, Picker).
+- Tools: Rectangle Select, Ellipse Select, Lasso, Polygon Lasso, and Magic Wand buttons (the active tool is highlighted; Rectangle Select is active at startup), followed by disabled placeholders for upcoming tools (Move, Brush, Eraser, Fill, Picker). Shortcuts: M toggles Rectangle/Ellipse Select, L toggles Lasso/Polygon Lasso, W selects Magic Wand; single-key tool shortcuts are ignored while a text field is focused or Cmd/Ctrl is held.
 - Layers: lists the current document's layers top-first, each with a visibility indicator and name; the active layer is highlighted and clicking a row makes it active; shows "No document" when none is focused.
 - Asset Library: placeholder text indicating the library arrives later.
 
@@ -52,3 +52,14 @@ The Game Asset Creator desktop application window: eframe/egui with egui_dock pr
 
 - App state operations (new, open, export current, close, execute/undo/redo, active layer, current document, layer listing) are callable without a window.
 - The UI renders headlessly through `egui::Context::run_ui` without panicking.
+
+### Select menu
+
+- All (Ctrl+A), None (Ctrl+D), Invert (Ctrl+Shift+I). All and Invert are enabled with a current document; None needs an existing selection.
+- Grow…, Shrink…, Feather…: each opens a dialog with a radius in pixels (whole number 1–100; defaults 2, 2, 5), enabled when the current document has a selection; OK applies the operation as one undoable step, Cancel does nothing, invalid input shows an inline error.
+
+### Tool-options strip
+
+- Always shows the combine-mode buttons Replace / Add / Subtract / Intersect (one active; Replace by default).
+- Ellipse Select, Lasso, and Polygon Lasso also show an Anti-alias checkbox (default on, shared by those tools).
+- Magic Wand also shows Tolerance (0–255, default 32) and Contiguous (default on).
