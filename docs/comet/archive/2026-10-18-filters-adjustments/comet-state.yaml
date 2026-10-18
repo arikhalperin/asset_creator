@@ -2,8 +2,8 @@ schema: comet.native.v4
 name: filters-adjustments
 language: en
 phase: archive
-status: active
-state_version: 11
+status: done
+state_version: 13
 brief: brief.md
 document_constraints_version: 1
 shape_confirmation_hash: c85ba0d1187213a631086ecebf24cc2476cdeff473405e200b1c857e96d501b4
@@ -21,9 +21,9 @@ workspace:
   isolation: branch
   change_branch: comet/filters-adjustments
   target_branch: master
-  finish: null
+  finish: merge
 loop:
-  stage: archive-ready
+  stage: done
   goal_cycle: 1
   iteration: 2
   attempt: 1
@@ -32,7 +32,7 @@ loop:
   no_progress_count: 0
   execution_failure_count: 0
   previous_unresolved_ids: []
-  next_action: archive
+  next_action: null
 acceptance:
   - id: A1
     source: brief.md
@@ -506,5 +506,5 @@ history_overflow:
     recovery: 0
 verification_result: pass
 verification_report: verification.md
-archived: false
+archived: true
 created_at: 2026-10-17T11:56:40.551Z

@@ -54,3 +54,8 @@ Command-pattern undo/redo framework through which every document edit flows.
 ### Saved state
 
 - Every recorded step has a unique id; the document is clean when the id of its most recent applied step equals the id recorded at the last save (or at open/creation). Undoing back to the saved step makes the document clean again.
+
+### Filter commands
+
+- Applying a filter is one undo step labelled with the filter's name. It stores the previous pixels of the affected region (editable bounds of the edit target) and restores them exactly on undo.
+- While a filter dialog is open the canvas shows the preview without recording history; OK records the step, Cancel (or closing the dialog, switching document, or undo) restores the previous pixels.
