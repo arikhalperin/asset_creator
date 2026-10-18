@@ -7,8 +7,9 @@
 
 use std::path::Path;
 
-use crate::document::{Document, DocumentError, PixelRect};
+use crate::document::{Document, DocumentError, Layer, PixelRect, DEFAULT_DPI};
 use crate::filters::{self, Filter, Params};
+use crate::frame_set::FrameSet;
 use crate::io::{self, IoError};
 use crate::layers::{self, LayerProps};
 use crate::paint::PixelPatch;
@@ -219,6 +220,8 @@ pub struct AppState {
     current: Option<DocId>,
     next_id: u64,
     untitled_count: u32,
+    /// Frames extracted from videos this session.
+    pub frame_set: FrameSet,
 }
 
 impl AppState {
@@ -264,6 +267,18 @@ impl AppState {
         let name = format!("Untitled-{}", self.untitled_count + 1);
         let document = Document::new_blank(name, width, height, dpi)?;
         self.untitled_count += 1;
+        Ok(self.insert(document))
+    }
+
+    /// Opens `image` as a new current document with one "Background" layer
+    /// (e.g. a frame grabbed from a video). It has no file yet.
+    pub fn new_document_from_image(
+        &mut self,
+        name: impl Into<String>,
+        image: image::RgbaImage,
+    ) -> Result<DocId, DocumentError> {
+        let mut document = Document::new(name, image.width(), image.height(), DEFAULT_DPI)?;
+        document.add_layer(Layer::new("Background", image))?;
         Ok(self.insert(document))
     }
 
