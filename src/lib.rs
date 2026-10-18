@@ -5,6 +5,7 @@ pub mod canvas;
 pub mod document;
 pub mod filter_dialog;
 pub mod filters;
+pub mod frame_set;
 pub mod io;
 pub mod layers;
 pub mod layers_panel;
@@ -15,6 +16,8 @@ pub mod tools;
 pub mod transform;
 pub mod ui;
 pub mod undo;
+pub mod video;
+pub mod video_ui;
 
 pub use app_state::{AppState, DocId};
 pub use document::{Document, DocumentError, Layer, PixelRect};

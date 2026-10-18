@@ -24,6 +24,11 @@ use crate::selection::{self, CombineMode};
 use crate::tools::{self, Colors, SelectionRequest, Tool, ToolOptions};
 use crate::transform::{self, Affine, Handle, Interpolation};
 use crate::undo::{Command, FillLayer, PaintTarget, SetSelection};
+use crate::video::{self, VideoSource};
+use crate::video_ui::{
+    frame_set_panel, ExtractDialog, ExtractOutcome, FrameSetAction, FrameSetView, Transport,
+    VideoAction, VideoId, VideoTab,
+};
 
 pub const APP_TITLE: &str = "Game Asset Creator";
 
@@ -118,16 +123,23 @@ pub enum Panel {
     Tools,
     Layers,
     AssetLibrary,
+    FrameSet,
 }
 
 impl Panel {
-    pub const ALL: [Panel; 3] = [Panel::Tools, Panel::Layers, Panel::AssetLibrary];
+    pub const ALL: [Panel; 4] = [
+        Panel::Tools,
+        Panel::Layers,
+        Panel::AssetLibrary,
+        Panel::FrameSet,
+    ];
 
     pub fn title(self) -> &'static str {
         match self {
             Panel::Tools => "Tools",
             Panel::Layers => "Layers",
             Panel::AssetLibrary => "Asset Library",
+            Panel::FrameSet => "Frame Set",
         }
     }
 }
@@ -137,6 +149,7 @@ impl Panel {
 pub enum Tab {
     Panel(Panel),
     Document(DocId),
+    Video(VideoId),
 }
 
 /// Text fields of the File → New dialog.
@@ -209,6 +222,7 @@ enum Action {
     CancelTransform,
     Nudge(i32, i32),
     Filter(&'static str),
+    Video(Transport),
 }
 
 /// A pending "save changes?" question.
@@ -264,6 +278,14 @@ pub struct EditorApp {
     free_transform: Option<DocId>,
     /// The open filter dialog and the document it previews on.
     filter_dialog: Option<(DocId, FilterDialog)>,
+    videos: HashMap<VideoId, VideoTab>,
+    next_video: u64,
+    /// Video tab with keyboard focus (gets Space / arrows / Home / End).
+    focused_video: Option<VideoId>,
+    extract_dialog: Option<ExtractDialog>,
+    frame_set_view: FrameSetView,
+    /// For background workers to request repaints.
+    repaint: Option<egui::Context>,
 }
 
 impl Default for EditorApp {
@@ -299,6 +321,230 @@ impl EditorApp {
             quit_now: false,
             free_transform: None,
             filter_dialog: None,
+            videos: HashMap::new(),
+            next_video: 0,
+            focused_video: None,
+            extract_dialog: None,
+            frame_set_view: FrameSetView::default(),
+            repaint: None,
+        }
+    }
+
+    /// Lets background workers (video decoding) request repaints; set
+    /// automatically on the first frame.
+    pub fn set_repaint_context(&mut self, ctx: &egui::Context) {
+        self.repaint = Some(ctx.clone());
+    }
+
+    /// Opens a video in a new focused tab, or shows an error.
+    pub fn open_video(&mut self, path: &Path) -> Option<VideoId> {
+        match VideoSource::open(path) {
+            Ok(source) => {
+                self.next_video += 1;
+                let id = VideoId(self.next_video);
+                self.videos
+                    .insert(id, VideoTab::new(source, self.repaint.as_ref()));
+                self.add_center_tab(Tab::Video(id));
+                self.focused_video = Some(id);
+                Some(id)
+            }
+            Err(err) => {
+                self.error = Some(format!("Could not open {}:\n{err}", path.display()));
+                None
+            }
+        }
+    }
+
+    pub fn video(&self, id: VideoId) -> Option<&VideoTab> {
+        self.videos.get(&id)
+    }
+
+    pub fn video_mut(&mut self, id: VideoId) -> Option<&mut VideoTab> {
+        self.videos.get_mut(&id)
+    }
+
+    /// Open video ids in dock order.
+    pub fn video_tabs(&self) -> Vec<VideoId> {
+        self.dock
+            .iter_all_tabs()
+            .filter_map(|(_, tab)| match tab {
+                Tab::Video(id) => Some(*id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn focused_video(&self) -> Option<VideoId> {
+        self.focused_video
+    }
+
+    /// Closes a video tab, stopping its decoder.
+    pub fn close_video(&mut self, id: VideoId) {
+        if let Some(path) = self.dock.find_tab(&Tab::Video(id)) {
+            self.dock.remove_tab(path);
+        }
+        self.forget_video(id);
+    }
+
+    fn forget_video(&mut self, id: VideoId) {
+        self.videos.remove(&id);
+        if self.focused_video == Some(id) {
+            self.focused_video = None;
+        }
+        if self.extract_dialog.as_ref().is_some_and(|d| d.video == id) {
+            self.cancel_extract();
+        }
+    }
+
+    /// Grab Frame: opens the exact current frame as a new document once it
+    /// is decoded (see [`Self::pump_videos`]).
+    pub fn grab_frame(&mut self, id: VideoId) -> bool {
+        match self.videos.get_mut(&id) {
+            Some(tab) => {
+                tab.grab();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Handles background results of every video tab and the extraction job;
+    /// returns documents opened from grabbed frames.
+    pub fn pump_videos(&mut self, ctx: &egui::Context) -> Vec<DocId> {
+        let mut grabbed = Vec::new();
+        for tab in self.videos.values_mut() {
+            if let Some(frame) = tab.poll(ctx) {
+                grabbed.push(frame);
+            }
+        }
+        let mut opened = Vec::new();
+        for frame in grabbed {
+            if let Some(id) = self.open_image_document(frame.name, frame.image) {
+                opened.push(id);
+            }
+        }
+        if let Some(dialog) = &mut self.extract_dialog {
+            match dialog.take_result() {
+                Some(Ok(frames)) => {
+                    let added = frames.len();
+                    self.state.frame_set.extend(frames);
+                    self.extract_dialog = None;
+                    self.status_message = Some(format!(
+                        "Added {added} frame{} to the Frame Set",
+                        if added == 1 { "" } else { "s" }
+                    ));
+                    self.show_panel(Panel::FrameSet);
+                }
+                Some(Err(message)) => dialog.error = Some(message),
+                None => {}
+            }
+        }
+        opened
+    }
+
+    /// Opens `image` as a new document in a focused tab.
+    fn open_image_document(&mut self, name: String, image: image::RgbaImage) -> Option<DocId> {
+        match self.state.new_document_from_image(name, image) {
+            Ok(id) => {
+                self.add_document_tab(id);
+                Some(id)
+            }
+            Err(err) => {
+                self.error = Some(err.to_string());
+                None
+            }
+        }
+    }
+
+    /// Extract Frames…: opens the dialog for a video.
+    pub fn open_extract_dialog(&mut self, id: VideoId) -> bool {
+        if self.extract_dialog.is_some() {
+            return false;
+        }
+        let Some(tab) = self.videos.get(&id) else {
+            return false;
+        };
+        self.extract_dialog = Some(ExtractDialog::new(id, tab.info().clone()));
+        true
+    }
+
+    pub fn extract_dialog(&self) -> Option<&ExtractDialog> {
+        self.extract_dialog.as_ref()
+    }
+
+    pub fn extract_dialog_mut(&mut self) -> Option<&mut ExtractDialog> {
+        self.extract_dialog.as_mut()
+    }
+
+    /// Starts the extraction with the dialog's settings.
+    pub fn start_extract(&mut self) -> bool {
+        let notify: video::player::Notify = match &self.repaint {
+            Some(ctx) => {
+                let ctx = ctx.clone();
+                std::sync::Arc::new(move || ctx.request_repaint())
+            }
+            None => std::sync::Arc::new(|| {}),
+        };
+        match &mut self.extract_dialog {
+            Some(dialog) if !dialog.running() => {
+                dialog.start(notify);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Cancel in the Extract Frames dialog: stops any job and closes it.
+    pub fn cancel_extract(&mut self) {
+        if let Some(mut dialog) = self.extract_dialog.take() {
+            dialog.cancel_job();
+        }
+    }
+
+    fn show_extract_dialog_window(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = &mut self.extract_dialog else {
+            return;
+        };
+        match dialog.show(ctx) {
+            ExtractOutcome::Open => {}
+            ExtractOutcome::Start => {
+                self.start_extract();
+            }
+            ExtractOutcome::Cancel => self.cancel_extract(),
+        }
+    }
+
+    pub fn frame_set_view(&self) -> &FrameSetView {
+        &self.frame_set_view
+    }
+
+    pub fn frame_set_view_mut(&mut self) -> &mut FrameSetView {
+        &mut self.frame_set_view
+    }
+
+    /// Runs a Frame Set panel action; `Open` returns the new document.
+    pub fn frame_set_action(&mut self, action: FrameSetAction) -> Option<DocId> {
+        match action {
+            FrameSetAction::Open(id) => {
+                let entry = self.state.frame_set.get(id)?;
+                let (name, image) = (entry.document_name(), entry.image());
+                self.open_image_document(name, image)
+            }
+            FrameSetAction::Remove(ids) => {
+                self.state.frame_set.remove(&ids);
+                None
+            }
+            FrameSetAction::Clear => {
+                self.state.frame_set.clear();
+                None
+            }
+        }
+    }
+
+    fn show_panel(&mut self, panel: Panel) {
+        self.set_panel_open(panel, true);
+        if let Some(path) = self.dock.find_tab(&Tab::Panel(panel)) {
+            let _ = self.dock.set_active_tab(path);
         }
     }
 
@@ -1168,7 +1414,12 @@ impl EditorApp {
     }
 
     /// Opens an image file in a new focused tab, or shows an error.
+    /// Videos open in a video tab instead (and return `None`).
     pub fn open_path(&mut self, path: &Path) -> Option<DocId> {
+        if video::is_video_path(path) {
+            self.open_video(path);
+            return None;
+        }
         match self.state.open(path) {
             Ok(id) => {
                 self.add_document_tab(id);
@@ -1204,6 +1455,10 @@ impl EditorApp {
     /// File → Close: closes the current document, asking first if it has
     /// unsaved changes.
     pub fn close_current(&mut self) {
+        if let Some(video) = self.focused_video {
+            self.close_video(video);
+            return;
+        }
         if let Some(id) = self.state.current_id() {
             self.request_close(id);
         }
@@ -1240,7 +1495,7 @@ impl EditorApp {
             .iter_all_tabs()
             .filter_map(|(_, tab)| match tab {
                 Tab::Document(id) => Some(*id),
-                Tab::Panel(_) => None,
+                _ => None,
             })
             .collect()
     }
@@ -1256,6 +1511,10 @@ impl EditorApp {
             });
             self.configured_context = true;
         }
+        if self.repaint.is_none() {
+            self.repaint = Some(ui.ctx().clone());
+        }
+        self.pump_videos(ui.ctx());
         let checker = self
             .checker
             .get_or_insert_with(|| canvas::checker_texture(ui.ctx()))
@@ -1315,6 +1574,9 @@ impl EditorApp {
         let mut layer_actions = Vec::new();
         let mut tool_click = None;
         let mut requests = Vec::new();
+        let mut closed_videos = Vec::new();
+        let mut video_actions = Vec::new();
+        let mut frame_set_actions = Vec::new();
         egui::CentralPanel::default()
             .frame(egui::Frame::central_panel(ui.style()).inner_margin(0.0))
             .show(ui, |ui| {
@@ -1333,6 +1595,11 @@ impl EditorApp {
                     tool_click: &mut tool_click,
                     colors: &mut self.colors,
                     requests: &mut requests,
+                    videos: &mut self.videos,
+                    closed_videos: &mut closed_videos,
+                    video_actions: &mut video_actions,
+                    frame_set_view: &mut self.frame_set_view,
+                    frame_set_actions: &mut frame_set_actions,
                 };
                 DockArea::new(&mut self.dock)
                     .show_leaf_close_all_buttons(false)
@@ -1342,9 +1609,30 @@ impl EditorApp {
         for id in closed {
             self.forget_document(id);
         }
-        if let Some((_, Tab::Document(id))) = self.dock.find_active_focused() {
-            let id = *id;
-            self.state.set_current(id);
+        for id in closed_videos {
+            self.forget_video(id);
+        }
+        match self.dock.find_active_focused() {
+            Some((_, Tab::Document(id))) => {
+                let id = *id;
+                self.state.set_current(id);
+                self.focused_video = None;
+            }
+            Some((_, Tab::Video(id))) => self.focused_video = Some(*id),
+            _ => {}
+        }
+        for (id, action) in video_actions {
+            match action {
+                VideoAction::Grab => {
+                    self.grab_frame(id);
+                }
+                VideoAction::Extract => {
+                    self.open_extract_dialog(id);
+                }
+            }
+        }
+        for action in frame_set_actions {
+            self.frame_set_action(action);
         }
         if self.state.current_id() != self.last_current {
             // Switching documents abandons an open polygon, drag, or stroke.
@@ -1371,6 +1659,7 @@ impl EditorApp {
         self.show_fill_dialog_window(ui.ctx());
         self.show_radius_dialog_window(ui.ctx());
         self.show_filter_dialog_window(ui.ctx());
+        self.show_extract_dialog_window(ui.ctx());
         self.show_prompt_window(ui.ctx());
         self.show_error_window(ui.ctx());
 
@@ -1459,6 +1748,19 @@ impl EditorApp {
                 .filter(|(shortcut, _)| input.consume_shortcut(shortcut))
                 .map(|(_, action)| action)
                 .collect();
+            if !typing && self.focused_video.is_some() && !input.modifiers.command {
+                for (key, command) in [
+                    (Key::Space, Transport::PlayPause),
+                    (Key::ArrowLeft, Transport::Step(-1)),
+                    (Key::ArrowRight, Transport::Step(1)),
+                    (Key::Home, Transport::Start),
+                    (Key::End, Transport::End),
+                ] {
+                    if input.consume_key(Modifiers::NONE, key) {
+                        actions.push(Action::Video(command));
+                    }
+                }
+            }
             if !typing && self.transform_active() {
                 if input.consume_key(Modifiers::NONE, Key::Enter) {
                     actions.push(Action::CommitTransform);
@@ -1842,6 +2144,11 @@ impl EditorApp {
             Action::Filter(id) => {
                 self.open_filter(id);
             }
+            Action::Video(command) => {
+                if let Some(tab) = self.focused_video.and_then(|id| self.videos.get_mut(&id)) {
+                    tab.transport(command);
+                }
+            }
             Action::Undo => {
                 self.undo_current();
             }
@@ -2003,11 +2310,20 @@ impl EditorApp {
         if let Some(open) = self.state.document(id) {
             self.canvases.insert(id, CanvasState::new(&open.document));
         }
-        let tab = Tab::Document(id);
+        self.add_center_tab(Tab::Document(id));
+    }
+
+    /// Adds a document or video tab next to the existing ones (or into the
+    /// empty center area) and focuses it.
+    fn add_center_tab(&mut self, tab: Tab) {
         let leaf = self
             .dock
             .iter_leaves()
-            .find(|(_, leaf)| leaf.tabs().iter().any(|t| matches!(t, Tab::Document(_))))
+            .find(|(_, leaf)| {
+                leaf.tabs()
+                    .iter()
+                    .any(|t| matches!(t, Tab::Document(_) | Tab::Video(_)))
+            })
             .or_else(|| {
                 self.dock
                     .iter_leaves()
@@ -2073,7 +2389,11 @@ pub fn default_layout() -> DockState<Tab> {
     let [documents, _tools] =
         tree.split_left(NodeIndex::root(), 0.16, vec![Tab::Panel(Panel::Tools)]);
     let [_documents, layers] = tree.split_right(documents, 0.78, vec![Tab::Panel(Panel::Layers)]);
-    tree.split_below(layers, 0.5, vec![Tab::Panel(Panel::AssetLibrary)]);
+    tree.split_below(
+        layers,
+        0.5,
+        vec![Tab::Panel(Panel::AssetLibrary), Tab::Panel(Panel::FrameSet)],
+    );
     dock
 }
 
@@ -2097,6 +2417,11 @@ struct Viewer<'a> {
     /// Finished selection gestures this frame.
     requests: &'a mut Vec<(DocId, CanvasEvent)>,
     colors: &'a mut Colors,
+    videos: &'a mut HashMap<VideoId, VideoTab>,
+    closed_videos: &'a mut Vec<VideoId>,
+    video_actions: &'a mut Vec<(VideoId, VideoAction)>,
+    frame_set_view: &'a mut FrameSetView,
+    frame_set_actions: &'a mut Vec<FrameSetAction>,
 }
 
 impl TabViewer for Viewer<'_> {
@@ -2121,6 +2446,12 @@ impl TabViewer for Viewer<'_> {
                 })
                 .unwrap_or_default()
                 .into(),
+            Tab::Video(id) => self
+                .videos
+                .get(id)
+                .map(|v| v.info().name.clone())
+                .unwrap_or_default()
+                .into(),
         }
     }
 
@@ -2134,7 +2465,18 @@ impl TabViewer for Viewer<'_> {
             Tab::Panel(Panel::AssetLibrary) => {
                 ui.weak("The asset library arrives in a later version.");
             }
+            Tab::Panel(Panel::FrameSet) => {
+                let actions = frame_set_panel(ui, &self.state.frame_set, self.frame_set_view);
+                self.frame_set_actions.extend(actions);
+            }
             Tab::Document(id) => self.document_view(ui, id),
+            Tab::Video(id) => {
+                if let Some(video) = self.videos.get_mut(&id) {
+                    let actions = video.show(ui);
+                    self.video_actions
+                        .extend(actions.into_iter().map(|a| (id, a)));
+                }
+            }
         }
     }
 
@@ -2146,13 +2488,16 @@ impl TabViewer for Viewer<'_> {
             }
             self.closed.push(*id);
         }
+        if let Tab::Video(id) = tab {
+            self.closed_videos.push(*id);
+        }
         OnCloseResponse::Close
     }
 
     fn scroll_bars(&self, tab: &Tab) -> [bool; 2] {
         // The canvas handles its own scrolling.
         match tab {
-            Tab::Document(_) => [false, false],
+            Tab::Document(_) | Tab::Video(_) => [false, false],
             Tab::Panel(_) => [true, true],
         }
     }
@@ -2374,9 +2719,11 @@ fn open_file_dialog() -> Option<PathBuf> {
         .flat_map(|f| f.extensions().iter().copied())
         .collect();
     all.push(project::EXTENSION);
+    all.extend(video::EXTENSIONS);
     let mut dialog = rfd::FileDialog::new()
-        .add_filter("Images and projects", &all)
-        .add_filter("Game Asset Creator project", &[project::EXTENSION]);
+        .add_filter("Images, videos, and projects", &all)
+        .add_filter("Game Asset Creator project", &[project::EXTENSION])
+        .add_filter("Videos", &video::EXTENSIONS);
     for format in FileFormat::ALL {
         dialog = dialog.add_filter(format.label(), format.extensions());
     }

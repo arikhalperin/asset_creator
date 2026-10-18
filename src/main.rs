@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use game_asset_creator::{EditorApp, APP_TITLE};
 
 fn main() -> eframe::Result {
-    // Any paths on the command line are opened as documents at startup.
+    // Any paths on the command line are opened (as documents or videos) at startup.
     let paths: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -26,8 +26,9 @@ fn main() -> eframe::Result {
     eframe::run_native(
         APP_TITLE,
         options,
-        Box::new(move |_cc| {
+        Box::new(move |cc| {
             let mut app = EditorApp::new();
+            app.set_repaint_context(&cc.egui_ctx);
             for path in &paths {
                 app.open_path(path);
             }
