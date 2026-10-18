@@ -3,6 +3,8 @@
 pub mod app_state;
 pub mod canvas;
 pub mod document;
+pub mod filter_dialog;
+pub mod filters;
 pub mod io;
 pub mod layers;
 pub mod layers_panel;

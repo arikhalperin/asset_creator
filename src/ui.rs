@@ -11,6 +11,8 @@ use crate::app_state::{AppState, DocId, EditTarget};
 use crate::canvas::{self, CanvasState, ViewAction};
 use crate::canvas::{CanvasEvent, TransformBox};
 use crate::document::DEFAULT_DPI;
+use crate::filter_dialog::{self, DialogOutcome, FilterDialog};
+use crate::filters::{self, ParamValue, Params};
 use crate::io::FileFormat;
 use crate::layers::{self, LayerProps};
 use crate::layers_panel::{layers_panel, LayerAction, LayerOp};
@@ -206,6 +208,7 @@ enum Action {
     CommitTransform,
     CancelTransform,
     Nudge(i32, i32),
+    Filter(&'static str),
 }
 
 /// A pending "save changes?" question.
@@ -259,6 +262,8 @@ pub struct EditorApp {
     quit_now: bool,
     /// Document with a Free Transform session (as opposed to a Move drag).
     free_transform: Option<DocId>,
+    /// The open filter dialog and the document it previews on.
+    filter_dialog: Option<(DocId, FilterDialog)>,
 }
 
 impl Default for EditorApp {
@@ -293,6 +298,108 @@ impl EditorApp {
             prompt: None,
             quit_now: false,
             free_transform: None,
+            filter_dialog: None,
+        }
+    }
+
+    /// Filter → <filter>: opens its preview dialog, or applies it immediately
+    /// when it has no parameters. Returns whether anything happened.
+    pub fn open_filter(&mut self, filter_id: &str) -> bool {
+        let (Some(filter), Some(id)) = (filters::find(filter_id), self.state.current_id()) else {
+            return false;
+        };
+        if self.transform_active() || self.filter_dialog.is_some() {
+            return false;
+        }
+        if filter.params().is_empty() {
+            return match self.state.apply_filter(id, filter, &Params::default()) {
+                Ok(changed) => changed,
+                Err(err) => {
+                    self.error = Some(format!("{}: {err}", filter.name()));
+                    false
+                }
+            };
+        }
+        if let Err(err) = self.state.begin_filter(id) {
+            self.error = Some(format!("{}: {err}", filter.name()));
+            return false;
+        }
+        self.filter_dialog = Some((id, FilterDialog::new(filter)));
+        self.refresh_filter_preview();
+        true
+    }
+
+    /// The open filter dialog, if any.
+    pub fn filter_dialog(&self) -> Option<&FilterDialog> {
+        self.filter_dialog.as_ref().map(|(_, d)| d)
+    }
+
+    /// Sets a parameter of the open filter dialog and refreshes the preview.
+    pub fn set_filter_param(&mut self, key: &'static str, value: ParamValue) {
+        if let Some((_, dialog)) = &mut self.filter_dialog {
+            dialog.params.set(key, value);
+            let schema = dialog.filter().params();
+            dialog.params.clamp(&schema);
+        }
+        self.refresh_filter_preview();
+    }
+
+    /// Turns the dialog's Preview checkbox on or off.
+    pub fn set_filter_preview(&mut self, on: bool) {
+        if let Some((_, dialog)) = &mut self.filter_dialog {
+            dialog.preview = on;
+        }
+        self.refresh_filter_preview();
+    }
+
+    /// The dialog's Reset button.
+    pub fn reset_filter(&mut self) {
+        if let Some((_, dialog)) = &mut self.filter_dialog {
+            dialog.reset();
+        }
+        self.refresh_filter_preview();
+    }
+
+    /// The dialog's OK button. Returns whether an undo step was added.
+    pub fn filter_ok(&mut self) -> bool {
+        let Some((id, dialog)) = self.filter_dialog.take() else {
+            return false;
+        };
+        self.state
+            .commit_filter(id, dialog.filter(), &dialog.params)
+    }
+
+    /// The dialog's Cancel button.
+    pub fn filter_cancel(&mut self) {
+        if let Some((id, _)) = self.filter_dialog.take() {
+            self.state.cancel_filter(id);
+        }
+    }
+
+    fn refresh_filter_preview(&mut self) {
+        if let Some((id, dialog)) = &self.filter_dialog {
+            self.state
+                .preview_filter(*id, dialog.filter(), &dialog.params, dialog.preview);
+        }
+    }
+
+    fn show_filter_dialog_window(&mut self, ctx: &egui::Context) {
+        // The preview may have been cancelled elsewhere (undo, document switch).
+        if let Some((id, _)) = &self.filter_dialog {
+            if !self.state.document(*id).is_some_and(|o| o.is_filtering()) {
+                self.filter_dialog = None;
+            }
+        }
+        let Some((_, dialog)) = &mut self.filter_dialog else {
+            return;
+        };
+        match filter_dialog::show(ctx, dialog) {
+            DialogOutcome::Open { changed: true } => self.refresh_filter_preview(),
+            DialogOutcome::Open { changed: false } => {}
+            DialogOutcome::Ok => {
+                self.filter_ok();
+            }
+            DialogOutcome::Cancel => self.filter_cancel(),
         }
     }
 
@@ -1263,6 +1370,7 @@ impl EditorApp {
         self.show_new_dialog_window(ui.ctx());
         self.show_fill_dialog_window(ui.ctx());
         self.show_radius_dialog_window(ui.ctx());
+        self.show_filter_dialog_window(ui.ctx());
         self.show_prompt_window(ui.ctx());
         self.show_error_window(ui.ctx());
 
@@ -1478,63 +1586,6 @@ impl EditorApp {
                 actions.push(Action::Flip { horizontal: false });
             }
         });
-        if let Some(open) = self.state.current_document() {
-            ui.menu_button("Layer", |ui| {
-                let shortcut_of = |op: LayerOp| match op {
-                    LayerOp::New => Some(SHORTCUT_NEW_LAYER),
-                    LayerOp::Duplicate => Some(SHORTCUT_DUPLICATE_LAYER),
-                    LayerOp::MoveUp => Some(SHORTCUT_LAYER_UP),
-                    LayerOp::MoveDown => Some(SHORTCUT_LAYER_DOWN),
-                    LayerOp::MergeDown => Some(SHORTCUT_MERGE_DOWN),
-                    _ => None,
-                };
-                let groups: [&[LayerOp]; 3] = [
-                    &[
-                        LayerOp::New,
-                        LayerOp::Duplicate,
-                        LayerOp::Delete,
-                        LayerOp::MoveUp,
-                        LayerOp::MoveDown,
-                        LayerOp::MergeDown,
-                        LayerOp::Flatten,
-                    ],
-                    &[
-                        LayerOp::AddMask,
-                        LayerOp::AddMaskFromSelection,
-                        LayerOp::DeleteMask,
-                        LayerOp::ApplyMask,
-                        LayerOp::ToggleMask,
-                    ],
-                    &[LayerOp::EditPixels, LayerOp::EditMask],
-                ];
-                for (i, group) in groups.iter().enumerate() {
-                    if i > 0 {
-                        ui.separator();
-                    }
-                    for &op in *group {
-                        let label = if op == LayerOp::ToggleMask
-                            && open
-                                .document
-                                .layer(open.active_layer())
-                                .is_some_and(|l| !l.mask_enabled)
-                        {
-                            "Enable Mask"
-                        } else {
-                            op.label()
-                        };
-                        let mut button = egui::Button::new(label);
-                        if let Some(shortcut) = shortcut_of(op) {
-                            button = button.shortcut_text(ui.ctx().format_shortcut(&shortcut));
-                        }
-                        if ui.add_enabled(op.enabled(open), button).clicked() {
-                            actions.push(Action::Layer(op));
-                        }
-                    }
-                }
-            });
-        } else {
-            ui.add_enabled(false, egui::Button::new("Layer"));
-        }
         let has_selection = self
             .state
             .current_document()
@@ -1596,6 +1647,90 @@ impl EditorApp {
                 has_selection,
                 Action::Radius(RadiusOp::Feather),
             );
+        });
+        if let Some(open) = self.state.current_document() {
+            ui.menu_button("Layer", |ui| {
+                let shortcut_of = |op: LayerOp| match op {
+                    LayerOp::New => Some(SHORTCUT_NEW_LAYER),
+                    LayerOp::Duplicate => Some(SHORTCUT_DUPLICATE_LAYER),
+                    LayerOp::MoveUp => Some(SHORTCUT_LAYER_UP),
+                    LayerOp::MoveDown => Some(SHORTCUT_LAYER_DOWN),
+                    LayerOp::MergeDown => Some(SHORTCUT_MERGE_DOWN),
+                    _ => None,
+                };
+                let groups: [&[LayerOp]; 3] = [
+                    &[
+                        LayerOp::New,
+                        LayerOp::Duplicate,
+                        LayerOp::Delete,
+                        LayerOp::MoveUp,
+                        LayerOp::MoveDown,
+                        LayerOp::MergeDown,
+                        LayerOp::Flatten,
+                    ],
+                    &[
+                        LayerOp::AddMask,
+                        LayerOp::AddMaskFromSelection,
+                        LayerOp::DeleteMask,
+                        LayerOp::ApplyMask,
+                        LayerOp::ToggleMask,
+                    ],
+                    &[LayerOp::EditPixels, LayerOp::EditMask],
+                ];
+                for (i, group) in groups.iter().enumerate() {
+                    if i > 0 {
+                        ui.separator();
+                    }
+                    for &op in *group {
+                        let label = if op == LayerOp::ToggleMask
+                            && open
+                                .document
+                                .layer(open.active_layer())
+                                .is_some_and(|l| !l.mask_enabled)
+                        {
+                            "Enable Mask"
+                        } else {
+                            op.label()
+                        };
+                        let mut button = egui::Button::new(label);
+                        if let Some(shortcut) = shortcut_of(op) {
+                            button = button.shortcut_text(ui.ctx().format_shortcut(&shortcut));
+                        }
+                        if ui.add_enabled(op.enabled(open), button).clicked() {
+                            actions.push(Action::Layer(op));
+                        }
+                    }
+                }
+            });
+        } else {
+            ui.add_enabled(false, egui::Button::new("Layer"));
+        }
+        let filter_enabled = self.state.current_document().is_some()
+            && !self.transform_active()
+            && self.filter_dialog.is_none();
+        ui.menu_button("Filter", |ui| {
+            for (i, category) in filters::Category::ALL.iter().enumerate() {
+                if i > 0 {
+                    ui.separator();
+                }
+                ui.weak(category.label());
+                for filter in filters::registry()
+                    .iter()
+                    .filter(|f| f.category() == *category)
+                {
+                    let label = if filter.params().is_empty() {
+                        filter.name().to_owned()
+                    } else {
+                        format!("{}…", filter.name())
+                    };
+                    if ui
+                        .add_enabled(filter_enabled, egui::Button::new(label))
+                        .clicked()
+                    {
+                        actions.push(Action::Filter(filter.id()));
+                    }
+                }
+            }
         });
         ui.menu_button("View", |ui| {
             let mut item = |ui: &mut egui::Ui, label: &str, shortcut, action| {
@@ -1703,6 +1838,9 @@ impl EditorApp {
             Action::CancelTransform => self.cancel_free_transform(),
             Action::Nudge(dx, dy) => {
                 self.nudge(dx, dy);
+            }
+            Action::Filter(id) => {
+                self.open_filter(id);
             }
             Action::Undo => {
                 self.undo_current();

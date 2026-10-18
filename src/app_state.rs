@@ -8,12 +8,16 @@
 use std::path::Path;
 
 use crate::document::{Document, DocumentError, PixelRect};
+use crate::filters::{self, Filter, Params};
 use crate::io::{self, IoError};
 use crate::layers::{self, LayerProps};
+use crate::paint::PixelPatch;
 use crate::paint::{ActiveStroke, BrushSettings, StrokeKind};
 use crate::project::{self, ProjectError};
 use crate::transform::{self, Affine, Interpolation, TransformSession};
-use crate::undo::{Change, Command, CommandError, PaintTarget, UndoStack};
+use crate::undo::{
+    target_image, write_target_region, Change, Command, CommandError, PaintTarget, UndoStack,
+};
 
 /// Stable identifier of an open document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -38,6 +42,7 @@ pub struct OpenDocument {
     pub selection_revision: u64,
     stroke: Option<ActiveStroke>,
     transform: Option<TransformSession>,
+    filter: Option<FilterSession>,
     last_stroke_end: Option<(f32, f32)>,
 }
 
@@ -55,6 +60,7 @@ impl OpenDocument {
             selection_revision: 0,
             stroke: None,
             transform: None,
+            filter: None,
             last_stroke_end: None,
         }
     }
@@ -83,6 +89,7 @@ impl OpenDocument {
         self.undo.state_id() != self.saved_state
             || self.stroke.is_some()
             || self.transform.is_some()
+            || self.filter.is_some()
     }
 
     /// Whether a paint stroke is in progress.
@@ -118,6 +125,26 @@ impl OpenDocument {
             self.repainted(rect);
             self.selection_revision += 1;
         }
+        if let Some(session) = self.filter.take() {
+            write_target_region(
+                &mut self.document,
+                session.target,
+                session.rect,
+                &session.before,
+            );
+            self.repainted(Some(session.rect));
+        }
+    }
+
+    /// Whether a stroke, transform, or filter preview is showing unrecorded
+    /// changes (Save and Export wait for it to finish).
+    pub fn has_live_edit(&self) -> bool {
+        self.stroke.is_some() || self.transform.is_some() || self.filter.is_some()
+    }
+
+    /// Whether a filter preview is in progress.
+    pub fn is_filtering(&self) -> bool {
+        self.filter.is_some()
     }
 
     /// The transform session in progress, if any.
@@ -148,6 +175,15 @@ impl OpenDocument {
         }
         self.target_layer = active;
     }
+}
+
+/// A filter dialog in progress: the target as it was, for previews and cancel.
+#[derive(Debug)]
+struct FilterSession {
+    target: PaintTarget,
+    snapshot: image::RgbaImage,
+    rect: PixelRect,
+    before: image::RgbaImage,
 }
 
 /// Why a file could not be opened.
@@ -247,7 +283,7 @@ impl AppState {
         let open = self
             .document(id)
             .ok_or_else(|| ProjectError::Manifest("no such document".to_owned()))?;
-        if open.stroke.is_some() || open.transform.is_some() {
+        if open.has_live_edit() {
             return Err(ProjectError::Manifest(
                 "finish the current edit before saving".to_owned(),
             ));
@@ -304,6 +340,103 @@ impl AppState {
             id,
             Box::new(layers::SetLayerProps::new(index, before, after)),
         )
+    }
+
+    /// Starts a filter preview on the active layer's pixels or mask.
+    pub fn begin_filter(&mut self, id: DocId) -> Result<(), CommandError> {
+        let open = self
+            .document_mut(id)
+            .ok_or_else(|| CommandError::Invalid("no such document".to_owned()))?;
+        open.cancel_stroke();
+        let target = open.paint_target();
+        let snapshot = target_image(&open.document, target)?;
+        let rect = open.document.editable_bounds();
+        let before = image::imageops::crop_imm(&snapshot, rect.x, rect.y, rect.width, rect.height)
+            .to_image();
+        open.filter = Some(FilterSession {
+            target,
+            snapshot,
+            rect,
+            before,
+        });
+        Ok(())
+    }
+
+    /// Shows `filter` with `params` on the canvas (or the original when `show` is false).
+    pub fn preview_filter(&mut self, id: DocId, filter: &dyn Filter, params: &Params, show: bool) {
+        let Some(open) = self.document_mut(id) else {
+            return;
+        };
+        let Some(session) = &open.filter else {
+            return;
+        };
+        let pixels = if show {
+            filters::render_filter(
+                &session.snapshot,
+                open.document.selection(),
+                session.rect,
+                filter,
+                params,
+            )
+        } else {
+            session.before.clone()
+        };
+        let (target, rect) = (session.target, session.rect);
+        write_target_region(&mut open.document, target, rect, &pixels);
+        open.repainted(Some(rect));
+    }
+
+    /// Applies `filter` as one undo step and ends the preview. Returns whether a step was added.
+    pub fn commit_filter(&mut self, id: DocId, filter: &dyn Filter, params: &Params) -> bool {
+        let Some(open) = self.document_mut(id) else {
+            return false;
+        };
+        let Some(session) = open.filter.take() else {
+            return false;
+        };
+        let after = filters::render_filter(
+            &session.snapshot,
+            open.document.selection(),
+            session.rect,
+            filter,
+            params,
+        );
+        // Show the final result even if the preview was off, then record it.
+        write_target_region(&mut open.document, session.target, session.rect, &after);
+        open.repainted(Some(session.rect));
+        if after == session.before {
+            return false;
+        }
+        let patch = PixelPatch::on_target(
+            filter.name(),
+            session.target,
+            session.rect,
+            session.before,
+            after,
+        );
+        match open.undo.execute(&mut open.document, Box::new(patch)) {
+            Ok(change) => {
+                open.changed(change);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Ends the filter preview, restoring the target.
+    pub fn cancel_filter(&mut self, id: DocId) {
+        self.cancel_stroke(id);
+    }
+
+    /// Applies a filter immediately (filters without parameters).
+    pub fn apply_filter(
+        &mut self,
+        id: DocId,
+        filter: &dyn Filter,
+        params: &Params,
+    ) -> Result<bool, CommandError> {
+        self.begin_filter(id)?;
+        Ok(self.commit_filter(id, filter, params))
     }
 
     /// Starts a transform session on the active layer (Free Transform or Move).
@@ -388,6 +521,9 @@ impl AppState {
     /// Exports the current document. Returns `Ok(false)` when there is none.
     pub fn export_current(&self, path: &Path) -> Result<bool, IoError> {
         match self.current_document() {
+            Some(open) if open.has_live_edit() => Err(IoError::Encode(
+                "finish the current edit before exporting".to_owned(),
+            )),
             Some(open) => io::export_document(&open.document, path).map(|()| true),
             None => Ok(false),
         }
@@ -1098,5 +1234,67 @@ mod tests {
         // Undo of the duplicate changes the active layer too.
         state.undo(a);
         assert_eq!(state.document(a).unwrap().edit_target(), EditTarget::Pixels);
+    }
+
+    #[test]
+    fn filter_preview_commit_and_cancel() {
+        let mut state = AppState::new();
+        let a = state.new_document(8, 4, 72.0).unwrap();
+        state
+            .execute(a, Box::new(FillLayer::new(0, [10, 20, 30, 255])))
+            .unwrap();
+        let before = state.document(a).unwrap().document.clone();
+        let invert = filters::find("invert").unwrap();
+        let params = Params::default();
+
+        state.begin_filter(a).unwrap();
+        state.preview_filter(a, invert, &params, true);
+        assert_eq!(
+            state
+                .document(a)
+                .unwrap()
+                .document
+                .layer(0)
+                .unwrap()
+                .pixels
+                .get_pixel(0, 0)
+                .0,
+            [245, 235, 225, 255]
+        );
+        assert!(state.document(a).unwrap().is_dirty());
+        state.preview_filter(a, invert, &params, false);
+        assert_eq!(
+            state.document(a).unwrap().document,
+            before,
+            "preview off shows the original"
+        );
+        state.cancel_filter(a);
+        assert_eq!(state.document(a).unwrap().document, before);
+        assert!(!state.document(a).unwrap().is_filtering());
+
+        // OK applies even with the preview off; one labelled step.
+        state.begin_filter(a).unwrap();
+        state.preview_filter(a, invert, &params, false);
+        assert!(state.commit_filter(a, invert, &params));
+        let open = state.document(a).unwrap();
+        assert_eq!(open.undo_stack().undo_label(), Some("Invert"));
+        assert_eq!(
+            open.document.layer(0).unwrap().pixels.get_pixel(3, 3).0,
+            [245, 235, 225, 255]
+        );
+        state.undo(a);
+        assert_eq!(state.document(a).unwrap().document, before);
+
+        // Undo/redo during a preview cancels it.
+        state.begin_filter(a).unwrap();
+        state.preview_filter(a, invert, &params, true);
+        state.redo(a);
+        assert!(!state.document(a).unwrap().is_filtering());
+        assert!(state.apply_filter(a, invert, &params).unwrap());
+        assert_eq!(
+            state.document(a).unwrap().document,
+            before,
+            "inverted twice"
+        );
     }
 }

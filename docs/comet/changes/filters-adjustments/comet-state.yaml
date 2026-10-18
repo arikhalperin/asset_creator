@@ -1,0 +1,510 @@
+schema: comet.native.v4
+name: filters-adjustments
+language: en
+phase: archive
+status: active
+state_version: 11
+brief: brief.md
+document_constraints_version: 1
+shape_confirmation_hash: c85ba0d1187213a631086ecebf24cc2476cdeff473405e200b1c857e96d501b4
+spec_changes:
+  - capability: editor-shell
+    operation: modify
+    source: specs/editor-shell/spec.md
+  - capability: filters
+    operation: create
+    source: specs/filters/spec.md
+  - capability: undo
+    operation: modify
+    source: specs/undo/spec.md
+workspace:
+  isolation: branch
+  change_branch: comet/filters-adjustments
+  target_branch: master
+  finish: null
+loop:
+  stage: archive-ready
+  goal_cycle: 1
+  iteration: 2
+  attempt: 1
+  retry_epoch: 0
+  failed_iteration_count: 0
+  no_progress_count: 0
+  execution_failure_count: 0
+  previous_unresolved_ids: []
+  next_action: archive
+acceptance:
+  - id: A1
+    source: brief.md
+    text: "A1: Every filter is defined through the plugin API (id, name, category,
+      parameter schema, apply) in its own file and registered in one registry;
+      the Filter menu and dialogs are generated from the registry and schemas,
+      so adding a filter needs only its file and a registry line."
+    result: passed
+    reason:
+      text: src/filters/mod.rs defines the Filter trait (id, name, category, params
+        schema, margin, pure apply) and one static 14-entry registry(); each
+        filter has its own file under src/filters/; the Filter menu (ui.rs) and
+        the dialog (filter_dialog.rs) iterate registry()/params() only;
+        registry_ids_are_unique_and_schemas_valid passes.
+      truncated: false
+  - id: A2
+    source: brief.md
+    text: "A2: The Filter menu lists all 14 filters grouped Adjustments / Blur /
+      Sharpen / Noise; filters with parameters open a preview dialog,
+      Desaturate, Invert, and Sharpen apply immediately; items are disabled
+      without a document or during a transform."
+    result: passed
+    reason:
+      text: The Filter menu loops over Category::ALL with separators/headings in
+        registry order; parameterless filters (Desaturate, Invert, Sharpen) have
+        no '…' and go through apply_filter immediately; enabled only with a
+        current document, no transform, and no open dialog;
+        parameterless_filters_apply_immediately and
+        menu_disabled_without_document_or_during_transform... pass.
+      truncated: false
+  - id: A3
+    source: brief.md
+    text: "A3: A preview dialog shows the filter's parameters (sliders, checkboxes,
+      choices, seed, curve editor; grouped parameters follow their group
+      selector), a Preview checkbox (default on), Reset, OK, and Cancel; the
+      canvas shows the filtered result live after each change (the original when
+      Preview is off); OK records one undo step named after the filter; Cancel
+      restores the layer exactly."
+    result: passed
+    reason:
+      text: filter_dialog::show draws schema widgets
+        (slider/checkbox/choice/seed/curve editor), hides params outside the
+        selected group, plus Preview (default true), Reset (keeps the seed),
+        Cancel, OK; preview_filter writes the render or the 'before' snapshot;
+        commit_filter records one PixelPatch named filter.name(); cancel
+        restores. dialog_previews_live_ok_records_one_step,
+        cancel_restores_exactly, grouped_parameters_per_channel_levels, and
+        curve_editor_drag_brightens_midtones pass.
+      truncated: false
+  - id: A4
+    source: brief.md
+    text: "A4: Filters apply to the active layer, or its mask when the mask is the
+      edit target, through the selection: unselected pixels are unchanged and
+      partially selected ones interpolated; undo/redo restore exactly."
+    result: passed
+    reason:
+      text: "FilterSession targets open.paint_target() (pixels or mask) over
+        editable_bounds; render_filter blends via blend_by_mask with selection
+        coverage; PixelPatch stores before/after for exact undo/redo;
+        filters_respect_selection_and_mask_target,
+        render_filter_uses_context_and_selection, and
+        filter_preview_commit_and_cancel pass. Repair (2): write_target_region
+        and rgba_to_mask_value now use luminance_u8 (0.299/0.587/0.114, rounded,
+        so gray stays exact); paint strokes already convert colors with
+        paint::mask_gray (the same formula), so mask painting is unaffected;
+        filtering_a_mask_writes_luminance passes."
+      truncated: false
+  - id: A5
+    source: brief.md
+    text: "A5: Color adjustments follow the spec formulas: Brightness/Contrast,
+      Levels (RGB + per-channel), Curves (RGB + per-channel monotone cubic),
+      Hue/Saturation/Lightness, Color Balance (tone ranges, preserve
+      luminosity), Desaturate, Invert, Posterize — verified by unit tests on
+      known values (e.g. Invert twice is identity, Posterize 2 yields only
+      0/255, identity Levels/Curves change nothing)."
+    result: passed
+    reason:
+      text: Brightness/Contrast, Levels (channel then master LUT), Curves
+        (Fritsch-Carlson), HSL, Color Balance, Desaturate, Invert, and Posterize
+        match the spec formulas I spot-checked; unit tests
+        (invert_twice_is_identity, two_levels_are_black_and_white,
+        identity_and_known_values, identity_monotone_and_through_points,
+        tones_and_preserve_luminosity, etc.) pass.
+      truncated: false
+  - id: A6
+    source: brief.md
+    text: "A6: Gaussian Blur, Motion Blur, Sharpen, Unsharp Mask, Add Noise (seeded,
+      uniform/gaussian, monochromatic), and Median follow the spec, blur in
+      premultiplied alpha with edge clamping, and are deterministic — verified
+      by unit tests (e.g. blur of a flat image is unchanged, median removes
+      isolated specks, same seed gives same noise and a different seed different
+      noise)."
+    result: passed
+    reason:
+      text: "Premul + edge-clamped helpers; exact Gaussian below sigma 2, three-box
+        above; motion blur, sharpen, unsharp, seeded noise, median, each with
+        passing unit tests (flat blur unchanged, median removes specks and
+        matches brute force, same/different seed). Repair (3): render_filter
+        sets hidden _origin_x/_origin_y/_image_width after Params::clamp (clamp
+        only touches schema keys, and the dialog's own Params never holds hidden
+        keys); add_noise indexes (oy+y)*image_w+ox+x, which reduces to the old
+        y*w+x without hidden params, so goldens are unchanged;
+        noise_is_keyed_to_absolute_positions passes."
+      truncated: false
+  - id: A7
+    source: brief.md
+    text: "A7: Previews update in under 100 ms on a 1920×1080 layer in a release
+      build for every filter at default parameters and at the large settings in
+      the spec (blur radius 50, motion distance 100, unsharp radius 50, median
+      radius 10), measured by a release benchmark."
+    result: passed
+    reason:
+      text: "cargo test --release --test filters -- --ignored --nocapture:
+        bench_previews_1080p ok. Slowest: unsharp_mask large 37.52 ms, unsharp
+        default 34.16, median large 30.47, motion large 29.46, gaussian large
+        24.58; all under 100 ms."
+      truncated: false
+  - id: A8
+    source: brief.md
+    text: "A8: Every filter has a golden-image regression test comparing a fixed
+      synthetic input and fixed parameters byte-for-byte with a committed PNG in
+      `tests/golden/` (regenerated with `UPDATE_GOLDEN=1`)."
+    result: passed
+    reason:
+      text: tests/golden has 14 PNGs (one per filter id);
+        every_filter_matches_its_golden_image compares bytes against
+        render_filter output on a fixed synthetic 64x48 image (UPDATE_GOLDEN=1
+        rewrites them), and goldens_differ_from_the_input guards against filters
+        that do nothing; both pass.
+      truncated: false
+builder_handoff:
+  candidate_id: 6e34c95c-3179-4a95-a6a5-e290e2c026cf
+  identity_provider: skill-coordinated
+  builder_execution_ref: skill-coordinated:builder:6cb4b045-34d8-4f09-8ff2-46380298ae79
+  iteration: 2
+  summary:
+    text: "Repair iteration 2 (user-requested fixes on top of the verified
+      candidate): (1) Save and Export refuse while a stroke, transform, or
+      filter preview is live (OpenDocument::has_live_edit; AppState::save
+      returns an error, export_current returns IoError::Encode, the dialog stays
+      open). (2) Filter results written to a layer mask use luminance
+      0.299R+0.587G+0.114B (undo::luminance_u8 in write_target_region and
+      rgba_to_mask_value; gray input unchanged, so painting on masks is
+      unaffected). (3) Add Noise keys its counter to absolute image coordinates:
+      render_filter passes hidden params _origin_x/_origin_y/_image_width, so a
+      pixel gets identical noise whatever the selection; goldens unchanged
+      (origin 0 gives the old index). New tests:
+      noise_is_keyed_to_absolute_positions,
+      save_and_export_wait_for_the_filter_preview,
+      filtering_a_mask_writes_luminance. New src/filters/: plugin API in mod.rs
+      (Category, ParamKind Int/Float/Bool/Choice/Seed/Curve, ParamSpec with
+      optional choice-selected group, Params with defaults/clamp, Filter trait
+      id/name/category/params/margin/apply, registry() of 14 filters, find(),
+      render_filter() that crops editable bounds plus the filter margin from the
+      target snapshot, filters, and blends through the selection), shared
+      helpers (row-parallel map, LUTs, premultiplied f32 buffers, exact Gaussian
+      below sigma 2, three-box Gaussian above with all-horizontal passes +
+      transpose, sparse tap convolution, splitmix64). One file per filter:
+      brightness_contrast, levels (RGB+per channel groups), curves (RGB+per
+      channel, Fritsch-Carlson monotone cubic LUT), hue_saturation (HSL),
+      color_balance (tone groups, preserve luminosity), desaturate, invert,
+      posterize, gaussian_blur, motion_blur (bilinear line kernel as merged
+      integer taps), sharpen (3x3, alpha preserved), unsharp_mask, add_noise
+      (seeded counter-based, uniform/gaussian, mono), median (per-channel
+      sliding histogram, Huang). AppState filter session
+      (begin/preview/commit/cancel/apply_filter; cancelled by
+      undo/redo/execute/strokes/doc switch; counts as dirty; works on pixels or
+      mask target; OK applies even with Preview off; one PixelPatch step
+      labelled with the filter name). New src/filter_dialog.rs: schema-generated
+      dialog (sliders, checkbox, choice buttons, seed with New, grouped params,
+      draggable curve editor with add/remove/endpoints),
+      Preview/Reset/OK/Cancel. UI: Filter menu grouped by category (params ->
+      '…' dialog, parameterless apply immediately; disabled without document,
+      during transform, or with a dialog open); dialog closes if its preview is
+      cancelled elsewhere. Also reordered menus to File, Edit, Select, Layer,
+      Filter, View (fixes the C5 order mismatch). Goldens in tests/golden/*.png
+      (14) with UPDATE_GOLDEN=1 regeneration."
+    truncated: false
+  addressed_acceptance_ids:
+    - A1
+    - A2
+    - A3
+    - A4
+    - A5
+    - A6
+    - A7
+    - A8
+  checks:
+    - name:
+        text: cargo test
+        truncated: false
+      result: passed
+      note:
+        text: All suites pass incl. 3 new tests (147 unit, filters 3 + 1 ignored bench,
+          filters_ui 9).
+        truncated: false
+    - name:
+        text: release filter benchmark
+        truncated: false
+      result: passed
+      note:
+        text: "1920x1080 render_filter: adjustments ~7 ms, gaussian 26 ms (radius 50: 26
+          ms), motion 19/29 ms, sharpen 21 ms, unsharp 36/40 ms, noise 9 ms,
+          median 14/36 ms; all < 100 ms"
+        truncated: false
+    - name:
+        text: other release benchmarks
+        truncated: false
+      result: passed
+      note:
+        text: pan/zoom 0.11 ms; transform 2.13 ms
+        truncated: false
+    - name:
+        text: cargo clippy --all-targets -- -D warnings
+        truncated: false
+      result: passed
+      note: null
+    - name:
+        text: cargo fmt --check
+        truncated: false
+      result: passed
+      note: null
+    - name:
+        text: manual launch
+        truncated: false
+      result: passed
+      note:
+        text: Release app starts; menu bar shows File, Edit, Select, Layer, Filter,
+          View. Filter dialogs were exercised headlessly, not opened by hand.
+        truncated: false
+  checks_truncated: false
+  known_limits:
+    - text: The benchmark measures the filter render path (render_filter on a full
+        1080p layer); the following canvas tile upload is not included.
+      truncated: false
+    - text: Golden images are byte-exact on this platform (f32 math, deterministic
+        per-pixel order); a different CPU/compiler could in principle differ in
+        rounding and require regenerating with UPDATE_GOLDEN=1.
+      truncated: false
+    - text: The dialog's sliders, checkboxes and choice buttons are driven through
+        EditorApp setters in tests; the curve editor is driven with real pointer
+        events.
+      truncated: false
+    - text: Gaussian sigma >= 2 uses the three-box approximation (as specified), so it
+        is close to but not identical with a true Gaussian.
+      truncated: false
+    - text: Add Noise default seed comes from the system clock when the dialog opens.
+      truncated: false
+  known_limits_truncated: false
+  review: null
+  submitted_at: 2026-10-18T06:26:35.883Z
+blockers: []
+verification:
+  candidate_id: 6e34c95c-3179-4a95-a6a5-e290e2c026cf
+  identity_provider: skill-coordinated
+  verifier_execution_ref: skill-coordinated:verifier:8edf5903-c759-4ab6-b6dc-6b84a7a314ea
+  iteration: 2
+  attempt: 1
+  assurance: skill-coordinated
+  verdict: pass
+  checks:
+    - id: cargo-test
+      name:
+        text: cargo test
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 10033
+    - id: bench-filters
+      name:
+        text: release filter preview benchmark
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: filters
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 1805
+    - id: bench-canvas
+      name:
+        text: release pan/zoom benchmark
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: canvas
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 480
+    - id: bench-transform
+      name:
+        text: release transform benchmark
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --lib
+          truncated: false
+        - text: bench_transform
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 402
+    - id: cargo-clippy
+      name:
+        text: cargo clippy
+        truncated: false
+      argv_display:
+        - text: clippy
+          truncated: false
+        - text: --all-targets
+          truncated: false
+        - text: --
+          truncated: false
+        - text: -D
+          truncated: false
+        - text: warnings
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 523
+    - id: cargo-fmt
+      name:
+        text: cargo fmt check
+        truncated: false
+      argv_display:
+        - text: fmt
+          truncated: false
+        - text: --check
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 223
+  summary:
+    text: "All of A1-A8 pass. cargo fmt --check is clean, clippy --all-targets -D
+      warnings is clean, cargo test passes in every suite, and the release
+      preview benchmark's slowest case is 37.5 ms. All three repairs are
+      implemented and tested: Save/Export are refused during a live edit with
+      the dialog kept open, filter results on a mask are written as luminance
+      (gray is exact), and Add Noise uses absolute coordinates with unchanged
+      goldens. Only minor UX risks remain."
+    truncated: false
+  risks:
+    - text: The A7 benchmark times render_filter only; it leaves out
+        write_target_region and the canvas texture refresh that a real preview
+        also pays (there is still about 60 ms of headroom).
+      truncated: false
+    - text: "Repair (1): the Export menu item and Ctrl+S are not disabled during a
+        live preview. The native file dialog opens first and the error comes
+        after the user picks a path. The export refusal reuses IoError::Encode,
+        so the message reads as an encode error. The behaviour is correct:
+        nothing is written and the dialog stays open
+        (save_and_export_wait_for_the_filter_preview)."
+      truncated: false
+    - text: "Quit or Close with a filter dialog open: choosing Save in the prompt is
+        refused because a live edit is in progress, and the prompt is dropped.
+        Don't Save works."
+      truncated: false
+    - text: Undo while a filter dialog is open cancels the preview and also undoes the
+        previous step, matching the existing stroke behaviour. The spec wording
+        is ambiguous on this point.
+      truncated: false
+    - text: "Mask target: commit_filter compares RGBA after/before, so a colored
+        result whose luminance equals the original records a no-op undo step
+        (cosmetic only)."
+      truncated: false
+    - text: Golden PNGs are untracked, so 'goldens unchanged' by repair (3) is shown
+        by reasoning plus the passing golden test, not by a git diff.
+      truncated: false
+  risks_truncated: false
+  completed_at: 2026-10-18T06:39:25.733Z
+history:
+  - goal_cycle: 1
+    iteration: 1
+    attempt: 1
+    outcome: pass
+    unresolved_ids: []
+    summary:
+      text: "All 8 acceptance items pass. The plugin API and registry of 14 filters
+        (one file each), the schema-generated preview dialog with live on-canvas
+        preview, the one-step undo named after the filter, selection and mask
+        targeting, the spec formulas, premultiplied edge-clamped blurs, a seeded
+        deterministic noise, the release 1080p benchmark at defaults and large
+        settings, and byte-exact goldens for all 14 filters are implemented and
+        tested. Remaining risks are minor: benchmark scope, noise keyed relative
+        to the region, mask write-back from the R channel, and goldens tied to
+        this platform."
+      truncated: false
+    completed_at: 2026-10-18T06:00:20.519Z
+  - goal_cycle: 1
+    iteration: 1
+    attempt: 1
+    outcome: recovery
+    unresolved_ids: []
+    summary:
+      text: "User asked to fix before archiving: block Save/Export while a filter
+        preview is open, write luminance gray when filtering a mask, key Add
+        Noise to absolute image positions."
+      truncated: false
+    completed_at: 2026-10-18T06:23:07.294Z
+  - goal_cycle: 1
+    iteration: 2
+    attempt: 1
+    outcome: pass
+    unresolved_ids: []
+    summary:
+      text: "All of A1-A8 pass. cargo fmt --check is clean, clippy --all-targets -D
+        warnings is clean, cargo test passes in every suite, and the release
+        preview benchmark's slowest case is 37.5 ms. All three repairs are
+        implemented and tested: Save/Export are refused during a live edit with
+        the dialog kept open, filter results on a mask are written as luminance
+        (gray is exact), and Add Noise uses absolute coordinates with unchanged
+        goldens. Only minor UX risks remain."
+      truncated: false
+    completed_at: 2026-10-18T06:39:25.733Z
+history_overflow:
+  dropped_entries: 0
+  first_dropped_at: null
+  last_dropped_at: null
+  outcome_counts:
+    pass: 0
+    fail: 0
+    blocked: 0
+    execution-error: 0
+    recovery: 0
+verification_result: pass
+verification_report: verification.md
+archived: false
+created_at: 2026-10-17T11:56:40.551Z
