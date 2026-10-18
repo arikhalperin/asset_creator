@@ -151,7 +151,7 @@ impl LinearMap {
 
 /// Runs `f(y, row)` for each row in `rows` of an image buffer with `stride`
 /// bytes per row, split across threads for large regions.
-fn parallel_rows(
+pub(crate) fn parallel_rows(
     buf: &mut [u8],
     stride: usize,
     rows: std::ops::Range<u32>,

@@ -240,9 +240,21 @@ pub fn mask_to_rgba(mask: &GrayImage) -> RgbaImage {
     })
 }
 
-/// The mask value an RGBA result stands for: flattened over `old` (opaque gray).
+/// The mask value an RGBA result stands for: its luminance after flattening
+/// over `old` (opaque gray).
 pub fn rgba_to_mask_value(old: u8, value: Rgba<u8>) -> u8 {
-    crate::document::blend_over(Rgba([old, old, old, 255]), value, 1.0)[0]
+    luminance_u8(crate::document::blend_over(
+        Rgba([old, old, old, 255]),
+        value,
+        1.0,
+    ))
+}
+
+/// Luminance `0.299 R + 0.587 G + 0.114 B` of an opaque pixel (gray stays exact).
+pub fn luminance_u8(p: Rgba<u8>) -> u8 {
+    (0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32)
+        .round()
+        .clamp(0.0, 255.0) as u8
 }
 
 /// Writes one pixel of the target; `old` is the pixel's value (in target
@@ -302,7 +314,7 @@ pub fn write_target_region(
                 for (x, y, p) in pixels.enumerate_pixels() {
                     let (mx, my) = (rect.x + x, rect.y + y);
                     if mx < mask.width() && my < mask.height() {
-                        mask.put_pixel(mx, my, image::Luma([p[0]]));
+                        mask.put_pixel(mx, my, image::Luma([luminance_u8(*p)]));
                     }
                 }
             }

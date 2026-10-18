@@ -14,7 +14,7 @@ The Game Asset Creator desktop application window: eframe/egui with egui_dock pr
 
 ### Layout
 
-- Menu bar with File, Edit, Select, Layer, and View menus; a tool-options strip below the menu bar; status bar at the bottom showing the focused document's name, size, DPI, zoom percentage, and the pointer's pixel coordinate when over the image (or "No document").
+- Menu bar with File, Edit, Select, Layer, Filter, and View menus; a tool-options strip below the menu bar; status bar at the bottom showing the focused document's name, size, DPI, zoom percentage, and the pointer's pixel coordinate when over the image (or "No document").
 - A dock area (egui_dock) containing three panel tabs — Tools, Layers, Asset Library — and the document tabs. Panels and documents can be dragged, re-docked, and closed.
 
 ### File menu
@@ -84,3 +84,7 @@ The Game Asset Creator desktop application window: eframe/egui with egui_dock pr
 ### Edit menu additions
 
 - Free Transform (Ctrl+T), Flip Horizontal, Flip Vertical, acting on the active layer (or the selected content).
+
+### Filter menu
+
+- Lists every registered filter grouped by category (Adjustments; Blur; Sharpen; Noise) in registry order. Filters with parameters end in "…" and open their preview dialog; filters without parameters (Desaturate, Invert, Sharpen) apply immediately as one undo step. Items are enabled when there is a current document and no transform is in progress.
