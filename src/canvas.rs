@@ -55,6 +55,25 @@ pub enum CanvasEvent {
         shift: bool,
     },
     TransformRelease,
+    /// Extract Object: a click (replacing the prompt, or adding an include /
+    /// exclude point with Shift / Option).
+    ExtractPoint {
+        point: (f32, f32),
+        mode: PointMode,
+    },
+    /// Extract Object: a dragged box.
+    ExtractBox {
+        start: (f32, f32),
+        end: (f32, f32),
+    },
+}
+
+/// How an Extract Object click changes the prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointMode {
+    Replace,
+    Include,
+    Exclude,
 }
 
 /// The Free Transform box to draw and interact with.
@@ -888,7 +907,7 @@ impl CanvasState {
                 ..
             }) => {
                 let path: Vec<Pos2> = match tool {
-                    Tool::RectSelect => {
+                    Tool::RectSelect | Tool::ExtractObject => {
                         let r = Rect::from_two_pos(to_screen(*start), to_screen(*current));
                         vec![
                             r.left_top(),
@@ -1112,15 +1131,12 @@ impl CanvasState {
         let pressed_here = pressed && response.contains_pointer();
         let mut events = Vec::new();
 
-        // The gradient drag is the only paint gesture using `self.gesture`.
-        if !matches!(
+        // Gradient and Extract Object drags are the paint gestures using `self.gesture`.
+        let own_drag = matches!(
             &self.gesture,
-            Some(Gesture::Drag {
-                tool: Tool::Gradient,
-                ..
-            })
-        ) || tool != Tool::Gradient
-        {
+            Some(Gesture::Drag { tool: t, .. }) if *t == tool
+        );
+        if !own_drag || !matches!(tool, Tool::Gradient | Tool::ExtractObject) {
             self.gesture = None;
         }
 
@@ -1192,6 +1208,47 @@ impl CanvasState {
                 if response.clicked_by(PointerButton::Primary) {
                     if let Some(p) = pointer.map(to_image).filter(|p| in_image(*p)) {
                         events.push(CanvasEvent::Bucket(pixel(p)));
+                    }
+                }
+            }
+            Tool::ExtractObject => {
+                if response.drag_started_by(PointerButton::Primary) {
+                    if let Some(origin) = press_origin {
+                        let start = to_image(origin);
+                        let start = Pos2::new(start.0, start.1);
+                        self.gesture = Some(Gesture::Drag {
+                            tool,
+                            mode: CombineMode::Replace,
+                            start,
+                            current: start,
+                            path: Vec::new(),
+                        });
+                    }
+                }
+                if let (Some(Gesture::Drag { current, .. }), Some(p)) = (&mut self.gesture, pointer)
+                {
+                    let p = to_image(p);
+                    *current = Pos2::new(p.0, p.1);
+                }
+                if response.drag_stopped_by(PointerButton::Primary) {
+                    if let Some(Gesture::Drag { start, current, .. }) = self.gesture.take() {
+                        if (current - start).abs().min_elem() >= 2.0 {
+                            events.push(CanvasEvent::ExtractBox {
+                                start: (start.x, start.y),
+                                end: (current.x, current.y),
+                            });
+                        }
+                    }
+                } else if response.clicked_by(PointerButton::Primary) {
+                    if let Some(p) = pointer.map(to_image).filter(|p| in_image(*p)) {
+                        let mode = if modifiers.alt {
+                            PointMode::Exclude
+                        } else if modifiers.shift {
+                            PointMode::Include
+                        } else {
+                            PointMode::Replace
+                        };
+                        events.push(CanvasEvent::ExtractPoint { point: p, mode });
                     }
                 }
             }

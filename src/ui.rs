@@ -9,8 +9,14 @@ use egui_dock::{DockArea, DockState, NodeIndex, TabViewer};
 
 use crate::app_state::{AppState, DocId, EditTarget};
 use crate::canvas::{self, CanvasState, ViewAction};
-use crate::canvas::{CanvasEvent, TransformBox};
+use crate::canvas::{CanvasEvent, PointMode, TransformBox};
 use crate::document::DEFAULT_DPI;
+use crate::extract::segment::{self, Availability, Engine, Prompt, Segmenter};
+use crate::extract::{self as extraction, keying::RemoveBackground, models};
+use crate::extract_ui::{
+    asset_library_panel, draw_overlays, AssetAction, AssetLibraryView, AutoDetectDialog,
+    DetectOutcome, ExtractSession, RemoveBackgroundDialog,
+};
 use crate::filter_dialog::{self, DialogOutcome, FilterDialog};
 use crate::filters::{self, ParamValue, Params};
 use crate::io::FileFormat;
@@ -223,6 +229,30 @@ enum Action {
     Nudge(i32, i32),
     Filter(&'static str),
     Video(Transport),
+    RemoveBackground,
+    AutoDetect,
+    AddSelectionToLibrary,
+    ExtractAccept,
+    ExtractToSelection,
+    ExtractClear,
+    DownloadModel,
+}
+
+/// Whether the user agreed to download MobileSAM this session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Consent {
+    NotAsked,
+    Asking,
+    Accepted,
+    Declined,
+}
+
+/// What the Extract Object tool options show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractStrip {
+    pub status: String,
+    pub has_mask: bool,
+    pub can_download: bool,
 }
 
 /// A pending "save changes?" question.
@@ -286,6 +316,19 @@ pub struct EditorApp {
     frame_set_view: FrameSetView,
     /// For background workers to request repaints.
     repaint: Option<egui::Context>,
+    remove_background: Option<RemoveBackgroundDialog>,
+    auto_detect: Option<AutoDetectDialog>,
+    extract: Option<ExtractSession>,
+    /// Created on the first Extract Object prompt.
+    segmenter: Option<Segmenter>,
+    segment_config: segment::Config,
+    availability: Option<Availability>,
+    analyzing: bool,
+    download: Option<models::Download>,
+    download_error: Option<String>,
+    consent: Consent,
+    next_request: u64,
+    asset_view: AssetLibraryView,
 }
 
 impl Default for EditorApp {
@@ -327,6 +370,606 @@ impl EditorApp {
             extract_dialog: None,
             frame_set_view: FrameSetView::default(),
             repaint: None,
+            remove_background: None,
+            auto_detect: None,
+            extract: None,
+            segmenter: None,
+            segment_config: segment::Config::default(),
+            availability: None,
+            analyzing: false,
+            download: None,
+            download_error: None,
+            consent: Consent::NotAsked,
+            next_request: 0,
+            asset_view: AssetLibraryView::default(),
+        }
+    }
+
+    fn notify(&self) -> std::sync::Arc<dyn Fn() + Send + Sync> {
+        match &self.repaint {
+            Some(ctx) => {
+                let ctx = ctx.clone();
+                std::sync::Arc::new(move || ctx.request_repaint())
+            }
+            None => std::sync::Arc::new(|| {}),
+        }
+    }
+
+    /// The active layer's pixels of the current document.
+    fn active_pixels(&self) -> Option<(DocId, image::RgbaImage)> {
+        let open = self.state.current_document()?;
+        let layer = open.document.layer(open.active_layer())?;
+        Some((open.id, layer.pixels.clone()))
+    }
+
+    /// Whether a modal-ish extraction or filter dialog is open.
+    fn dialog_open(&self) -> bool {
+        self.filter_dialog.is_some()
+            || self.remove_background.is_some()
+            || self.auto_detect.is_some()
+    }
+
+    // --- Remove Background ------------------------------------------------
+
+    /// Extract → Remove Background…: opens the dialog with a live preview.
+    pub fn open_remove_background(&mut self) -> bool {
+        if self.transform_active() || self.dialog_open() {
+            return false;
+        }
+        let Some((id, pixels)) = self.active_pixels() else {
+            return false;
+        };
+        if self
+            .state
+            .document(id)
+            .is_some_and(|o| o.edit_target() == EditTarget::Mask)
+        {
+            return false;
+        }
+        if let Err(err) = self.state.begin_filter(id) {
+            self.error = Some(format!("Remove Background: {err}"));
+            return false;
+        }
+        self.remove_background = Some(RemoveBackgroundDialog::new(id, &pixels));
+        self.refresh_remove_background();
+        true
+    }
+
+    pub fn remove_background_dialog(&self) -> Option<&RemoveBackgroundDialog> {
+        self.remove_background.as_ref()
+    }
+
+    /// Changes the dialog's settings and refreshes the preview.
+    pub fn set_remove_background(&mut self, key: extraction::keying::KeyParams, preview: bool) {
+        if let Some(dialog) = &mut self.remove_background {
+            dialog.set_key(key);
+            dialog.preview = preview;
+        }
+        self.refresh_remove_background();
+    }
+
+    /// Pick: the next canvas click sets the background color.
+    pub fn pick_background_color(&mut self) {
+        if let Some(dialog) = &mut self.remove_background {
+            dialog.picking = true;
+        }
+    }
+
+    fn refresh_remove_background(&mut self) {
+        if let Some(dialog) = &self.remove_background {
+            self.state.preview_filter(
+                dialog.doc,
+                &RemoveBackground,
+                &dialog.params,
+                dialog.preview,
+            );
+        }
+    }
+
+    /// OK: one undo step "Remove Background".
+    pub fn remove_background_ok(&mut self) -> bool {
+        let Some(dialog) = self.remove_background.take() else {
+            return false;
+        };
+        self.state
+            .commit_filter(dialog.doc, &RemoveBackground, &dialog.params)
+    }
+
+    pub fn remove_background_cancel(&mut self) {
+        if let Some(dialog) = self.remove_background.take() {
+            self.state.cancel_filter(dialog.doc);
+        }
+    }
+
+    fn show_remove_background_window(&mut self, ctx: &egui::Context) {
+        if let Some(dialog) = &self.remove_background {
+            if !self
+                .state
+                .document(dialog.doc)
+                .is_some_and(|o| o.is_filtering())
+            {
+                self.remove_background = None;
+            }
+        }
+        let Some(dialog) = &mut self.remove_background else {
+            return;
+        };
+        match dialog.show(ctx) {
+            crate::extract_ui::DialogOutcome::Open { changed: true } => {
+                self.refresh_remove_background()
+            }
+            crate::extract_ui::DialogOutcome::Open { changed: false } => {}
+            crate::extract_ui::DialogOutcome::Ok => {
+                self.remove_background_ok();
+            }
+            crate::extract_ui::DialogOutcome::Cancel => self.remove_background_cancel(),
+        }
+    }
+
+    // --- Auto-Detect ----------------------------------------------------------
+
+    /// Extract → Auto-Detect Objects…
+    pub fn open_auto_detect(&mut self) -> bool {
+        if self.transform_active() || self.dialog_open() {
+            return false;
+        }
+        let Some((id, pixels)) = self.active_pixels() else {
+            return false;
+        };
+        self.auto_detect = Some(AutoDetectDialog::new(id, &pixels));
+        true
+    }
+
+    pub fn auto_detect_dialog(&self) -> Option<&AutoDetectDialog> {
+        self.auto_detect.as_ref()
+    }
+
+    pub fn auto_detect_dialog_mut(&mut self) -> Option<&mut AutoDetectDialog> {
+        self.auto_detect.as_mut()
+    }
+
+    /// Add to Library: the checked proposals become assets; returns how many.
+    pub fn auto_detect_add(&mut self) -> usize {
+        let Some(dialog) = self.auto_detect.take() else {
+            return 0;
+        };
+        let name = self.document_name(dialog.doc);
+        let crops = dialog.crops();
+        let added = crops.len();
+        for (image, rect) in crops {
+            self.state.assets.add(&name, image, rect);
+        }
+        self.after_assets_added(added);
+        added
+    }
+
+    pub fn auto_detect_cancel(&mut self) {
+        self.auto_detect = None;
+    }
+
+    fn show_auto_detect_window(&mut self, ctx: &egui::Context) {
+        if let Some(dialog) = &self.auto_detect {
+            if self.state.document(dialog.doc).is_none() {
+                self.auto_detect = None;
+            }
+        }
+        let Some(dialog) = &mut self.auto_detect else {
+            return;
+        };
+        match dialog.show(ctx) {
+            DetectOutcome::Open => {}
+            DetectOutcome::Add => {
+                self.auto_detect_add();
+            }
+            DetectOutcome::Cancel => self.auto_detect_cancel(),
+        }
+    }
+
+    fn document_name(&self, id: DocId) -> String {
+        self.state
+            .document(id)
+            .map(|o| o.document.name.clone())
+            .unwrap_or_default()
+    }
+
+    fn after_assets_added(&mut self, added: usize) {
+        if added > 0 {
+            self.status_message = Some(format!(
+                "Added {added} asset{} to the Asset Library",
+                if added == 1 { "" } else { "s" }
+            ));
+            self.set_panel_open(Panel::AssetLibrary, true);
+            if let Some(path) = self.dock.find_tab(&Tab::Panel(Panel::AssetLibrary)) {
+                let _ = self.dock.set_active_tab(path);
+            }
+        }
+    }
+
+    /// Extract → Add Selection to Library.
+    pub fn add_selection_to_library(&mut self) -> bool {
+        let Some((id, pixels)) = self.active_pixels() else {
+            return false;
+        };
+        let Some(selection) = self
+            .state
+            .document(id)
+            .and_then(|o| o.document.selection().cloned())
+        else {
+            return false;
+        };
+        let Some((image, rect)) = extraction::tight_crop(&pixels, &selection) else {
+            return false;
+        };
+        let name = self.document_name(id);
+        self.state.assets.add(&name, image, rect);
+        self.after_assets_added(1);
+        true
+    }
+
+    // --- Extract Object -----------------------------------------------------
+
+    /// Where segmentation looks for ONNX Runtime and the models (tests point
+    /// it elsewhere). Takes effect before the first prompt.
+    pub fn set_segment_config(&mut self, config: segment::Config) {
+        self.segment_config = config;
+    }
+
+    pub fn extract_session(&self) -> Option<&ExtractSession> {
+        self.extract.as_ref()
+    }
+
+    pub fn availability(&self) -> Option<&Availability> {
+        self.availability.as_ref()
+    }
+
+    pub fn consent(&self) -> Consent {
+        self.consent
+    }
+
+    /// Whether the worker has been created (nothing ML loads before).
+    pub fn segmenter_started(&self) -> bool {
+        self.segmenter.is_some()
+    }
+
+    pub fn download_in_progress(&self) -> bool {
+        self.download.is_some()
+    }
+
+    /// An Extract Object click or box on document `id`.
+    fn extract_event(&mut self, id: DocId, event: CanvasEvent) {
+        if self.extract.as_ref().is_none_or(|s| s.doc != id) {
+            self.extract = Some(ExtractSession::new(id));
+        }
+        let session = self.extract.as_mut().expect("session just set");
+        match event {
+            CanvasEvent::ExtractPoint { point, mode } => match mode {
+                PointMode::Replace => session.prompt = Prompt::click(point),
+                PointMode::Include => session.prompt.points.push((point.0, point.1, true)),
+                PointMode::Exclude => session.prompt.points.push((point.0, point.1, false)),
+            },
+            CanvasEvent::ExtractBox { start, end } => {
+                session.prompt = Prompt::boxed(start, end);
+            }
+            _ => return,
+        }
+        self.request_segmentation();
+    }
+
+    /// Sends the session's prompt to the worker (creating it on first use).
+    fn request_segmentation(&mut self) {
+        let Some(session) = &self.extract else {
+            return;
+        };
+        if session.prompt.is_empty() {
+            return;
+        }
+        let Some(open) = self.state.document(session.doc) else {
+            return;
+        };
+        let Some(layer) = open.document.layer(open.active_layer()) else {
+            return;
+        };
+        // Cache key for the MobileSAM embedding: document, layer, and content.
+        let key =
+            (open.id.0 << 40) ^ ((open.active_layer() as u64) << 32) ^ open.undo_stack().state_id();
+        let image = std::sync::Arc::new(layer.pixels.clone());
+        if self.segmenter.is_none() {
+            self.segmenter = Some(Segmenter::new(self.segment_config.clone(), self.notify()));
+        }
+        self.next_request += 1;
+        let request = segment::Request {
+            id: self.next_request,
+            key,
+            image,
+            prompt: session.prompt.clone(),
+        };
+        if let Some(session) = &mut self.extract {
+            session.request = self.next_request;
+            session.busy = true;
+        }
+        if let Some(segmenter) = &self.segmenter {
+            segmenter.request(request);
+        }
+    }
+
+    /// Prompt Extract Object from code (tests): a click, Shift/Option point,
+    /// or box on the current document.
+    pub fn extract_prompt(&mut self, event: CanvasEvent) -> bool {
+        let Some(id) = self.state.current_id() else {
+            return false;
+        };
+        self.extract_event(id, event);
+        true
+    }
+
+    /// Add to Library: the mask over the active layer becomes an asset.
+    pub fn extract_accept(&mut self) -> bool {
+        let Some(session) = &self.extract else {
+            return false;
+        };
+        let Some((mask, _)) = &session.mask else {
+            return false;
+        };
+        let doc = session.doc;
+        let Some(open) = self.state.document(doc) else {
+            return false;
+        };
+        let Some(layer) = open.document.layer(open.active_layer()) else {
+            return false;
+        };
+        let Some((image, rect)) = extraction::tight_crop(&layer.pixels, mask) else {
+            return false;
+        };
+        let name = self.document_name(doc);
+        self.state.assets.add(&name, image, rect);
+        self.extract = None;
+        self.after_assets_added(1);
+        true
+    }
+
+    /// To Selection: the mask becomes the document selection (undoable).
+    pub fn extract_to_selection(&mut self) -> bool {
+        let Some(session) = &self.extract else {
+            return false;
+        };
+        let Some((mask, _)) = &session.mask else {
+            return false;
+        };
+        let (doc, mask) = (session.doc, mask.clone());
+        let command = SetSelection::new("Extract Object", Some(mask));
+        match self.state.execute(doc, Box::new(command)) {
+            Ok(()) => true,
+            Err(err) => {
+                self.error = Some(err.to_string());
+                false
+            }
+        }
+    }
+
+    pub fn extract_clear(&mut self) {
+        self.extract = None;
+    }
+
+    /// Download Model… / the consent dialog's Download.
+    pub fn start_model_download(&mut self) {
+        if self.download.is_some() {
+            return;
+        }
+        self.consent = Consent::Accepted;
+        self.download_error = None;
+        self.download = Some(models::Download::start(
+            self.segment_config.source.clone(),
+            self.segment_config.model_dir.clone(),
+            self.notify(),
+        ));
+    }
+
+    /// The consent dialog's Use GrabCut.
+    pub fn decline_model_download(&mut self) {
+        self.consent = Consent::Declined;
+    }
+
+    /// Handles segmentation and download results.
+    pub fn pump_extraction(&mut self) {
+        let events = self
+            .segmenter
+            .as_ref()
+            .map(Segmenter::poll)
+            .unwrap_or_default();
+        for event in events {
+            match event {
+                segment::Event::Availability(a) => {
+                    if matches!(a, Availability::NeedsModels(_))
+                        && self.consent == Consent::NotAsked
+                        && self.download.is_none()
+                    {
+                        self.consent = Consent::Asking;
+                    }
+                    self.availability = Some(a);
+                }
+                segment::Event::Analyzing(id) => {
+                    self.analyzing = self.extract.as_ref().is_some_and(|s| s.request == id);
+                }
+                segment::Event::Mask {
+                    id,
+                    mask,
+                    engine,
+                    note,
+                } => {
+                    if let Some(session) = &mut self.extract {
+                        if session.request == id {
+                            session.set_mask(mask, engine, note);
+                        }
+                    }
+                    self.analyzing = false;
+                }
+            }
+        }
+        let finished = self.download.as_mut().and_then(|d| d.result().cloned());
+        match finished {
+            Some(Ok(())) => {
+                self.download = None;
+                if let Some(segmenter) = &self.segmenter {
+                    segmenter.reprobe();
+                }
+            }
+            Some(Err(e)) => {
+                self.download = None;
+                self.download_error = Some(e);
+            }
+            None => {}
+        }
+    }
+
+    /// The Extract Object tool options' status line and buttons.
+    pub fn extract_strip(&self) -> ExtractStrip {
+        let has_mask = self.extract.as_ref().is_some_and(|s| s.mask.is_some());
+        let busy = self.extract.as_ref().is_some_and(|s| s.busy);
+        let can_download = self.download.is_none()
+            && matches!(self.availability, Some(Availability::NeedsModels(_)));
+        let status = if let Some(d) = &self.download {
+            format!("Downloading MobileSAM… {:.0} %", d.progress() * 100.0)
+        } else if self.analyzing && busy {
+            "Analyzing image…".to_owned()
+        } else {
+            let mut s = match &self.availability {
+                None => "Click an object or drag a box around it".to_owned(),
+                Some(Availability::Ready) => "MobileSAM".to_owned(),
+                Some(Availability::NeedsModels(None)) => {
+                    "GrabCut — MobileSAM is not installed".to_owned()
+                }
+                Some(Availability::NeedsModels(Some(reason))) => format!("GrabCut — {reason}"),
+                Some(Availability::Unavailable(reason)) => format!("GrabCut — {reason}"),
+            };
+            if let Some(e) = &self.download_error {
+                s = format!("GrabCut — {e}");
+            }
+            if let Some(ExtractSession {
+                mask: Some((_, engine)),
+                note,
+                ..
+            }) = &self.extract
+            {
+                if *engine == Engine::GrabCut
+                    && matches!(self.availability, Some(Availability::Ready))
+                {
+                    s = format!(
+                        "GrabCut — {}",
+                        note.as_deref().unwrap_or("MobileSAM failed")
+                    );
+                }
+            }
+            if busy {
+                s.push_str("  (working…)");
+            }
+            s
+        };
+        ExtractStrip {
+            status,
+            has_mask,
+            can_download,
+        }
+    }
+
+    fn show_consent_window(&mut self, ctx: &egui::Context) {
+        if self.consent != Consent::Asking {
+            return;
+        }
+        let mut answer = None;
+        egui::Window::new("Download MobileSAM?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "Extract Object can use MobileSAM (MIT license) for better masks.\nDownload it now (about {} MB) into\n{}?\nUntil then, GrabCut is used.",
+                    models::total_size() / 1_000_000,
+                    self.segment_config.model_dir.display()
+                ));
+                ui.horizontal(|ui| {
+                    if ui.button("Download").clicked() {
+                        answer = Some(true);
+                    }
+                    if ui.button("Use GrabCut").clicked() {
+                        answer = Some(false);
+                    }
+                });
+            });
+        match answer {
+            Some(true) => self.start_model_download(),
+            Some(false) => self.decline_model_download(),
+            None => {}
+        }
+    }
+
+    // --- Asset Library -------------------------------------------------------
+
+    pub fn asset_view(&self) -> &AssetLibraryView {
+        &self.asset_view
+    }
+
+    pub fn asset_view_mut(&mut self) -> &mut AssetLibraryView {
+        &mut self.asset_view
+    }
+
+    /// Saves asset `id` as a PNG at `path`.
+    pub fn save_asset_to(&mut self, id: u64, path: &Path) -> bool {
+        let Some(asset) = self.state.assets.get(id) else {
+            return false;
+        };
+        match crate::asset_library::save_png(&asset.image, path) {
+            Ok(()) => true,
+            Err(e) => {
+                self.error = Some(e);
+                false
+            }
+        }
+    }
+
+    /// Saves every asset into `dir`.
+    pub fn save_all_assets_to(&mut self, dir: &Path) -> Option<Vec<PathBuf>> {
+        match self.state.assets.save_all(dir) {
+            Ok(paths) => {
+                self.status_message =
+                    Some(format!("Saved {} assets to {}", paths.len(), dir.display()));
+                Some(paths)
+            }
+            Err(e) => {
+                self.error = Some(e);
+                None
+            }
+        }
+    }
+
+    /// Runs an Asset Library panel action; `Open` returns the new document.
+    pub fn asset_action(&mut self, action: AssetAction) -> Option<DocId> {
+        match action {
+            AssetAction::SavePng(id) => {
+                let name = self.state.assets.get(id)?.name.clone();
+                let mut path = rfd::FileDialog::new()
+                    .set_file_name(format!("{name}.png"))
+                    .add_filter("PNG", &["png"])
+                    .save_file()?;
+                if path.extension().is_none() {
+                    path.set_extension("png");
+                }
+                self.save_asset_to(id, &path);
+                None
+            }
+            AssetAction::SaveAll => {
+                let dir = rfd::FileDialog::new().pick_folder()?;
+                self.save_all_assets_to(&dir);
+                None
+            }
+            AssetAction::Open(id) => {
+                let asset = self.state.assets.get(id)?;
+                let (name, image) = (asset.name.clone(), asset.image.clone());
+                self.open_image_document(name, image)
+            }
+            AssetAction::Remove(ids) => {
+                self.state.assets.remove(&ids);
+                None
+            }
         }
     }
 
@@ -1009,6 +1652,9 @@ impl EditorApp {
         };
         let active = open.active_layer();
         match event {
+            CanvasEvent::ExtractPoint { .. } | CanvasEvent::ExtractBox { .. } => {
+                self.extract_event(id, event);
+            }
             CanvasEvent::Selection(request) => {
                 if Some(id) == self.state.current_id() {
                     self.apply_selection_request(&request);
@@ -1063,6 +1709,18 @@ impl EditorApp {
                     canvas.set_clone_source(p);
                 }
                 self.status_message = None;
+            }
+            CanvasEvent::Pick { pixel, .. }
+                if self.remove_background.as_ref().is_some_and(|d| d.picking) =>
+            {
+                if let Some(dialog) = &mut self.remove_background {
+                    let p = dialog.original.get_pixel(pixel.0, pixel.1);
+                    let mut key = dialog.key();
+                    key.color = [p[0], p[1], p[2]];
+                    dialog.set_key(key);
+                    dialog.picking = false;
+                }
+                self.refresh_remove_background();
             }
             CanvasEvent::Pick { pixel, background } => {
                 let all = self.tool_options.sample_all_layers;
@@ -1515,6 +2173,7 @@ impl EditorApp {
             self.repaint = Some(ui.ctx().clone());
         }
         self.pump_videos(ui.ctx());
+        self.pump_extraction();
         let checker = self
             .checker
             .get_or_insert_with(|| canvas::checker_texture(ui.ctx()))
@@ -1547,11 +2206,13 @@ impl EditorApp {
         });
         let transform_active = self.transform_active();
         egui::Panel::top("tool_options").show(ui, |ui| {
+            let strip = (self.tool == Tool::ExtractObject).then(|| self.extract_strip());
             tool_options_strip(
                 ui,
                 self.tool,
                 &mut self.tool_options,
                 transform_active,
+                strip.as_ref(),
                 &mut actions,
             );
         });
@@ -1577,6 +2238,7 @@ impl EditorApp {
         let mut closed_videos = Vec::new();
         let mut video_actions = Vec::new();
         let mut frame_set_actions = Vec::new();
+        let mut asset_actions = Vec::new();
         egui::CentralPanel::default()
             .frame(egui::Frame::central_panel(ui.style()).inner_margin(0.0))
             .show(ui, |ui| {
@@ -1600,6 +2262,11 @@ impl EditorApp {
                     video_actions: &mut video_actions,
                     frame_set_view: &mut self.frame_set_view,
                     frame_set_actions: &mut frame_set_actions,
+                    extract: &mut self.extract,
+                    auto_detect: self.auto_detect.as_ref(),
+                    picking: self.remove_background.as_ref().is_some_and(|d| d.picking),
+                    asset_view: &mut self.asset_view,
+                    asset_actions: &mut asset_actions,
                 };
                 DockArea::new(&mut self.dock)
                     .show_leaf_close_all_buttons(false)
@@ -1634,6 +2301,18 @@ impl EditorApp {
         for action in frame_set_actions {
             self.frame_set_action(action);
         }
+        for action in asset_actions {
+            self.asset_action(action);
+        }
+        // The Extract Object session follows the tool and the document.
+        if self.tool != Tool::ExtractObject
+            || self
+                .extract
+                .as_ref()
+                .is_some_and(|s| Some(s.doc) != self.state.current_id())
+        {
+            self.extract = None;
+        }
         if self.state.current_id() != self.last_current {
             // Switching documents abandons an open polygon, drag, or stroke.
             self.state.cancel_all_strokes();
@@ -1660,6 +2339,9 @@ impl EditorApp {
         self.show_radius_dialog_window(ui.ctx());
         self.show_filter_dialog_window(ui.ctx());
         self.show_extract_dialog_window(ui.ctx());
+        self.show_remove_background_window(ui.ctx());
+        self.show_auto_detect_window(ui.ctx());
+        self.show_consent_window(ui.ctx());
         self.show_prompt_window(ui.ctx());
         self.show_error_window(ui.ctx());
 
@@ -1761,6 +2443,18 @@ impl EditorApp {
                     }
                 }
             }
+            if !typing
+                && self.tool == Tool::ExtractObject
+                && !self.transform_active()
+                && self.extract.is_some()
+            {
+                if input.consume_key(Modifiers::NONE, Key::Enter) {
+                    actions.push(Action::ExtractAccept);
+                }
+                if input.consume_key(Modifiers::NONE, Key::Escape) {
+                    actions.push(Action::ExtractClear);
+                }
+            }
             if !typing && self.transform_active() {
                 if input.consume_key(Modifiers::NONE, Key::Enter) {
                     actions.push(Action::CommitTransform);
@@ -1798,6 +2492,7 @@ impl EditorApp {
                     (Key::G, Tool::after_g(self.tool)),
                     (Key::S, Tool::CloneStamp),
                     (Key::V, Tool::Move),
+                    (Key::O, Tool::ExtractObject),
                 ];
                 for (key, tool) in tool_keys {
                     if input.consume_key(Modifiers::NONE, key) {
@@ -2034,6 +2729,38 @@ impl EditorApp {
                 }
             }
         });
+        let extract_enabled = self.state.current_document().is_some()
+            && !self.transform_active()
+            && !self.dialog_open();
+        let can_key = extract_enabled
+            && self
+                .state
+                .current_document()
+                .is_some_and(|o| o.edit_target() == EditTarget::Pixels);
+        ui.menu_button("Extract", |ui| {
+            if ui
+                .add_enabled(can_key, egui::Button::new("Remove Background…"))
+                .clicked()
+            {
+                actions.push(Action::RemoveBackground);
+            }
+            if ui
+                .add_enabled(extract_enabled, egui::Button::new("Auto-Detect Objects…"))
+                .clicked()
+            {
+                actions.push(Action::AutoDetect);
+            }
+            ui.separator();
+            if ui
+                .add_enabled(
+                    extract_enabled && has_selection,
+                    egui::Button::new("Add Selection to Library"),
+                )
+                .clicked()
+            {
+                actions.push(Action::AddSelectionToLibrary);
+            }
+        });
         ui.menu_button("View", |ui| {
             let mut item = |ui: &mut egui::Ui, label: &str, shortcut, action| {
                 let button =
@@ -2144,6 +2871,23 @@ impl EditorApp {
             Action::Filter(id) => {
                 self.open_filter(id);
             }
+            Action::RemoveBackground => {
+                self.open_remove_background();
+            }
+            Action::AutoDetect => {
+                self.open_auto_detect();
+            }
+            Action::AddSelectionToLibrary => {
+                self.add_selection_to_library();
+            }
+            Action::ExtractAccept => {
+                self.extract_accept();
+            }
+            Action::ExtractToSelection => {
+                self.extract_to_selection();
+            }
+            Action::ExtractClear => self.extract_clear(),
+            Action::DownloadModel => self.start_model_download(),
             Action::Video(command) => {
                 if let Some(tab) = self.focused_video.and_then(|id| self.videos.get_mut(&id)) {
                     tab.transport(command);
@@ -2422,6 +3166,12 @@ struct Viewer<'a> {
     video_actions: &'a mut Vec<(VideoId, VideoAction)>,
     frame_set_view: &'a mut FrameSetView,
     frame_set_actions: &'a mut Vec<FrameSetAction>,
+    extract: &'a mut Option<ExtractSession>,
+    auto_detect: Option<&'a AutoDetectDialog>,
+    /// Remove Background's Pick: canvas clicks sample a color.
+    picking: bool,
+    asset_view: &'a mut AssetLibraryView,
+    asset_actions: &'a mut Vec<AssetAction>,
 }
 
 impl TabViewer for Viewer<'_> {
@@ -2463,7 +3213,8 @@ impl TabViewer for Viewer<'_> {
                 self.layer_actions.extend(actions);
             }
             Tab::Panel(Panel::AssetLibrary) => {
-                ui.weak("The asset library arrives in a later version.");
+                let actions = asset_library_panel(ui, &self.state.assets, self.asset_view);
+                self.asset_actions.extend(actions);
             }
             Tab::Panel(Panel::FrameSet) => {
                 let actions = frame_set_panel(ui, &self.state.frame_set, self.frame_set_view);
@@ -2509,12 +3260,17 @@ impl Viewer<'_> {
         else {
             return;
         };
+        let tool = if self.picking {
+            Tool::Eyedropper
+        } else {
+            self.tool
+        };
         let events = canvas.show(
             ui,
             open,
             self.checker,
             self.show_pixel_grid,
-            self.tool,
+            tool,
             self.tool_options,
             open.transform()
                 .filter(|_| self.free_transform == Some(id))
@@ -2524,6 +3280,14 @@ impl Viewer<'_> {
                 }),
         );
         self.requests.extend(events.into_iter().map(|e| (id, e)));
+        let session = self.extract.as_mut().filter(|s| s.doc == id);
+        let detect = self.auto_detect.filter(|d| d.doc == id);
+        if session.is_some() || detect.is_some() {
+            if let (Some(rect), Some(view)) = (canvas.rect(), canvas.view()) {
+                let size = [open.document.width(), open.document.height()];
+                draw_overlays(ui, rect, &view, size, session, detect);
+            }
+        }
     }
 }
 
@@ -2583,9 +3347,36 @@ fn tool_options_strip(
     tool: Tool,
     options: &mut ToolOptions,
     transform_active: bool,
+    extract: Option<&ExtractStrip>,
     actions: &mut Vec<Action>,
 ) {
     ui.horizontal(|ui| {
+        if let (Some(strip), false) = (extract, transform_active) {
+            ui.label(tool.label());
+            ui.separator();
+            ui.label(&strip.status);
+            ui.separator();
+            if ui
+                .add_enabled(strip.has_mask, egui::Button::new("Add to Library"))
+                .on_hover_text("Enter")
+                .clicked()
+            {
+                actions.push(Action::ExtractAccept);
+            }
+            if ui
+                .add_enabled(strip.has_mask, egui::Button::new("To Selection"))
+                .clicked()
+            {
+                actions.push(Action::ExtractToSelection);
+            }
+            if ui.button("Clear").on_hover_text("Escape").clicked() {
+                actions.push(Action::ExtractClear);
+            }
+            if strip.can_download && ui.button("Download Model…").clicked() {
+                actions.push(Action::DownloadModel);
+            }
+            return;
+        }
         if transform_active {
             ui.label("Free Transform");
             ui.separator();

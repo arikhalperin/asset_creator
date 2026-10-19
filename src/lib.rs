@@ -1,8 +1,11 @@
 //! Game Asset Creator: a desktop image editor for building game assets.
 
 pub mod app_state;
+pub mod asset_library;
 pub mod canvas;
 pub mod document;
+pub mod extract;
+pub mod extract_ui;
 pub mod filter_dialog;
 pub mod filters;
 pub mod frame_set;

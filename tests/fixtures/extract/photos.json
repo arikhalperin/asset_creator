@@ -1,0 +1,28 @@
+{
+  "photos": [
+    {
+      "click": [
+        330,
+        300
+      ],
+      "mask": "photo_potion_mask.png",
+      "photo": "photo_potion.png"
+    },
+    {
+      "click": [
+        320,
+        160
+      ],
+      "mask": "photo_chalice_mask.png",
+      "photo": "photo_chalice.png"
+    },
+    {
+      "click": [
+        320,
+        200
+      ],
+      "mask": "photo_skull_mask.png",
+      "photo": "photo_skull.png"
+    }
+  ]
+}
