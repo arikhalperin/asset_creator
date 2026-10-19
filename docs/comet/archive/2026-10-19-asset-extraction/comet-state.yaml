@@ -2,8 +2,8 @@ schema: comet.native.v4
 name: asset-extraction
 language: en
 phase: archive
-status: active
-state_version: 12
+status: done
+state_version: 14
 brief: brief.md
 document_constraints_version: 1
 shape_confirmation_hash: 19ea5e6f9462e202ce5b648477690c0a35f45f48e3662f0d6a565fc84f5c6e07
@@ -15,9 +15,9 @@ workspace:
   isolation: branch
   change_branch: comet/asset-extraction
   target_branch: master
-  finish: null
+  finish: merge
 loop:
-  stage: archive-ready
+  stage: done
   goal_cycle: 3
   iteration: 1
   attempt: 1
@@ -26,7 +26,7 @@ loop:
   no_progress_count: 0
   execution_failure_count: 0
   previous_unresolved_ids: []
-  next_action: archive
+  next_action: null
 acceptance:
   - id: A1
     source: brief.md
@@ -600,5 +600,5 @@ history_overflow:
     recovery: 0
 verification_result: pass
 verification_report: verification.md
-archived: false
+archived: true
 created_at: 2026-10-18T15:16:22.541Z
