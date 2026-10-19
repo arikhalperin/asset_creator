@@ -23,10 +23,11 @@ pub enum Tool {
     Gradient,
     CloneStamp,
     Move,
+    ExtractObject,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 12] = [
+    pub const ALL: [Tool; 13] = [
         Self::Move,
         Self::RectSelect,
         Self::EllipseSelect,
@@ -39,6 +40,7 @@ impl Tool {
         Self::PaintBucket,
         Self::Gradient,
         Self::CloneStamp,
+        Self::ExtractObject,
     ];
 
     pub fn label(self) -> &'static str {
@@ -55,6 +57,7 @@ impl Tool {
             Self::Gradient => "Gradient",
             Self::CloneStamp => "Clone Stamp",
             Self::Move => "Move",
+            Self::ExtractObject => "Extract Object",
         }
     }
 
@@ -96,6 +99,7 @@ impl Tool {
             Self::PaintBucket | Self::Gradient => "G",
             Self::CloneStamp => "S",
             Self::Move => "V",
+            Self::ExtractObject => "O",
         }
     }
 

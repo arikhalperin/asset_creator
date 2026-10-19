@@ -222,6 +222,8 @@ pub struct AppState {
     untitled_count: u32,
     /// Frames extracted from videos this session.
     pub frame_set: FrameSet,
+    /// Assets extracted this session.
+    pub assets: crate::asset_library::AssetLibrary,
 }
 
 impl AppState {
