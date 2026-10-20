@@ -2,8 +2,8 @@ schema: comet.native.v4
 name: video-asset-grouping
 language: en
 phase: archive
-status: active
-state_version: 43
+status: done
+state_version: 45
 brief: brief.md
 document_constraints_version: 1
 shape_confirmation_hash: 18448b626be6babd89e59b4471c12b3590d79d6fc67529f2236d4c6b6a740619
@@ -15,9 +15,9 @@ workspace:
   isolation: branch
   change_branch: comet/video-asset-grouping
   target_branch: master
-  finish: null
+  finish: merge
 loop:
-  stage: archive-ready
+  stage: done
   goal_cycle: 8
   iteration: 1
   attempt: 1
@@ -26,7 +26,7 @@ loop:
   no_progress_count: 0
   execution_failure_count: 0
   previous_unresolved_ids: []
-  next_action: archive
+  next_action: null
 acceptance:
   - id: A1
     source: brief.md
@@ -766,5 +766,5 @@ history_overflow:
     recovery: 0
 verification_result: pass
 verification_report: verification.md
-archived: false
+archived: true
 created_at: 2026-10-19T09:52:36.001Z
