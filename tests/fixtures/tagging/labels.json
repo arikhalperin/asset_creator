@@ -1,0 +1,335 @@
+{
+ "categories": [
+  "chalice",
+  "skeleton",
+  "potion",
+  "deathtrap",
+  "wall",
+  "prop",
+  "other"
+ ],
+ "sprites": [
+  {
+   "file": "chalice_01.png",
+   "category": "chalice",
+   "split": "tune",
+   "pack": "Roguelike RPG Pack",
+   "source": "Spritesheet/roguelikeSheet_transparent.png row 14 col 55"
+  },
+  {
+   "file": "chalice_02.png",
+   "category": "chalice",
+   "split": "test",
+   "pack": "Roguelike RPG Pack",
+   "source": "Spritesheet/roguelikeSheet_transparent.png row 14 col 56"
+  },
+  {
+   "file": "chalice_03.png",
+   "category": "chalice",
+   "split": "tune",
+   "pack": "Roguelike RPG Pack",
+   "source": "Spritesheet/roguelikeSheet_transparent.png row 17 col 54"
+  },
+  {
+   "file": "chalice_04.png",
+   "category": "chalice",
+   "split": "test",
+   "pack": "1-Bit Pack",
+   "source": "Tilesheet/colored-transparent_packed.png row 16 col 40"
+  },
+  {
+   "file": "skeleton_01.png",
+   "category": "skeleton",
+   "split": "tune",
+   "pack": "1-Bit Pack",
+   "source": "Tilesheet/colored-transparent_packed.png row 6 col 29"
+  },
+  {
+   "file": "skeleton_02.png",
+   "category": "skeleton",
+   "split": "test",
+   "pack": "1-Bit Pack",
+   "source": "Tilesheet/colored-transparent_packed.png row 12 col 34"
+  },
+  {
+   "file": "skeleton_03.png",
+   "category": "skeleton",
+   "split": "tune",
+   "pack": "1-Bit Pack",
+   "source": "Tilesheet/colored-transparent_packed.png row 4 col 31"
+  },
+  {
+   "file": "skeleton_04.png",
+   "category": "skeleton",
+   "split": "test",
+   "pack": "1-Bit Pack",
+   "source": "Tilesheet/colored-transparent_packed.png row 11 col 38"
+  },
+  {
+   "file": "potion_01.png",
+   "category": "potion",
+   "split": "tune",
+   "pack": "Tiny Dungeon",
+   "source": "Tiles/tile_0113.png"
+  },
+  {
+   "file": "potion_02.png",
+   "category": "potion",
+   "split": "test",
+   "pack": "Tiny Dungeon",
+   "source": "Tiles/tile_0114.png"
+  },
+  {
+   "file": "potion_03.png",
+   "category": "potion",
+   "split": "tune",
+   "pack": "Tiny Dungeon",
+   "source": "Tiles/tile_0115.png"
+  },
+  {
+   "file": "potion_04.png",
+   "category": "potion",
+   "split": "test",
+   "pack": "Tiny Dungeon",
+   "source": "Tiles/tile_0116.png"
+  },
+  {
+   "file": "potion_05.png",
+   "category": "potion",
+   "split": "tune",
+   "pack": "Tiny Dungeon",
+   "source": "Tiles/tile_0125.png"
+  },
+  {
+   "file": "potion_06.png",
+   "category": "potion",
+   "split": "test",
+   "pack": "Tiny Dungeon",
+   "source": "Tiles/tile_0127.png"
+  },
+  {
+   "file": "potion_07.png",
+   "category": "potion",
+   "split": "tune",
+   "pack": "1-Bit Pack",
+   "source": "Tilesheet/colored-transparent_packed.png row 13 col 32"
+  },
+  {
+   "file": "potion_08.png",
+   "category": "potion",
+   "split": "test",
+   "pack": "1-Bit Pack",
+   "source": "Tilesheet/colored-transparent_packed.png row 13 col 33"
+  },
+  {
+   "file": "potion_09.png",
+   "category": "potion",
+   "split": "tune",
+   "pack": "Roguelike RPG Pack",
+   "source": "Spritesheet/roguelikeSheet_transparent.png row 11 col 55"
+  },
+  {
+   "file": "potion_10.png",
+   "category": "potion",
+   "split": "test",
+   "pack": "Roguelike RPG Pack",
+   "source": "Spritesheet/roguelikeSheet_transparent.png row 12 col 54"
+  },
+  {
+   "file": "deathtrap_01.png",
+   "category": "deathtrap",
+   "split": "tune",
+   "pack": "1-Bit Pack",
+   "source": "Tilesheet/colored-transparent_packed.png row 0 col 22"
+  },
+  {
+   "file": "deathtrap_02.png",
+   "category": "deathtrap",
+   "split": "test",
+   "pack": "1-Bit Pack",
+   "source": "Tilesheet/colored-transparent_packed.png row 6 col 21"
+  },
+  {
+   "file": "deathtrap_03.png",
+   "category": "deathtrap",
+   "split": "tune",
+   "pack": "1-Bit Pack",
+   "source": "Tilesheet/colored-transparent_packed.png row 6 col 22"
+  },
+  {
+   "file": "deathtrap_04.png",
+   "category": "deathtrap",
+   "split": "test",
+   "pack": "1-Bit Pack",
+   "source": "Tilesheet/colored-transparent_packed.png row 6 col 23"
+  },
+  {
+   "file": "wall_01.png",
+   "category": "wall",
+   "split": "tune",
+   "pack": "Tiny Dungeon",
+   "source": "Tiles/tile_0014.png"
+  },
+  {
+   "file": "wall_02.png",
+   "category": "wall",
+   "split": "test",
+   "pack": "Tiny Dungeon",
+   "source": "Tiles/tile_0028.png"
+  },
+  {
+   "file": "wall_03.png",
+   "category": "wall",
+   "split": "tune",
+   "pack": "Tiny Dungeon",
+   "source": "Tiles/tile_0040.png"
+  },
+  {
+   "file": "wall_04.png",
+   "category": "wall",
+   "split": "test",
+   "pack": "Tiny Dungeon",
+   "source": "Tiles/tile_0057.png"
+  },
+  {
+   "file": "wall_05.png",
+   "category": "wall",
+   "split": "tune",
+   "pack": "Tiny Dungeon",
+   "source": "Tiles/tile_0058.png"
+  },
+  {
+   "file": "wall_06.png",
+   "category": "wall",
+   "split": "test",
+   "pack": "Tiny Dungeon",
+   "source": "Tiles/tile_0059.png"
+  },
+  {
+   "file": "prop_01.png",
+   "category": "prop",
+   "split": "tune",
+   "pack": "Tiny Dungeon",
+   "source": "Tiles/tile_0063.png"
+  },
+  {
+   "file": "prop_02.png",
+   "category": "prop",
+   "split": "test",
+   "pack": "Tiny Dungeon",
+   "source": "Tiles/tile_0072.png"
+  },
+  {
+   "file": "prop_03.png",
+   "category": "prop",
+   "split": "tune",
+   "pack": "Tiny Dungeon",
+   "source": "Tiles/tile_0073.png"
+  },
+  {
+   "file": "prop_04.png",
+   "category": "prop",
+   "split": "test",
+   "pack": "Tiny Dungeon",
+   "source": "Tiles/tile_0075.png"
+  },
+  {
+   "file": "prop_05.png",
+   "category": "prop",
+   "split": "tune",
+   "pack": "Tiny Dungeon",
+   "source": "Tiles/tile_0082.png"
+  },
+  {
+   "file": "prop_06.png",
+   "category": "prop",
+   "split": "test",
+   "pack": "Tiny Dungeon",
+   "source": "Tiles/tile_0089.png"
+  },
+  {
+   "file": "prop_07.png",
+   "category": "prop",
+   "split": "tune",
+   "pack": "Tiny Dungeon",
+   "source": "Tiles/tile_0090.png"
+  },
+  {
+   "file": "prop_08.png",
+   "category": "prop",
+   "split": "test",
+   "pack": "Tiny Dungeon",
+   "source": "Tiles/tile_0091.png"
+  },
+  {
+   "file": "prop_09.png",
+   "category": "prop",
+   "split": "tune",
+   "pack": "Roguelike RPG Pack",
+   "source": "Spritesheet/roguelikeSheet_transparent.png row 12 col 46"
+  },
+  {
+   "file": "other_01.png",
+   "category": "other",
+   "split": "tune",
+   "pack": "Tiny Dungeon",
+   "source": "Tiles/tile_0084.png"
+  },
+  {
+   "file": "other_02.png",
+   "category": "other",
+   "split": "test",
+   "pack": "Tiny Dungeon",
+   "source": "Tiles/tile_0085.png"
+  },
+  {
+   "file": "other_03.png",
+   "category": "other",
+   "split": "tune",
+   "pack": "Tiny Dungeon",
+   "source": "Tiles/tile_0096.png"
+  },
+  {
+   "file": "other_04.png",
+   "category": "other",
+   "split": "test",
+   "pack": "Tiny Dungeon",
+   "source": "Tiles/tile_0104.png"
+  },
+  {
+   "file": "other_05.png",
+   "category": "other",
+   "split": "tune",
+   "pack": "Tiny Dungeon",
+   "source": "Tiles/tile_0117.png"
+  },
+  {
+   "file": "other_06.png",
+   "category": "other",
+   "split": "test",
+   "pack": "Tiny Dungeon",
+   "source": "Tiles/tile_0121.png"
+  },
+  {
+   "file": "other_07.png",
+   "category": "other",
+   "split": "tune",
+   "pack": "Tiny Dungeon",
+   "source": "Tiles/tile_0122.png"
+  },
+  {
+   "file": "other_08.png",
+   "category": "other",
+   "split": "test",
+   "pack": "1-Bit Pack",
+   "source": "Tilesheet/colored-transparent_packed.png row 7 col 28"
+  },
+  {
+   "file": "other_09.png",
+   "category": "other",
+   "split": "tune",
+   "pack": "1-Bit Pack",
+   "source": "Tilesheet/colored-transparent_packed.png row 0 col 25"
+  }
+ ]
+}

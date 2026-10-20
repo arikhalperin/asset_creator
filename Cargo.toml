@@ -28,6 +28,8 @@ ndarray = "0.17"
 ureq = "3"
 sha2 = "0.10"
 dirs = "6"
+# CLIP text tokenizer (tokenizer.json).
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "webp"] }
 png = "0.18"
 rfd = "0.17"
