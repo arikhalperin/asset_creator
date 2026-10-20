@@ -29,6 +29,9 @@ fn main() -> eframe::Result {
         Box::new(move |cc| {
             let mut app = EditorApp::new();
             app.set_repaint_context(&cc.egui_ctx);
+            // The persistent asset library (app data folder).
+            app.open_library(&game_asset_creator::asset_library::AssetLibrary::default_dir());
+            app.set_tag_config(game_asset_creator::library::tagger::TagConfig::default());
             for path in &paths {
                 app.open_path(path);
             }

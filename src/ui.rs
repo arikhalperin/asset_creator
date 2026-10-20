@@ -8,20 +8,24 @@ use egui_dock::tab_viewer::OnCloseResponse;
 use egui_dock::{DockArea, DockState, NodeIndex, TabViewer};
 
 use crate::app_state::{AppState, DocId, EditTarget};
+use crate::asset_library::{AssetLibrary, CategorySource, Origin};
 use crate::canvas::{self, CanvasState, ViewAction};
 use crate::canvas::{CanvasEvent, PointMode, TransformBox};
 use crate::document::DEFAULT_DPI;
 use crate::extract::segment::{self, Availability, Engine, Prompt, Segmenter};
 use crate::extract::{self as extraction, keying::RemoveBackground, models};
 use crate::extract_ui::{
-    asset_library_panel, draw_overlays, AssetAction, AssetLibraryView, AutoDetectDialog,
-    DetectOutcome, ExtractSession, RemoveBackgroundDialog,
+    draw_overlays, AssetAction, AutoDetectDialog, DetectOutcome, ExtractSession,
+    RemoveBackgroundDialog,
 };
 use crate::filter_dialog::{self, DialogOutcome, FilterDialog};
 use crate::filters::{self, ParamValue, Params};
 use crate::io::FileFormat;
 use crate::layers::{self, LayerProps};
 use crate::layers_panel::{layers_panel, LayerAction, LayerOp};
+use crate::library::pack::{self, ExportFormat};
+use crate::library::tagger::{TagConfig, TagEvent, TagJob, Tagger};
+use crate::library_ui::{library_panel, library_windows, LibraryAction, LibraryView, TagStatus};
 use crate::paint::{
     self, mask_gray, BucketFill, GradientColors, GradientFill, GradientKind, StrokeKind,
 };
@@ -330,7 +334,16 @@ pub struct EditorApp {
     download_error: Option<String>,
     consent: Consent,
     next_request: u64,
-    asset_view: AssetLibraryView,
+    asset_view: LibraryView,
+    /// Auto-tagging worker (created on the first tagging request).
+    tagger: Option<Tagger>,
+    tag_config: TagConfig,
+    tag_availability: Option<Availability>,
+    tag_consent: Consent,
+    tag_download: Option<models::Download>,
+    tag_note: Option<String>,
+    /// Asset ids already sent for automatic tagging this session.
+    tag_queued: std::collections::HashSet<u64>,
     video_assets: Option<VideoAssetsDialog>,
     reviews: HashMap<ReviewId, ReviewTab>,
     next_review: u64,
@@ -386,7 +399,16 @@ impl EditorApp {
             download_error: None,
             consent: Consent::NotAsked,
             next_request: 0,
-            asset_view: AssetLibraryView::default(),
+            asset_view: LibraryView::default(),
+            tagger: None,
+            // The app enables the real configuration at startup (main.rs);
+            // a fresh editor (tests, embedding) does not look for models.
+            tag_config: TagConfig::disabled(),
+            tag_availability: None,
+            tag_consent: Consent::NotAsked,
+            tag_download: None,
+            tag_note: None,
+            tag_queued: std::collections::HashSet::new(),
             video_assets: None,
             reviews: HashMap::new(),
             next_review: 0,
@@ -444,8 +466,9 @@ impl EditorApp {
                 self.video_assets = None;
                 self.next_review += 1;
                 let id = ReviewId(self.next_review);
-                self.reviews
-                    .insert(id, ReviewTab::new(info.name.clone(), info.fps(), clusters));
+                let mut review = ReviewTab::new(info.name.clone(), info.fps(), clusters);
+                review.video_path = Some(info.path.clone());
+                self.reviews.insert(id, review);
                 self.add_center_tab(Tab::Review(id));
             }
             Some(Err(e)) => dialog.error = Some(e),
@@ -498,6 +521,7 @@ impl EditorApp {
         };
         let (mut singles, mut animations) = (0, 0);
         let video = review.video.clone();
+        let video_file = review.video_path.as_ref().map(|p| p.display().to_string());
         let kept: Vec<_> = review
             .clusters
             .iter()
@@ -511,12 +535,26 @@ impl EditorApp {
                 let images: Vec<image::RgbaImage> =
                     cluster.poses.iter().map(|p| p.image.clone()).collect();
                 let frames = extraction::video::align_frames(&images);
-                self.state.assets.add_animation(&video, frames, first.rect);
-                animations += 1;
-            } else {
+                let origin = Origin {
+                    file: video_file.clone(),
+                    frame: Some(first.frame),
+                    method: "video".to_owned(),
+                    params: serde_json::json!({"poses": cluster.poses.len(), "seen_in_frames": cluster.frames.len()}),
+                };
                 self.state
                     .assets
-                    .add(&video, first.image.clone(), first.rect);
+                    .add_animation_with(&video, frames, first.rect, origin);
+                animations += 1;
+            } else {
+                let origin = Origin {
+                    file: video_file.clone(),
+                    frame: Some(first.frame),
+                    method: "video".to_owned(),
+                    params: serde_json::json!({"seen_in_frames": cluster.frames.len()}),
+                };
+                self.state
+                    .assets
+                    .add_with(&video, first.image.clone(), first.rect, origin);
                 singles += 1;
             }
         }
@@ -683,8 +721,13 @@ impl EditorApp {
         let name = self.document_name(dialog.doc);
         let crops = dialog.crops();
         let added = crops.len();
+        let params = serde_json::json!({
+            "min_size": dialog.params.min_size,
+            "merge_distance": dialog.params.merge_distance,
+        });
         for (image, rect) in crops {
-            self.state.assets.add(&name, image, rect);
+            let origin = self.origin_of(dialog.doc, "auto_detect", params.clone());
+            self.state.assets.add_with(&name, image, rect, origin);
         }
         self.after_assets_added(added);
         added
@@ -720,6 +763,7 @@ impl EditorApp {
     }
 
     fn after_assets_added(&mut self, added: usize) {
+        self.queue_untagged();
         if added > 0 {
             self.status_message = Some(format!(
                 "Added {added} asset{} to the Asset Library",
@@ -748,9 +792,24 @@ impl EditorApp {
             return false;
         };
         let name = self.document_name(id);
-        self.state.assets.add(&name, image, rect);
+        let origin = self.origin_of(id, "selection", serde_json::Value::Null);
+        self.state.assets.add_with(&name, image, rect, origin);
         self.after_assets_added(1);
         true
+    }
+
+    /// The origin of an asset extracted from document `id`.
+    fn origin_of(&self, id: DocId, method: &str, params: serde_json::Value) -> Origin {
+        Origin {
+            file: self
+                .state
+                .document(id)
+                .and_then(|o| o.document.source_path.as_ref())
+                .map(|p| p.display().to_string()),
+            frame: None,
+            method: method.to_owned(),
+            params,
+        }
     }
 
     // --- Extract Object -----------------------------------------------------
@@ -868,7 +927,17 @@ impl EditorApp {
             return false;
         };
         let name = self.document_name(doc);
-        self.state.assets.add(&name, image, rect);
+        let engine = match session.mask.as_ref().map(|m| m.1) {
+            Some(Engine::Sam) => "MobileSAM",
+            _ => "GrabCut",
+        };
+        let params = serde_json::json!({
+            "engine": engine,
+            "points": session.prompt.points,
+            "box": session.prompt.rect,
+        });
+        let origin = self.origin_of(doc, "extract_object", params);
+        self.state.assets.add_with(&name, image, rect, origin);
         self.extract = None;
         self.after_assets_added(1);
         true
@@ -1051,12 +1120,302 @@ impl EditorApp {
 
     // --- Asset Library -------------------------------------------------------
 
-    pub fn asset_view(&self) -> &AssetLibraryView {
+    pub fn asset_view(&self) -> &LibraryView {
         &self.asset_view
     }
 
-    pub fn asset_view_mut(&mut self) -> &mut AssetLibraryView {
+    pub fn asset_view_mut(&mut self) -> &mut LibraryView {
         &mut self.asset_view
+    }
+
+    /// Opens the persistent library kept in `dir` (replacing the in-memory
+    /// one; the app opens the default folder at startup).
+    pub fn open_library(&mut self, dir: &Path) {
+        self.state.assets = AssetLibrary::open(dir);
+        self.asset_view = LibraryView::default();
+        self.tag_queued.clear();
+        self.queue_untagged_if_installed();
+    }
+
+    /// Tags assets left untagged (e.g. from an earlier session) when the
+    /// tagging model is already installed — never asks to download at startup.
+    fn queue_untagged_if_installed(&mut self) {
+        if !self.tag_config.runtime_paths.is_empty()
+            && models::present_set(&models::CLIP, &self.tag_config.model_dir)
+        {
+            self.queue_untagged();
+        }
+    }
+
+    /// Where auto-tagging looks for ONNX Runtime and the model (tests point
+    /// it elsewhere). Takes effect before the first tagging request.
+    pub fn set_tag_config(&mut self, config: TagConfig) {
+        self.tag_config = config;
+        self.queue_untagged_if_installed();
+    }
+
+    pub fn tag_consent(&self) -> Consent {
+        self.tag_consent
+    }
+
+    pub fn tag_availability(&self) -> Option<&Availability> {
+        self.tag_availability.as_ref()
+    }
+
+    pub fn tagger_started(&self) -> bool {
+        self.tagger.is_some()
+    }
+
+    /// Whether tagging work is still queued or running.
+    pub fn tagging_busy(&self) -> bool {
+        self.tagger.as_ref().is_some_and(|t| t.pending() > 0)
+            || self.state.assets.assets().iter().any(|a| {
+                a.category_source == CategorySource::None
+                    && self.tag_queued.contains(&a.id)
+                    && self.tag_note.is_none()
+            })
+    }
+
+    /// Queues assets for tagging (`force`: replace manual categories too).
+    pub fn queue_tagging(&mut self, ids: &[u64], force: bool) {
+        let jobs: Vec<TagJob> = ids
+            .iter()
+            .filter_map(|&id| {
+                self.state.assets.get(id).map(|a| TagJob {
+                    id,
+                    image: a.image.clone(),
+                    force,
+                })
+            })
+            .collect();
+        if jobs.is_empty() {
+            return;
+        }
+        self.tag_queued.extend(ids);
+        if self.tagger.is_none() {
+            self.tagger = Some(Tagger::new(self.tag_config.clone(), self.notify()));
+        }
+        let categories = self.state.assets.categories().to_vec();
+        if let Some(t) = &self.tagger {
+            t.tag(jobs, categories);
+        }
+    }
+
+    /// Sends assets that have no category yet (and were not sent) to the tagger.
+    fn queue_untagged(&mut self) {
+        let ids: Vec<u64> = self
+            .state
+            .assets
+            .assets()
+            .iter()
+            .filter(|a| {
+                a.category_source == CategorySource::None && !self.tag_queued.contains(&a.id)
+            })
+            .map(|a| a.id)
+            .collect();
+        self.queue_tagging(&ids, false);
+    }
+
+    /// Handles tagging results and the model download.
+    pub fn pump_tagging(&mut self) {
+        let events = self.tagger.as_ref().map(Tagger::poll).unwrap_or_default();
+        for event in events {
+            match event {
+                TagEvent::Availability(a) => {
+                    if matches!(a, Availability::NeedsModels(_))
+                        && self.tag_consent == Consent::NotAsked
+                        && self.tag_download.is_none()
+                    {
+                        self.tag_consent = Consent::Asking;
+                    }
+                    if a == Availability::Ready {
+                        self.tag_note = None;
+                    }
+                    self.tag_availability = Some(a);
+                }
+                TagEvent::Tagged {
+                    id,
+                    category,
+                    confidence,
+                    force,
+                } => {
+                    self.state
+                        .assets
+                        .apply_auto_tag(id, &category, confidence, force);
+                }
+                TagEvent::Skipped { reason, .. } => self.tag_note = Some(reason),
+            }
+        }
+        let finished = self.tag_download.as_mut().and_then(|d| d.result().cloned());
+        match finished {
+            Some(Ok(())) => {
+                self.tag_download = None;
+                if let Some(t) = &self.tagger {
+                    t.reprobe();
+                }
+                // Tag what was added while the model was missing.
+                self.tag_queued.clear();
+                self.queue_untagged();
+            }
+            Some(Err(e)) => {
+                self.tag_download = None;
+                self.tag_note = Some(e);
+            }
+            None => {}
+        }
+    }
+
+    pub fn start_tag_download(&mut self) {
+        if self.tag_download.is_some() {
+            return;
+        }
+        self.tag_consent = Consent::Accepted;
+        self.tag_note = None;
+        self.tag_download = Some(models::Download::start_set(
+            models::CLIP,
+            self.tag_config.source.clone(),
+            self.tag_config.model_dir.clone(),
+            self.notify(),
+        ));
+    }
+
+    pub fn decline_tag_download(&mut self) {
+        self.tag_consent = Consent::Declined;
+    }
+
+    pub fn tag_download_in_progress(&self) -> bool {
+        self.tag_download.is_some()
+    }
+
+    /// The tagging status line of the Library panel.
+    pub fn tag_status(&self) -> TagStatus {
+        let can_download = self.tag_download.is_none()
+            && matches!(self.tag_availability, Some(Availability::NeedsModels(_)));
+        let text = if let Some(d) = &self.tag_download {
+            format!(
+                "Downloading the tagging model… {:.0} %",
+                d.progress() * 100.0
+            )
+        } else {
+            match (&self.tag_availability, &self.tag_note) {
+                (Some(Availability::Ready), _) => "Auto-tag: OpenCLIP".to_owned(),
+                (_, Some(note)) => format!("Auto-tag off — {note}; new assets get \"other\""),
+                (None, None) => "Auto-tag: loads when the first asset is added".to_owned(),
+                (Some(Availability::NeedsModels(_)), None) => {
+                    "Auto-tag off — the tagging model is not installed".to_owned()
+                }
+                (Some(Availability::Unavailable(r)), None) => format!("Auto-tag off — {r}"),
+            }
+        };
+        TagStatus { text, can_download }
+    }
+
+    fn show_tag_consent_window(&mut self, ctx: &egui::Context) {
+        if self.tag_consent != Consent::Asking {
+            return;
+        }
+        let mut answer = None;
+        egui::Window::new("Download the tagging model?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "The Asset Library can tag assets automatically with OpenCLIP (MIT license).\nDownload it now (about {} MB) into\n{}?\nUntil then, new assets get \"other\" and you can tag them by hand.",
+                    models::CLIP.total_size() / 1_000_000,
+                    self.tag_config.model_dir.display()
+                ));
+                ui.horizontal(|ui| {
+                    if ui.button("Download").clicked() {
+                        answer = Some(true);
+                    }
+                    if ui.button("Not now").clicked() {
+                        answer = Some(false);
+                    }
+                });
+            });
+        match answer {
+            Some(true) => self.start_tag_download(),
+            Some(false) => self.decline_tag_download(),
+            None => {}
+        }
+    }
+
+    /// Exports assets `ids` in `format` to `target` (folder or sheet file).
+    pub fn export_assets(
+        &mut self,
+        ids: &[u64],
+        format: ExportFormat,
+        target: &Path,
+    ) -> Result<Vec<PathBuf>, String> {
+        let assets: Vec<_> = ids
+            .iter()
+            .filter_map(|id| self.state.assets.get(*id))
+            .collect();
+        let result = pack::export(&assets, format, target);
+        match &result {
+            Ok(files) => {
+                self.status_message = Some(format!(
+                    "Exported {} file{}",
+                    files.len(),
+                    if files.len() == 1 { "" } else { "s" }
+                ))
+            }
+            Err(e) => self.error = Some(format!("Export failed: {e}")),
+        }
+        result
+    }
+
+    /// Runs a Library panel action; `Open` returns the new document.
+    pub fn library_action(&mut self, action: LibraryAction) -> Option<DocId> {
+        match action {
+            LibraryAction::Open(id) => return self.asset_action(AssetAction::Open(id)),
+            LibraryAction::Rename(id, name) => {
+                self.state.assets.rename(id, &name);
+            }
+            LibraryAction::SetCategory(ids, c) => self.state.assets.set_category(&ids, &c),
+            LibraryAction::SetTags(id, tags) => self.state.assets.set_tags(id, tags),
+            LibraryAction::Remove(ids) => {
+                self.state.assets.remove(&ids);
+            }
+            LibraryAction::AddCategory(c) => {
+                self.state.assets.add_category(&c);
+            }
+            LibraryAction::RenameCategory(from, to) => {
+                self.state.assets.rename_category(&from, &to);
+            }
+            LibraryAction::RemoveCategory(c) => {
+                self.state.assets.remove_category(&c);
+            }
+            LibraryAction::AutoTag(ids) => self.queue_tagging(&ids, true),
+            LibraryAction::DownloadTagger => self.start_tag_download(),
+            LibraryAction::Reveal(id) => {
+                if let (Some(dir), Some(a)) = (self.state.assets.dir(), self.state.assets.get(id)) {
+                    let file = if a.is_animation() {
+                        format!("{id}_01.png")
+                    } else {
+                        format!("{id}.png")
+                    };
+                    let _ = std::process::Command::new("open")
+                        .arg("-R")
+                        .arg(dir.join("assets").join(file))
+                        .spawn();
+                }
+            }
+            LibraryAction::Export(ids, format) => {
+                let target = match format {
+                    ExportFormat::Sheet(_) => rfd::FileDialog::new()
+                        .set_file_name("sprites.png")
+                        .add_filter("PNG", &["png"])
+                        .save_file(),
+                    _ => rfd::FileDialog::new().pick_folder(),
+                };
+                if let Some(target) = target {
+                    let _ = self.export_assets(&ids, format, &target);
+                }
+            }
+        }
+        None
     }
 
     /// Saves asset `id` as a PNG at `path`.
@@ -2342,6 +2701,7 @@ impl EditorApp {
         self.pump_videos(ui.ctx());
         self.pump_extraction();
         self.pump_video_assets();
+        self.pump_tagging();
         let checker = self
             .checker
             .get_or_insert_with(|| canvas::checker_texture(ui.ctx()))
@@ -2407,6 +2767,7 @@ impl EditorApp {
         let mut video_actions = Vec::new();
         let mut frame_set_actions = Vec::new();
         let mut asset_actions = Vec::new();
+        let tag_status = self.tag_status();
         let mut review_actions = Vec::new();
         let mut closed_reviews = Vec::new();
         egui::CentralPanel::default()
@@ -2437,6 +2798,7 @@ impl EditorApp {
                     picking: self.remove_background.as_ref().is_some_and(|d| d.picking),
                     asset_view: &mut self.asset_view,
                     asset_actions: &mut asset_actions,
+                    tag_status: tag_status.clone(),
                     reviews: &mut self.reviews,
                     review_actions: &mut review_actions,
                     closed_reviews: &mut closed_reviews,
@@ -2477,8 +2839,13 @@ impl EditorApp {
         for action in frame_set_actions {
             self.frame_set_action(action);
         }
+        asset_actions.extend(library_windows(
+            ui.ctx(),
+            &self.state.assets,
+            &mut self.asset_view,
+        ));
         for action in asset_actions {
-            self.asset_action(action);
+            self.library_action(action);
         }
         for id in closed_reviews {
             self.reviews.remove(&id);
@@ -2532,6 +2899,7 @@ impl EditorApp {
         self.show_remove_background_window(ui.ctx());
         self.show_auto_detect_window(ui.ctx());
         self.show_consent_window(ui.ctx());
+        self.show_tag_consent_window(ui.ctx());
         self.show_prompt_window(ui.ctx());
         self.show_error_window(ui.ctx());
 
@@ -3360,8 +3728,9 @@ struct Viewer<'a> {
     auto_detect: Option<&'a AutoDetectDialog>,
     /// Remove Background's Pick: canvas clicks sample a color.
     picking: bool,
-    asset_view: &'a mut AssetLibraryView,
-    asset_actions: &'a mut Vec<AssetAction>,
+    asset_view: &'a mut LibraryView,
+    asset_actions: &'a mut Vec<LibraryAction>,
+    tag_status: TagStatus,
     reviews: &'a mut HashMap<ReviewId, ReviewTab>,
     review_actions: &'a mut Vec<(ReviewId, ReviewAction)>,
     closed_reviews: &'a mut Vec<ReviewId>,
@@ -3412,7 +3781,8 @@ impl TabViewer for Viewer<'_> {
                 self.layer_actions.extend(actions);
             }
             Tab::Panel(Panel::AssetLibrary) => {
-                let actions = asset_library_panel(ui, &self.state.assets, self.asset_view);
+                let actions =
+                    library_panel(ui, &self.state.assets, self.asset_view, &self.tag_status);
                 self.asset_actions.extend(actions);
             }
             Tab::Panel(Panel::FrameSet) => {
@@ -3458,6 +3828,8 @@ impl TabViewer for Viewer<'_> {
         // The canvas handles its own scrolling.
         match tab {
             Tab::Document(_) | Tab::Video(_) | Tab::Review(_) => [false, false],
+            // The library wraps to the panel's width and scrolls its own grid.
+            Tab::Panel(Panel::AssetLibrary) => [false, false],
             Tab::Panel(_) => [true, true],
         }
     }

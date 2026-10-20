@@ -1,13 +1,10 @@
 //! Extraction UI: the Remove Background and Auto-Detect Objects dialogs, the
 //! Extract Object session, canvas overlays, and the Asset Library panel.
 
-use std::collections::{BTreeSet, HashMap};
-
-use egui::{Color32, Pos2, Rect, Sense, Stroke, TextureHandle, TextureOptions, Vec2};
+use egui::{Color32, Pos2, Rect, Stroke, TextureHandle, TextureOptions, Vec2};
 use image::{GrayImage, RgbaImage};
 
 use crate::app_state::DocId;
-use crate::asset_library::AssetLibrary;
 use crate::canvas::ViewState;
 use crate::document::PixelRect;
 use crate::extract::detect::{self, DetectParams, Proposal};
@@ -420,13 +417,6 @@ pub fn draw_overlays(
 // ---------------------------------------------------------------------------
 // Asset Library panel
 
-/// Selection and texture cache of the Asset Library panel.
-#[derive(Default)]
-pub struct AssetLibraryView {
-    pub selected: BTreeSet<u64>,
-    textures: HashMap<(u64, usize), TextureHandle>,
-}
-
 /// What the user did in the Asset Library panel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssetAction {
@@ -434,149 +424,4 @@ pub enum AssetAction {
     SaveAll,
     Open(u64),
     Remove(Vec<u64>),
-}
-
-const THUMB: f32 = 48.0;
-
-pub fn asset_library_panel(
-    ui: &mut egui::Ui,
-    library: &AssetLibrary,
-    view: &mut AssetLibraryView,
-) -> Vec<AssetAction> {
-    let mut actions = Vec::new();
-    view.textures
-        .retain(|(id, _), _| library.get(*id).is_some());
-    view.selected.retain(|id| library.get(*id).is_some());
-    let single = (view.selected.len() == 1).then(|| *view.selected.first().expect("one selected"));
-    ui.horizontal_wrapped(|ui| {
-        ui.label(format!(
-            "{} asset{}",
-            library.len(),
-            if library.len() == 1 { "" } else { "s" }
-        ));
-        if ui
-            .add_enabled(single.is_some(), egui::Button::new("Save PNG…"))
-            .clicked()
-        {
-            actions.push(AssetAction::SavePng(single.expect("enabled with one")));
-        }
-        if ui
-            .add_enabled(!library.is_empty(), egui::Button::new("Save All…"))
-            .clicked()
-        {
-            actions.push(AssetAction::SaveAll);
-        }
-        if ui
-            .add_enabled(single.is_some(), egui::Button::new("Open as Document"))
-            .clicked()
-        {
-            actions.push(AssetAction::Open(single.expect("enabled with one")));
-        }
-        if ui
-            .add_enabled(!view.selected.is_empty(), egui::Button::new("Remove"))
-            .clicked()
-        {
-            actions.push(AssetAction::Remove(view.selected.iter().copied().collect()));
-        }
-    });
-    if library.is_empty() {
-        ui.weak("Extracted assets appear here (Extract menu, or the Extract Object tool).");
-        return actions;
-    }
-    ui.separator();
-    let modifiers = ui.input(|i| i.modifiers);
-    let ids: Vec<u64> = library.assets().iter().map(|a| a.id).collect();
-    for asset in library.assets() {
-        // A thumbnail, or a filmstrip of up to four frames for an animation.
-        let frames = asset.all_frames();
-        let shown = frames.len().min(4);
-        let textures: Vec<TextureHandle> = (0..shown)
-            .map(|i| {
-                let image = frames[i];
-                view.textures
-                    .entry((asset.id, i))
-                    .or_insert_with(|| {
-                        let c = egui::ColorImage::from_rgba_unmultiplied(
-                            [image.width() as usize, image.height() as usize],
-                            image.as_raw(),
-                        );
-                        ui.ctx().load_texture(
-                            format!("asset-{}-{i}", asset.id),
-                            c,
-                            TextureOptions::LINEAR,
-                        )
-                    })
-                    .clone()
-            })
-            .collect();
-        let selected = view.selected.contains(&asset.id);
-        let response = ui
-            .horizontal(|ui| {
-                let (w, h) = (asset.image.width() as f32, asset.image.height() as f32);
-                let scale = (THUMB / w).min(THUMB / h).min(4.0);
-                for texture in &textures {
-                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(THUMB), Sense::hover());
-                    ui.painter()
-                        .rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
-                    ui.painter().image(
-                        texture.id(),
-                        Rect::from_center_size(rect.center(), Vec2::new(w, h) * scale),
-                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                        Color32::WHITE,
-                    );
-                }
-                ui.vertical(|ui| {
-                    ui.label(&asset.name);
-                    if asset.is_animation() {
-                        ui.small(format!(
-                            "{} frames, {} × {}",
-                            frames.len(),
-                            asset.image.width(),
-                            asset.image.height()
-                        ));
-                    } else {
-                        ui.small(format!(
-                            "{} × {}",
-                            asset.image.width(),
-                            asset.image.height()
-                        ));
-                    }
-                });
-            })
-            .response;
-        let response = ui.interact(
-            response.rect,
-            ui.id().with(("asset", asset.id)),
-            Sense::click(),
-        );
-        if selected {
-            ui.painter().rect_stroke(
-                response.rect.expand(1.0),
-                2.0,
-                Stroke::new(2.0, ui.visuals().selection.stroke.color),
-                egui::StrokeKind::Inside,
-            );
-        }
-        if response.double_clicked() {
-            actions.push(AssetAction::Open(asset.id));
-        } else if response.clicked() {
-            if modifiers.command {
-                if !view.selected.remove(&asset.id) {
-                    view.selected.insert(asset.id);
-                }
-            } else if modifiers.shift && !view.selected.is_empty() {
-                let anchor = ids
-                    .iter()
-                    .position(|id| view.selected.contains(id))
-                    .unwrap_or(0);
-                let here = ids.iter().position(|id| *id == asset.id).unwrap_or(0);
-                view.selected
-                    .extend(&ids[anchor.min(here)..=anchor.max(here)]);
-            } else {
-                view.selected.clear();
-                view.selected.insert(asset.id);
-            }
-        }
-    }
-    actions
 }

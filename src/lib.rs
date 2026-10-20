@@ -12,6 +12,8 @@ pub mod frame_set;
 pub mod io;
 pub mod layers;
 pub mod layers_panel;
+pub mod library;
+pub mod library_ui;
 pub mod paint;
 pub mod project;
 pub mod review_ui;

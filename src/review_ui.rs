@@ -153,6 +153,8 @@ pub struct ReviewTab {
     pub video: String,
     pub fps: f64,
     pub clusters: Vec<Cluster>,
+    /// The video file (recorded as the assets' source).
+    pub video_path: Option<std::path::PathBuf>,
     pub keep: Vec<bool>,
     pub selected: BTreeSet<usize>,
     textures: HashMap<(usize, usize), TextureHandle>,
@@ -174,6 +176,7 @@ impl ReviewTab {
             video,
             fps,
             clusters,
+            video_path: None,
             selected: BTreeSet::new(),
             textures: HashMap::new(),
         }

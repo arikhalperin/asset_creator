@@ -1,0 +1,9 @@
+Sprites in this folder are from Kenney asset packs (www.kenney.nl):
+Tiny Dungeon (1.0), 1-Bit Pack, and Roguelike RPG Pack.
+
+License: Creative Commons Zero (CC0)
+http://creativecommons.org/publicdomain/zero/1.0/
+
+Each sprite was cropped to its visible pixels and scaled 4x (nearest
+neighbour). labels.json lists each file's category, split (tune/test),
+source pack, and position in that pack.
