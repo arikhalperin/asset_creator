@@ -29,6 +29,7 @@ pub enum Transport {
 pub enum VideoAction {
     Grab,
     Extract,
+    ExtractAssets,
 }
 
 /// A grabbed frame ready to open as a document.
@@ -517,6 +518,9 @@ impl VideoTab {
             }
             if ui.button("Extract Frames…").clicked() {
                 actions.push(VideoAction::Extract);
+            }
+            if ui.button("Extract Assets…").clicked() {
+                actions.push(VideoAction::ExtractAssets);
             }
         });
         actions

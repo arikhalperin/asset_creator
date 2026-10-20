@@ -1,0 +1,770 @@
+schema: comet.native.v4
+name: video-asset-grouping
+language: en
+phase: archive
+status: active
+state_version: 43
+brief: brief.md
+document_constraints_version: 1
+shape_confirmation_hash: 18448b626be6babd89e59b4471c12b3590d79d6fc67529f2236d4c6b6a740619
+spec_changes:
+  - capability: video-extraction
+    operation: create
+    source: specs/video-extraction/spec.md
+workspace:
+  isolation: branch
+  change_branch: comet/video-asset-grouping
+  target_branch: master
+  finish: null
+loop:
+  stage: archive-ready
+  goal_cycle: 8
+  iteration: 1
+  attempt: 1
+  retry_epoch: 0
+  failed_iteration_count: 4
+  no_progress_count: 0
+  execution_failure_count: 0
+  previous_unresolved_ids: []
+  next_action: archive
+acceptance:
+  - id: A1
+    source: brief.md
+    text: "A1: A video tab's Extract Assets… opens a dialog — From/To frame (default
+      the whole clip), Every N frames (default 1), Minimum Size (16 px²), Merge
+      Distance (2 px); Extract runs in the background with a progress bar and
+      Cancel (Cancel discards everything) and, when done, opens a Review tab
+      titled `<video> review`; the UI stays responsive throughout."
+    result: passed
+    reason:
+      text: "Extract Assets… button on the video tab (video_ui.rs) opens
+        VideoAssetsDialog: From 0/To last frame, Every N 1 (1-1000), Min Size 16
+        px², Merge Distance 2 px; VideoExtractJob runs on a
+        'video-extract-assets' worker thread with progress bar and Cancel
+        (result dropped when cancelled); on completion a center tab '<video>
+        review' opens. Headless tests video_extract_ui (3/3) cover defaults,
+        progress/Cancel, tab title."
+      truncated: false
+  - id: A2
+    source: brief.md
+    text: "A2: Each processed frame is keyed with the automatic background color and
+      default tolerance/softness (contiguous), keyed specks of fewer than 5
+      pixels (compression noise) are removed, and the frame is split into
+      objects with Auto-Detect; every detection is a tight transparent crop
+      recorded with its frame number and position."
+    result: passed
+    reason:
+      text: "detect_frame: KeyParams::auto keying, 8-connected keyed pieces < 5 px
+        removed, then detect::detect with dialog params; each detection a tight
+        crop (tight_crop_region) with frame number and image rect. Covered by
+        fixture tests and my probe (every crop attributed to its rendered object
+        in all passing runs)."
+      truncated: false
+  - id: A3
+    source: brief.md
+    text: "A3: Repeated appearances are deduplicated, robustly under video
+      compression for sprites whose main shape is at least 32 px on its short
+      side (tested with H.264 at crf 18–28, thin limbs, fine textures, and
+      sub-pixel motion): crops are compared by their cores (the main piece plus
+      pieces at least 10 % of its size, so compression specks are ignored) — a
+      perceptual-hash prefilter (≤ 16 reliable bits), core sizes within 3 px or
+      12 %, shape mismatch (core pixels with no core pixel within 1 px in the
+      other, best alignment with centres matched ±2 px) up to 4 %, and
+      3×3-averaged colour differences up to 12 % in every quadrant (compared in
+      phase, ±1 px) — and each object's crops are grouped adaptively (tight
+      micro-groups merged by average linkage up to that rule; for sprites under
+      32 px, further when the object's own distances show a clear gap above it —
+      larger sprites keep the rule, so a smooth series of poses each just above
+      it is never collapsed). A static object seen in 200 frames yields one
+      appearance, and a looping pose is not split by sub-pixel position,
+      texture, or compression. Limits (stated, not guaranteed): sprites under 32
+      px may still get an extra pose under heavy compression, and poses that
+      differ by less than about 4 % of the sprite's pixels may be merged — both
+      correctable in the Review tab."
+    result: passed
+    reason:
+      text: "Rule implemented as specified (hash prefilter ≤16 reliable bits, core
+        size 3 px/12 %, shape ≤4 % at centre ±2 px, 3×3 colour ≤12 % per
+        quadrant ±1 px; average-linkage grouping, gap extension only when median
+        core short side < 32). New independent probe (render-level ground truth,
+        crf 18/23/28, keyint 12-250, Every 1-4, sub-ranges): in-scope sprites
+        (core ≥32 px, poses ≥5 % apart) 240/240 lossy runs exact; near-limit
+        (poses 4.1-4.8 % apart, incl. 1.6x robot that previously collapsed to 3
+        poses) 96/96 exact; no compression pose split in any of 504 lossy runs.
+        Fixture tests shapes/moving/textured pass."
+      truncated: false
+  - id: A4
+    source: brief.md
+    text: "A4: Detections are linked into objects by tracking between consecutive
+      processed frames (overlapping or nearby boxes, similar colors, similar
+      size) and by shared appearances; an object with one distinct appearance
+      becomes a single-asset cluster, one with several becomes an animation
+      cluster whose poses are ordered by first appearance in the video, with
+      repeats of a looping animation collapsed (within A3's scope and limits);
+      distinct objects, including copies recoloured in one area, stay separate."
+    result: passed
+    reason:
+      text: "Tracking + linking per spec; poses ordered by first appearance and loop
+        repeats collapsed in every in-scope run (ORDER/FRAMES/OBJSPLIT never
+        flagged in scope); similar-coloured gear crossing a 40 px arm stays
+        separate (24/24), quadrant-recoloured static copies of gears (6 sizes)
+        and pac-man stay separate. Only object merge seen: a static sprite
+        identical to one animation pose is linked into that animation, which the
+        spec's shared-appearance linking prescribes."
+      truncated: false
+  - id: A5
+    source: brief.md
+    text: 'A5: The Review tab lists clusters (single: thumbnail, "seen in N frames";
+      animation: filmstrip of its poses, "P poses, seen in N frames"), each with
+      Keep (default) / Discard; Merge combines two or more selected rows into
+      one animation (poses deduplicated and ordered by first appearance); Add
+      Kept to Library adds kept clusters and closes the tab; discarded clusters
+      are not added.'
+    result: passed
+    reason:
+      text: "ReviewTab: single rows 'Single: seen in N frames' + thumbnail, animation
+        rows filmstrip + 'Animation: P poses, seen in N frames', Keep default
+        on, click/Cmd/Shift selection, Merge (≥2 rows) via Cluster::merge (dedup
+        + first-appearance order), Add Kept to Library adds kept only and closes
+        the tab; tests discard_and_merge_in_the_review_tab and
+        cancel_or_closing_the_review_discards_the_run pass."
+      truncated: false
+  - id: A6
+    source: brief.md
+    text: 'A6: Animation entries in the Asset Library show a filmstrip thumbnail,
+      the name `<video stem> animation <n>`, and the frame count; their frames
+      share one size (the largest pose; each pose bottom-centre aligned); Save
+      PNG… writes `<name>_01.png`, `<name>_02.png`, … , Save All writes the
+      sequences too, Open as Document opens one layer per frame ("Frame 1", …);
+      the `AssetLibrary` API exposes the frames.'
+    result: passed
+    reason:
+      text: add_animation names '<stem> animation <n>', align_frames gives shared
+        largest canvas bottom-centred; library row shows filmstrip and 'P
+        frames, W × H'; Save PNG writes <name>_01.png… (2+ digits), Save All
+        writes sequences, Open as Document gives one layer per frame 'Frame 1'
+        at bottom; Asset::is_animation/all_frames/frames API. Unit + UI tests
+        pass.
+      truncated: false
+  - id: A7
+    source: brief.md
+    text: "A7: On the fixture clip (200 frames: a skeleton looping an 8-pose walk
+      while moving across a flat background, and a static potion), Extract
+      Assets… with default settings and Add Kept to Library yields exactly one
+      single potion asset and one 8-frame skeleton animation whose frames are
+      the walk's poses in order."
+    result: passed
+    reason:
+      text: "walk.mp4 with defaults: exactly one potion (seen in 200 frames) and one
+        8-pose skeleton animation in walk order (tests
+        walk_clip_yields_one_potion_and_one_eight_pose_walk and
+        extract_assets_review_and_add_yield_one_potion_and_one_walk pass)."
+      truncated: false
+  - id: A8
+    source: brief.md
+    text: "A8: In a release build the fixture clip is processed in under 10 s."
+    result: passed
+    reason:
+      text: "Release bench_video_extraction: 0.84 s and 1.07-1.39 s on reruns, 5.76 s
+        worst under host load average ~100; always < 10 s."
+      truncated: false
+builder_handoff:
+  candidate_id: 48738ff4-d11e-42e5-9383-211ced7a36ec
+  identity_provider: skill-coordinated
+  builder_execution_ref: skill-coordinated:builder:8a127a5c-80b7-47a5-bd9f-18f3c6418167
+  iteration: 1
+  summary:
+    text: "Revision after a passing round 5 (user asked to fix a risk found by
+      verifier 5: the gap extension collapsed smooth 10-pose series on larger
+      sprites, 10 -> 3 poses). group_poses now only extends merging past the
+      fixed rule for small sprites (median core under 32 px on the short side,
+      SMALL_SPRITE); larger sprites stop at distance 1. New unit test
+      smooth_pose_series_on_a_large_sprite_is_not_collapsed ports verifier 5's
+      10-pose checker robot (fails on the previous behaviour with 3 poses; now
+      >= 8 poses, the only merges being steps 3.0-3.7 % apart, within the stated
+      ~4 % limit). Scoreboards unchanged elsewhere: verifier 5 in-scope 211/216
+      (5 tracking splits on a 1 px checker at 2.2 px/frame), s3 robot now 8
+      poses instead of 3; verifier 4 117/152; verifier 3 167/167; verifier 2
+      90/90. Brief A3 and spec state the small-sprite condition. Earlier rounds:
+      Repair round 5 (user chose adaptive grouping + a scoped claim after
+      verifier 4: 125/135 fair scenarios, failures on ~20 px thin-winged bats at
+      crf 23-28; false merges of tiny pose changes listed as risks).
+      src/extract/video.rs: distance() in fixed-rule units; group_poses(): tight
+      micro-groups (<= 0.4), average-linkage merging up to 1 and further up to
+      the first gap >= 1.5x above 1, tiny groups folded; tracks keep all crops,
+      poses computed per object (cluster_of) and recomputed after linking;
+      colour difference now the worst quadrant (catches partly recoloured
+      copies). Scoreboards: verifier 3's 167/167, verifier 2's 90/90; verifier
+      4's set 117/152 incl. scenes it classed as flawed/risk; its fair failures
+      10 -> 7 runs, all sprites under 32 px (d14/d19 bats 20x14, one d16 chick
+      run). Brief A3/A4 and spec now scope the robustness guarantee to sprites
+      >= 32 px on the short side and state the limits (smaller sprites best
+      effort; pose changes under ~4 % may merge; Review Merge/Discard correct
+      both). New unit tests: adaptive_grouping_absorbs_noise_and_keeps_poses,
+      partly_recoloured_copies_are_different_appearances. Earlier rounds: Repair
+      round 4 (verifier 3: 140/151 own scenarios; fine high-contrast textures
+      failed on interior colour 0.12-0.25 under 4:2:0, flat slime hash distance
+      up to 12). Changes in src/extract/video.rs: hash is a prefilter (<= 16
+      reliable bits); colour compares 3x3-averaged core colours (precomputed per
+      crop) at the shape alignment refined +-1 px for texture phase (shape and
+      colour alignments separated in compare()). Scoreboards: verifier 3's 167
+      scenarios 167/167, verifier 2's 90/90, verifier 1's clips correct. New
+      fixture tests/fixtures/video/textured.mp4 (2 px black/white stripes,
+      5-pose figure + striped crate, 1.3 px/frame, crf 28) with test
+      fine_textures_under_heavy_compression_keep_the_pose_count. Brief A3 and
+      spec updated. Earlier rounds: Repair round 3 (verifier 2 failed A3/A4:
+      loop poses split at crf 23-28 with thin limbs and sub-pixel motion; fringe
+      specks shifted crop corners by 4 px). Comparison now uses each crop's core
+      (largest 8-connected piece + pieces >= 10 % of it), aligns cores by
+      bounding-box centre with a +-2 px search, gates core size by max(3 px, 12
+      %), shape mismatch <= 4 % (distinct poses measured >= 0.10 on all clips,
+      compressed duplicates ~0.02), interior colour <= 12 %; shape and colour
+      computed together at the best-shape alignment (compare()). Verifier 2's
+      own scoreboard (90 scenarios: 6 scenes x crf 18/23/28 x ranges/every) went
+      from 54/90 to 90/90; verifier 1's clips correct. New fixture
+      tests/fixtures/video/moving.mp4 (sub-pixel 1.5 px/frame, crf 28) with test
+      heavy_compression_and_subpixel_motion_keep_the_pose_count (every 1/2/3).
+      Removed the stray tests/fixtures/video/libsave/ left by a verifier probe.
+      Brief A3 and spec updated. Earlier rounds: Repair round 2 (verifier failed
+      A3/A4 on H.264 probes: flat symmetric static shapes split at keyframes;
+      thin limbs doubled poses). New same-appearance rule in
+      src/extract/video.rs: PHash with a reliable-bit mask (|coef-median| > 0.25
+      x mean abs deviation; distance counts only bits reliable in both), size
+      +-3 px, edge-tolerant shape mismatch (opaque pixels with no opaque pixel
+      within 1 px in the other, best +-1 alignment, <= 2 %, dilated masks
+      precomputed per crop), interior colour difference (<= 8 %, edges
+      excluded). Probe results: verifier clips clip_a/clip_a14/clip_b/lossless
+      -> 3 singles + exactly 4 (or 6) poses at every 1 and 2; walk unchanged.
+      New fixture tests/fixtures/video/shapes.mp4 (crf 18; flat
+      disc/square/diamond + thin 4-pose figure) and test
+      compressed_flat_shapes_and_thin_limbs_dedup_correctly. Also:
+      VideoExtractJob::cancel no longer joins the worker on the UI thread; Save
+      PNG... on an animation never overwrites an existing sequence
+      (free_entry_path adds ' (2)'). Brief A3 and spec updated to the new rule.
+      Previous round: Whole-video extraction. src/extract/video.rs: phash (32x32
+      grayscale over neutral gray, separable DCT, 8x8 low frequencies vs
+      median), pixel_difference (alpha-weighted mean, best alignment within +-1
+      px over the union area), same_appearance (<=8 bits, <=3 px size, <=4 %),
+      detect_frame (auto keying, specks <5 px removed, Auto-Detect, tight
+      crops), cluster (greedy nearest tracking between consecutive processed
+      frames with overlap/reach, histogram <=0.35 and 0.5-2 size ratio;
+      appearance dedup per object; linking of objects sharing an appearance;
+      poses by first frame), Cluster::merge, align_frames (shared canvas,
+      centered, bottom-aligned), VideoExtractJob/run (sequential exact decode,
+      Every N with seeks above 30, progress, cancel). src/review_ui.rs:
+      VideoAssetsDialog (From/To, Every N, Minimum Size, Merge Distance,
+      progress, Cancel), ReviewTab (rows with Keep checkbox, thumbnail or
+      filmstrip, counts, first frame; click/Cmd/Shift selection; Merge; Add Kept
+      to Library). src/asset_library.rs: animation entries (frames,
+      add_animation '<stem> animation <n>', entry_paths/save_entry numbered
+      sequences, save_all handles both, no overwrites). app_state:
+      new_document_from_frames (one layer per frame, Frame 1 at the bottom).
+      ui.rs: Tab::Review, Extract Assets... on the video tab, dialog/pump/review
+      wiring, animations in Open/Save; Asset Library rows show a filmstrip and
+      'P frames, W x H'. Fixture: tests/fixtures/video/walk.mp4 generated by
+      tests/video_extract_fixtures.rs (asserts the 8 poses differ >= 6 %). Brief
+      A2/A3 and spec updated (size slack 3 px, +-1 px alignment, speck removal)
+      after the walk clip showed sub-pixel width jitter and compression specks."
+    truncated: false
+  addressed_acceptance_ids:
+    - A1
+    - A2
+    - A3
+    - A4
+    - A5
+    - A6
+    - A7
+    - A8
+  checks:
+    - name:
+        text: cargo test
+        truncated: false
+      result: passed
+      note:
+        text: "302 tests; 301 tests; 299 tests incl. walk, shapes (crf 18), moving (crf
+          28) and textured (crf 28) fixture tests; 298 tests incl. walk, shapes
+          (crf 18) and moving (crf 28) fixture tests; 297 tests incl. the new
+          shapes regression test; 296 tests incl. lib video-extraction unit
+          tests (dedup rule, tracking/loop collapse/merge, alignment), library
+          animation tests, tests/extract.rs
+          walk_clip_yields_one_potion_and_one_eight_pose_walk (2 clusters;
+          potion in 200 frames; 8 pairwise-distinct poses first seen at frames
+          0,3,...,21; each pose matches frames 3k+1, 3k+2, 3k+24),
+          tests/video_extract_ui.rs (3: Extract Assets defaults -> Review -> Add
+          Kept = 1 asset + 1 eight-frame animation, sequence save, one layer per
+          frame, Save All; Keep checkbox discard and Cmd-click Merge; Cancel and
+          closing discard)."
+        truncated: false
+    - name:
+        text: clippy -D warnings
+        truncated: false
+      result: passed
+      note: null
+    - name:
+        text: fmt --check
+        truncated: false
+      result: passed
+      note: null
+    - name:
+        text: release benchmarks
+        truncated: false
+      result: passed
+      note:
+        text: whole-video extraction of walk.mp4 0.69 s (limit 10 s); extraction, video,
+          filters, canvas, transform unchanged.
+        truncated: false
+  checks_truncated: false
+  known_limits:
+    - text: Per-frame detection only works on flat/near-flat backgrounds (as decided).
+      truncated: false
+    - text: Animation frame alignment is bottom-centre; objects that bob vertically
+        keep their crop-relative alignment only.
+      truncated: false
+    - text: Tracking compares consecutive processed frames; with a large Every N,
+        fast-moving objects can split, but shared appearances re-link them.
+      truncated: false
+  known_limits_truncated: false
+  review: null
+  submitted_at: 2026-10-19T15:53:32.180Z
+blockers: []
+verification:
+  candidate_id: 48738ff4-d11e-42e5-9383-211ced7a36ec
+  identity_provider: skill-coordinated
+  verifier_execution_ref: skill-coordinated:verifier:f8f3cbdd-6edc-4e68-966a-f2ff7c850052
+  iteration: 1
+  attempt: 1
+  assurance: skill-coordinated
+  verdict: pass
+  checks:
+    - id: cargo-test
+      name:
+        text: cargo test
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 148047
+    - id: bench-extract
+      name:
+        text: release extraction + whole-video benchmarks (with MobileSAM)
+        truncated: false
+      argv_display:
+        - text: GAC_MODEL_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/models
+          truncated: false
+        - text: cargo
+          truncated: false
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: extract
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 11056
+    - id: bench-video
+      name:
+        text: release video benchmark
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: video
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 4285
+    - id: bench-filters
+      name:
+        text: release filter preview benchmark
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: filters
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 3277
+    - id: bench-canvas
+      name:
+        text: release pan/zoom benchmark
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: canvas
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 2087
+    - id: bench-transform
+      name:
+        text: release transform benchmark
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --lib
+          truncated: false
+        - text: bench_transform
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 7041
+    - id: cargo-clippy
+      name:
+        text: cargo clippy
+        truncated: false
+      argv_display:
+        - text: clippy
+          truncated: false
+        - text: --all-targets
+          truncated: false
+        - text: --
+          truncated: false
+        - text: -D
+          truncated: false
+        - text: warnings
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 2905
+    - id: cargo-fmt
+      name:
+        text: cargo fmt check
+        truncated: false
+      argv_display:
+        - text: fmt
+          truncated: false
+        - text: --check
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 308
+  summary:
+    text: "cargo test (all binaries ok), clippy -D warnings, fmt --check pass;
+      release benches pass when idle (load-induced failures in unrelated
+      transform/remove-background benches passed on rerun); A8 0.84 s idle, 5.76
+      s worst under load. New probe with render-level ground truth (21 scene
+      designs: smooth arm-sweep series on 34-64 px sprites with 4.6-11 % steps,
+      pac-man mouth series, waving flag, rotating gears 30-44 px around the 32
+      px boundary, 10-pose robots, similar-colour crossing objects,
+      quadrant-recoloured copies; crf 18/23/28, keyint 12-250, Every 1-4,
+      sub-ranges; lossless controls). Lossy runs: in scope (core >=32 px, poses
+      >=5 % apart) 240/240 exact; near-limit (4.1-4.8 %) 96/96 exact; limit zone
+      (<4 %) 4/48 exact (r1 robot 4/24 keeping 8 of 10 poses, p2 pac-man 0/24);
+      out of scope / borderline core (<32 px) 59/96 exact (28-30 px gears 48/48,
+      p1 7/24, o1 4/24). No pose split from compression in any run; the 1.6x
+      10-pose robot that previously collapsed to 3 poses now keeps all 10 in
+      24/24. Verdict pass, with the limit-zone and small-sprite merges listed as
+      risks."
+    truncated: false
+  risks:
+    - text: "Limit zone (poses < ~4 % apart) merges as stated: the 48 px 10-pose
+        checker robot now keeps 8 of 10 poses (only the 3.0 % and 3.7 % steps
+        merge; 4/24 lossy runs exact); pac-man mouth poses 2.3-2.5 % apart
+        collapse (0/24 exact); 3.5 %-apart pac-man (core 31-36 px) 7/24 exact."
+      truncated: false
+    - text: "Sprites under 32 px (best effort): a 22 px gear whose 4 rotation poses
+        are 5.9-6.5 % apart loses 1-2 poses at crf 18-28 (o1 scene 4/24 exact)
+        because the gap extension applies; a 24 px arm with 2.2-2.5 % steps
+        merges. 28-30 px gears kept all 4 poses (48/48)."
+      truncated: false
+    - text: A static prop identical to one pose of an animated object is linked into
+        the animation (spec-prescribed shared-appearance linking); Review has no
+        split, only Merge/Discard.
+      truncated: false
+    - text: The 32 px switch uses the median core short side, so a sprite near 32 px
+        can switch between grouping regimes with pose/compression; my 32-35 px
+        cases all passed.
+      truncated: false
+    - text: Unrelated release benches (transform 16 ms, remove-background) failed
+        under host load average 70-100 and passed on an idle rerun (transform
+        2.42 ms; extract benches ok); A8 timing is also load-sensitive
+        (0.84-5.76 s).
+      truncated: false
+  risks_truncated: false
+  completed_at: 2026-10-19T20:57:34.889Z
+history:
+  - goal_cycle: 1
+    iteration: 0
+    attempt: 0
+    outcome: recovery
+    unresolved_ids: []
+    summary:
+      text: Native Shape artifacts changed
+      truncated: false
+    completed_at: 2026-10-19T10:04:01.884Z
+  - goal_cycle: 2
+    iteration: 1
+    attempt: 0
+    outcome: recovery
+    unresolved_ids: []
+    summary:
+      text: Native confirmed acceptance criteria changed
+      truncated: false
+    completed_at: 2026-10-19T10:18:01.281Z
+  - goal_cycle: 3
+    iteration: 1
+    attempt: 1
+    outcome: fail
+    unresolved_ids:
+      - A3
+      - A4
+    summary:
+      text: "cargo test, clippy -D warnings, fmt --check and all release benches pass;
+        fixture A7 and A8 (0.68 s) pass; dialog, review, library animation
+        save/open behave as specified. Independent probe clips encoded with
+        H.264 at the fixture's own settings show the specified dedup rule does
+        not deliver A3/A4: static flat-coloured objects split into 3-5
+        appearances (pHash Hamming 10-38 with pixel diff <0.5 %) and become
+        animation clusters, and a 4-pose loop yields 9-10 poses (6-pose loop:
+        14). Lossless encoding of the same frames gives the correct result,
+        isolating the cause to the hash/threshold criteria under compression.
+        Verdict: fail (A3, A4)."
+      truncated: false
+    completed_at: 2026-10-19T11:53:13.550Z
+  - goal_cycle: 3
+    iteration: 2
+    attempt: 0
+    outcome: recovery
+    unresolved_ids: []
+    summary:
+      text: Native confirmed acceptance criteria changed
+      truncated: false
+    completed_at: 2026-10-19T12:03:37.816Z
+  - goal_cycle: 4
+    iteration: 1
+    attempt: 1
+    outcome: fail
+    unresolved_ids:
+      - A3
+      - A4
+    summary:
+      text: "cargo test (18 test binaries, all ok), cargo clippy --all-targets -D
+        warnings, cargo fmt --check and all release benches (with GAC_MODEL_DIR)
+        pass. The A8 bench takes 0.74 s. The A7 fixture, the dialog, the Review
+        tab and library animation save/open behave as specified. The previous
+        round's static-object failure is fixed: no static object split in any of
+        my 6 new clips at crf 18-28, nor in the previous verifier's clips.
+        However, independent clips show that repeats of a looping animation are
+        still split under ordinary H.264 compression. Fixture-thickness figures
+        at crf 23 gain 1-2 extra poses in most runs, and at crf 28 up to 5. A
+        very thin figure splits even at crf 18. Lossless controls give exact
+        counts. The causes are size slack and ±1 px top-left alignment when limb
+        tips erode or fringe specks attach. Verdict: fail (A3, A4)."
+      truncated: false
+    completed_at: 2026-10-19T12:23:06.330Z
+  - goal_cycle: 4
+    iteration: 2
+    attempt: 0
+    outcome: recovery
+    unresolved_ids: []
+    summary:
+      text: Native confirmed acceptance criteria changed
+      truncated: false
+    completed_at: 2026-10-19T12:33:08.055Z
+  - goal_cycle: 5
+    iteration: 1
+    attempt: 1
+    outcome: fail
+    unresolved_ids:
+      - A3
+      - A4
+    summary:
+      text: "A1, A2, A5-A8 pass and the full suite, clippy, fmt and benches are green.
+        A3/A4 fail on generalisation: 140/151 new adversarial lossy configs pass
+        (22 scene designs incl. thin limbs, sub-pixel, vertical, 10-pose,
+        outlines, crossing similar-colour objects, statics near movers), but
+        textured figures (s11, s15) and a flat symmetric slime (s13) get loop
+        poses split by H.264 compression at crf 18-28 (colour 0.12-0.25 > 0.12,
+        pHash 10 > 8); lossless controls of the same scenes pass."
+      truncated: false
+    completed_at: 2026-10-19T12:55:09.353Z
+  - goal_cycle: 5
+    iteration: 2
+    attempt: 0
+    outcome: recovery
+    unresolved_ids: []
+    summary:
+      text: Native confirmed acceptance criteria changed
+      truncated: false
+    completed_at: 2026-10-19T13:07:38.945Z
+  - goal_cycle: 6
+    iteration: 1
+    attempt: 1
+    outcome: fail
+    unresolved_ids:
+      - A3
+      - A4
+    summary:
+      text: "cargo test (all binaries ok), clippy -D warnings, fmt --check and all
+        release benches (GAC_MODEL_DIR) pass; A8 1.36 s. A1, A2, A5-A8 pass. New
+        scenario study (20 designs, none reused from earlier verifiers): 125/135
+        fair lossy configs correct (crf 18-28 yuv420p, keyint 8-250, Every 1-4,
+        sub-ranges); outlined/gradient/checker/noise/stripe textures, 150 px and
+        fast 3 px/f sprites, vertical/diagonal sub-pixel motion, multiple movers
+        and statics all pass. Failures: a ~22 px high-contrast thin-winged
+        3-pose bat with diagonal sub-pixel motion gets a duplicate pose in 10/18
+        configs over two scenes (crf18-28), shape 0.040-0.048 / size-gate
+        rejections from compression fringe; the same bat at 1.5x passes 9/9.
+        This contradicts A3/A4's compression-robustness claim. Opposite
+        direction: false merges of genuinely different poses (small limb changes
+        <4%) and of part-recoloured objects (interior colour mean <12%) follow
+        the specified rule and are listed as risks."
+      truncated: false
+    completed_at: 2026-10-19T14:15:31.439Z
+  - goal_cycle: 6
+    iteration: 2
+    attempt: 0
+    outcome: recovery
+    unresolved_ids: []
+    summary:
+      text: Native confirmed acceptance criteria changed
+      truncated: false
+    completed_at: 2026-10-19T15:06:10.474Z
+  - goal_cycle: 7
+    iteration: 1
+    attempt: 1
+    outcome: pass
+    unresolved_ids: []
+    summary:
+      text: "cargo test (all binaries ok), clippy -D warnings, fmt --check, and all
+        release benches (GAC_MODEL_DIR, idle rerun) pass; A8 0.79 s. A1, A2,
+        A5-A8 verified in code and tests. Independent probe with render-level
+        ground truth (15 new scene designs; outlines, gradients, soft edges,
+        thin limbs, 1-px checker/stripe textures, 2-12 pose loops, 0.3-3 px/f
+        incl. sub-pixel vertical/diagonal, crf 18-28 yuv420p, keyint 12-250,
+        Every 1-4, sub-ranges, similar colours and part-recoloured copies, plus
+        lossless controls). In-scope scenes (core >=32 px, all poses >=8%
+        apart): 211/216 lossy runs correct, no compression-induced pose split or
+        false merge; the 5 failures are tracking splits from a 1-px checker
+        under sub-pixel motion (also failing lossless) — risk. Limit-zone scenes
+        (poses <8% apart): 116/140; out-of-scope (<32 px) 132/144 (merges of
+        3.3%-apart poses). Verdict pass with risks, notably that the adaptive
+        gap rule can merge 5-9%-different poses in smooth pose ladders."
+      truncated: false
+    completed_at: 2026-10-19T15:29:13.002Z
+  - goal_cycle: 7
+    iteration: 1
+    attempt: 1
+    outcome: recovery
+    unresolved_ids: []
+    summary:
+      text: User asked to restrict the gap extension to sprites under 32 px (verifier
+        5 found smooth 10-pose ladders on a 48 px sprite collapsing to 3 poses),
+        add that case as a test, then re-verify.
+      truncated: false
+    completed_at: 2026-10-19T15:30:43.925Z
+  - goal_cycle: 7
+    iteration: 2
+    attempt: 0
+    outcome: recovery
+    unresolved_ids: []
+    summary:
+      text: Native confirmed acceptance criteria changed
+      truncated: false
+    completed_at: 2026-10-19T15:46:38.507Z
+  - goal_cycle: 8
+    iteration: 1
+    attempt: 1
+    outcome: pass
+    unresolved_ids: []
+    summary:
+      text: "cargo test (all binaries ok), clippy -D warnings, fmt --check pass;
+        release benches pass when idle (load-induced failures in unrelated
+        transform/remove-background benches passed on rerun); A8 0.84 s idle,
+        5.76 s worst under load. New probe with render-level ground truth (21
+        scene designs: smooth arm-sweep series on 34-64 px sprites with 4.6-11 %
+        steps, pac-man mouth series, waving flag, rotating gears 30-44 px around
+        the 32 px boundary, 10-pose robots, similar-colour crossing objects,
+        quadrant-recoloured copies; crf 18/23/28, keyint 12-250, Every 1-4,
+        sub-ranges; lossless controls). Lossy runs: in scope (core >=32 px,
+        poses >=5 % apart) 240/240 exact; near-limit (4.1-4.8 %) 96/96 exact;
+        limit zone (<4 %) 4/48 exact (r1 robot 4/24 keeping 8 of 10 poses, p2
+        pac-man 0/24); out of scope / borderline core (<32 px) 59/96 exact
+        (28-30 px gears 48/48, p1 7/24, o1 4/24). No pose split from compression
+        in any run; the 1.6x 10-pose robot that previously collapsed to 3 poses
+        now keeps all 10 in 24/24. Verdict pass, with the limit-zone and
+        small-sprite merges listed as risks."
+      truncated: false
+    completed_at: 2026-10-19T20:57:34.889Z
+history_overflow:
+  dropped_entries: 0
+  first_dropped_at: null
+  last_dropped_at: null
+  outcome_counts:
+    pass: 0
+    fail: 0
+    blocked: 0
+    execution-error: 0
+    recovery: 0
+verification_result: pass
+verification_report: verification.md
+archived: false
+created_at: 2026-10-19T09:52:36.001Z

@@ -342,3 +342,176 @@ fn bench_extraction() {
         }
     }
 }
+
+// --- Whole-video extraction (tests/fixtures/video/walk.mp4) ---------------
+
+fn clusters_of(clip: &str, every: u64) -> Vec<game_asset_creator::extract::video::Cluster> {
+    use game_asset_creator::extract::video::{self, VideoExtractSpec};
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/video")
+        .join(clip);
+    let spec = VideoExtractSpec {
+        path,
+        from: 0,
+        to: 199,
+        every,
+        detect: DetectParams::default(),
+    };
+    let none = std::sync::atomic::AtomicBool::new(false);
+    video::run(&spec, &std::sync::atomic::AtomicU64::new(0), &none, &|| {}).unwrap()
+}
+
+fn walk_clusters() -> Vec<game_asset_creator::extract::video::Cluster> {
+    clusters_of("walk.mp4", 1)
+}
+
+/// Flat, symmetric static shapes and a thin-limbed figure under H.264
+/// (crf 18): every static shape stays one asset, the figure has exactly its
+/// 4 poses, with every frame and with every second frame.
+#[test]
+fn compressed_flat_shapes_and_thin_limbs_dedup_correctly() {
+    for every in [1, 2] {
+        let clusters = clusters_of("shapes.mp4", every);
+        let summary: Vec<usize> = clusters.iter().map(|c| c.poses.len()).collect();
+        assert_eq!(clusters.len(), 4, "every {every}: {summary:?}");
+        assert_eq!(
+            clusters.iter().filter(|c| !c.is_animation()).count(),
+            3,
+            "every {every}: {summary:?}"
+        );
+        let figure = clusters.iter().find(|c| c.is_animation()).unwrap();
+        assert_eq!(figure.poses.len(), 4, "every {every}: {summary:?}");
+        assert!(clusters
+            .iter()
+            .all(|c| c.frames.len() == (200 / every) as usize));
+    }
+    let first: Vec<u64> = clusters_of("shapes.mp4", 1)
+        .into_iter()
+        .find(|c| c.is_animation())
+        .unwrap()
+        .poses
+        .iter()
+        .map(|p| p.frame)
+        .collect();
+    assert_eq!(first, vec![0, 4, 8, 12]);
+}
+
+/// Fine black/white stripes under crf 28 with sub-pixel motion: the crate
+/// stays one asset and the figure has exactly its 5 poses.
+#[test]
+fn fine_textures_under_heavy_compression_keep_the_pose_count() {
+    for every in [1, 2, 3] {
+        let clusters = clusters_of("textured.mp4", every);
+        let summary: Vec<usize> = clusters.iter().map(|c| c.poses.len()).collect();
+        assert_eq!(clusters.len(), 2, "every {every}: {summary:?}");
+        assert_eq!(
+            clusters.iter().filter(|c| !c.is_animation()).count(),
+            1,
+            "every {every}: {summary:?}"
+        );
+        assert_eq!(
+            clusters
+                .iter()
+                .find(|c| c.is_animation())
+                .unwrap()
+                .poses
+                .len(),
+            5,
+            "every {every}: {summary:?}"
+        );
+    }
+}
+
+/// Heavy compression (crf 28) with sub-pixel motion: still three static
+/// assets and exactly four poses, for every frame and every second or third.
+#[test]
+fn heavy_compression_and_subpixel_motion_keep_the_pose_count() {
+    for every in [1, 2, 3] {
+        let clusters = clusters_of("moving.mp4", every);
+        let summary: Vec<usize> = clusters.iter().map(|c| c.poses.len()).collect();
+        assert_eq!(clusters.len(), 4, "every {every}: {summary:?}");
+        assert_eq!(
+            clusters.iter().filter(|c| !c.is_animation()).count(),
+            3,
+            "every {every}: {summary:?}"
+        );
+        assert_eq!(
+            clusters
+                .iter()
+                .find(|c| c.is_animation())
+                .unwrap()
+                .poses
+                .len(),
+            4,
+            "every {every}: {summary:?}"
+        );
+    }
+}
+
+#[test]
+fn walk_clip_yields_one_potion_and_one_eight_pose_walk() {
+    let clusters = walk_clusters();
+    let summary: Vec<(usize, usize)> = clusters
+        .iter()
+        .map(|c| (c.poses.len(), c.frames.len()))
+        .collect();
+    assert_eq!(clusters.len(), 2, "clusters (poses, frames): {summary:?}");
+    let potion = clusters
+        .iter()
+        .find(|c| !c.is_animation())
+        .expect("a single-asset cluster");
+    assert_eq!(
+        potion.frames.len(),
+        200,
+        "the potion is seen in every frame"
+    );
+    let walk = clusters
+        .iter()
+        .find(|c| c.is_animation())
+        .expect("an animation cluster");
+    assert_eq!(walk.poses.len(), 8, "eight poses");
+    // In walk order: pose k first appears at frame 3k (the clip shows a new
+    // pose every 3 frames), the poses are pairwise distinct, and each is the
+    // same appearance as the other frames of its 3-frame window.
+    use game_asset_creator::extract::video::{detect_frame, same_appearance};
+    for (i, a) in walk.poses.iter().enumerate() {
+        for b in &walk.poses[i + 1..] {
+            assert!(
+                !same_appearance(a, b),
+                "poses at frames {} and {} are the same",
+                a.frame,
+                b.frame
+            );
+        }
+    }
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/video/walk.mp4");
+    let mut src = game_asset_creator::video::VideoSource::open(&path).unwrap();
+    for (k, pose) in walk.poses.iter().enumerate() {
+        for t in [3 * k as u64 + 1, 3 * k as u64 + 2, 3 * k as u64 + 24] {
+            let frame = src.frame(t).unwrap();
+            let skeleton = detect_frame(t, &frame.image, &DetectParams::default())
+                .into_iter()
+                .max_by_key(|c| c.rect.x)
+                .unwrap();
+            assert!(same_appearance(pose, &skeleton), "pose {k} vs frame {t}");
+        }
+    }
+    let first_frames: Vec<u64> = walk.poses.iter().map(|p| p.frame).collect();
+    assert_eq!(first_frames, vec![0, 3, 6, 9, 12, 15, 18, 21]);
+}
+
+/// Release benchmark: `cargo test --release --test extract bench_video -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn bench_video_extraction() {
+    let start = std::time::Instant::now();
+    let clusters = walk_clusters();
+    let seconds = start.elapsed().as_secs_f64();
+    println!(
+        "whole-video extraction of walk.mp4 (200 frames): {seconds:.2} s, {} clusters",
+        clusters.len()
+    );
+    if !cfg!(debug_assertions) {
+        assert!(seconds < 10.0, "{seconds:.2} s");
+    }
+}
