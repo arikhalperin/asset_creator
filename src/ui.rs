@@ -26,6 +26,7 @@ use crate::paint::{
     self, mask_gray, BucketFill, GradientColors, GradientFill, GradientKind, StrokeKind,
 };
 use crate::project;
+use crate::review_ui::{AssetsOutcome, ReviewAction, ReviewId, ReviewTab, VideoAssetsDialog};
 use crate::selection::{self, CombineMode};
 use crate::tools::{self, Colors, SelectionRequest, Tool, ToolOptions};
 use crate::transform::{self, Affine, Handle, Interpolation};
@@ -156,6 +157,7 @@ pub enum Tab {
     Panel(Panel),
     Document(DocId),
     Video(VideoId),
+    Review(ReviewId),
 }
 
 /// Text fields of the File → New dialog.
@@ -329,6 +331,9 @@ pub struct EditorApp {
     consent: Consent,
     next_request: u64,
     asset_view: AssetLibraryView,
+    video_assets: Option<VideoAssetsDialog>,
+    reviews: HashMap<ReviewId, ReviewTab>,
+    next_review: u64,
 }
 
 impl Default for EditorApp {
@@ -382,7 +387,149 @@ impl EditorApp {
             consent: Consent::NotAsked,
             next_request: 0,
             asset_view: AssetLibraryView::default(),
+            video_assets: None,
+            reviews: HashMap::new(),
+            next_review: 0,
         }
+    }
+
+    // --- Whole-video extraction ---------------------------------------------
+
+    /// Extract Assets… on a video tab.
+    pub fn open_video_assets(&mut self, id: VideoId) -> bool {
+        if self.video_assets.is_some() || self.extract_dialog.is_some() {
+            return false;
+        }
+        let Some(tab) = self.videos.get(&id) else {
+            return false;
+        };
+        self.video_assets = Some(VideoAssetsDialog::new(id, tab.info().clone()));
+        true
+    }
+
+    pub fn video_assets_dialog(&self) -> Option<&VideoAssetsDialog> {
+        self.video_assets.as_ref()
+    }
+
+    pub fn video_assets_dialog_mut(&mut self) -> Option<&mut VideoAssetsDialog> {
+        self.video_assets.as_mut()
+    }
+
+    /// Extract: starts the background run.
+    pub fn start_video_assets(&mut self) -> bool {
+        let notify = self.notify();
+        match &mut self.video_assets {
+            Some(dialog) if !dialog.running() => {
+                dialog.start(notify);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Cancel: stops the run (nothing is kept) and closes the dialog.
+    pub fn cancel_video_assets(&mut self) {
+        if let Some(mut dialog) = self.video_assets.take() {
+            dialog.cancel_job();
+        }
+    }
+
+    fn pump_video_assets(&mut self) {
+        let Some(dialog) = &mut self.video_assets else {
+            return;
+        };
+        match dialog.take_result() {
+            Some(Ok(clusters)) => {
+                let info = dialog.info.clone();
+                self.video_assets = None;
+                self.next_review += 1;
+                let id = ReviewId(self.next_review);
+                self.reviews
+                    .insert(id, ReviewTab::new(info.name.clone(), info.fps(), clusters));
+                self.add_center_tab(Tab::Review(id));
+            }
+            Some(Err(e)) => dialog.error = Some(e),
+            None => {}
+        }
+    }
+
+    fn show_video_assets_window(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = &mut self.video_assets else {
+            return;
+        };
+        match dialog.show(ctx) {
+            AssetsOutcome::Open => {}
+            AssetsOutcome::Start => {
+                self.start_video_assets();
+            }
+            AssetsOutcome::Cancel => self.cancel_video_assets(),
+        }
+    }
+
+    /// Open Review tabs in dock order.
+    pub fn review_tabs(&self) -> Vec<ReviewId> {
+        self.dock
+            .iter_all_tabs()
+            .filter_map(|(_, tab)| match tab {
+                Tab::Review(id) => Some(*id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn review(&self, id: ReviewId) -> Option<&ReviewTab> {
+        self.reviews.get(&id)
+    }
+
+    pub fn review_mut(&mut self, id: ReviewId) -> Option<&mut ReviewTab> {
+        self.reviews.get_mut(&id)
+    }
+
+    /// Merge selected rows of a Review tab.
+    pub fn review_merge(&mut self, id: ReviewId, rows: &[usize]) -> bool {
+        self.reviews.get_mut(&id).is_some_and(|r| r.merge(rows))
+    }
+
+    /// Add Kept to Library: returns (single assets, animations) added; the
+    /// tab closes.
+    pub fn review_add_kept(&mut self, id: ReviewId) -> (usize, usize) {
+        let Some(review) = self.reviews.get(&id) else {
+            return (0, 0);
+        };
+        let (mut singles, mut animations) = (0, 0);
+        let video = review.video.clone();
+        let kept: Vec<_> = review
+            .clusters
+            .iter()
+            .zip(&review.keep)
+            .filter(|(_, k)| **k)
+            .map(|(c, _)| c.clone())
+            .collect();
+        for cluster in kept {
+            let first = &cluster.poses[0];
+            if cluster.is_animation() {
+                let images: Vec<image::RgbaImage> =
+                    cluster.poses.iter().map(|p| p.image.clone()).collect();
+                let frames = extraction::video::align_frames(&images);
+                self.state.assets.add_animation(&video, frames, first.rect);
+                animations += 1;
+            } else {
+                self.state
+                    .assets
+                    .add(&video, first.image.clone(), first.rect);
+                singles += 1;
+            }
+        }
+        self.close_review(id);
+        self.after_assets_added(singles + animations);
+        (singles, animations)
+    }
+
+    pub fn close_review(&mut self, id: ReviewId) {
+        if let Some(path) = self.dock.find_tab(&Tab::Review(id)) {
+            self.dock.remove_tab(path);
+        }
+        self.reviews.remove(&id);
     }
 
     fn notify(&self) -> std::sync::Arc<dyn Fn() + Send + Sync> {
@@ -917,8 +1064,15 @@ impl EditorApp {
         let Some(asset) = self.state.assets.get(id) else {
             return false;
         };
-        match crate::asset_library::save_png(&asset.image, path) {
-            Ok(()) => true,
+        // A chosen PNG name is confirmed by the save dialog; an animation's
+        // numbered files are not, so an existing sequence is never overwritten.
+        let path = if asset.is_animation() {
+            crate::asset_library::free_entry_path(asset, path, &[])
+        } else {
+            path.to_path_buf()
+        };
+        match crate::asset_library::save_entry(asset, &path) {
+            Ok(_) => true,
             Err(e) => {
                 self.error = Some(e);
                 false
@@ -963,6 +1117,19 @@ impl EditorApp {
             }
             AssetAction::Open(id) => {
                 let asset = self.state.assets.get(id)?;
+                if asset.is_animation() {
+                    let (name, frames) = (asset.name.clone(), asset.frames.clone());
+                    return match self.state.new_document_from_frames(name, frames) {
+                        Ok(doc) => {
+                            self.add_document_tab(doc);
+                            Some(doc)
+                        }
+                        Err(err) => {
+                            self.error = Some(err.to_string());
+                            None
+                        }
+                    };
+                }
                 let (name, image) = (asset.name.clone(), asset.image.clone());
                 self.open_image_document(name, image)
             }
@@ -2174,6 +2341,7 @@ impl EditorApp {
         }
         self.pump_videos(ui.ctx());
         self.pump_extraction();
+        self.pump_video_assets();
         let checker = self
             .checker
             .get_or_insert_with(|| canvas::checker_texture(ui.ctx()))
@@ -2239,6 +2407,8 @@ impl EditorApp {
         let mut video_actions = Vec::new();
         let mut frame_set_actions = Vec::new();
         let mut asset_actions = Vec::new();
+        let mut review_actions = Vec::new();
+        let mut closed_reviews = Vec::new();
         egui::CentralPanel::default()
             .frame(egui::Frame::central_panel(ui.style()).inner_margin(0.0))
             .show(ui, |ui| {
@@ -2267,6 +2437,9 @@ impl EditorApp {
                     picking: self.remove_background.as_ref().is_some_and(|d| d.picking),
                     asset_view: &mut self.asset_view,
                     asset_actions: &mut asset_actions,
+                    reviews: &mut self.reviews,
+                    review_actions: &mut review_actions,
+                    closed_reviews: &mut closed_reviews,
                 };
                 DockArea::new(&mut self.dock)
                     .show_leaf_close_all_buttons(false)
@@ -2296,6 +2469,9 @@ impl EditorApp {
                 VideoAction::Extract => {
                     self.open_extract_dialog(id);
                 }
+                VideoAction::ExtractAssets => {
+                    self.open_video_assets(id);
+                }
             }
         }
         for action in frame_set_actions {
@@ -2303,6 +2479,19 @@ impl EditorApp {
         }
         for action in asset_actions {
             self.asset_action(action);
+        }
+        for id in closed_reviews {
+            self.reviews.remove(&id);
+        }
+        for (id, action) in review_actions {
+            match action {
+                ReviewAction::Merge(rows) => {
+                    self.review_merge(id, &rows);
+                }
+                ReviewAction::AddKept => {
+                    self.review_add_kept(id);
+                }
+            }
         }
         // The Extract Object session follows the tool and the document.
         if self.tool != Tool::ExtractObject
@@ -2339,6 +2528,7 @@ impl EditorApp {
         self.show_radius_dialog_window(ui.ctx());
         self.show_filter_dialog_window(ui.ctx());
         self.show_extract_dialog_window(ui.ctx());
+        self.show_video_assets_window(ui.ctx());
         self.show_remove_background_window(ui.ctx());
         self.show_auto_detect_window(ui.ctx());
         self.show_consent_window(ui.ctx());
@@ -3066,7 +3256,7 @@ impl EditorApp {
             .find(|(_, leaf)| {
                 leaf.tabs()
                     .iter()
-                    .any(|t| matches!(t, Tab::Document(_) | Tab::Video(_)))
+                    .any(|t| matches!(t, Tab::Document(_) | Tab::Video(_) | Tab::Review(_)))
             })
             .or_else(|| {
                 self.dock
@@ -3172,6 +3362,9 @@ struct Viewer<'a> {
     picking: bool,
     asset_view: &'a mut AssetLibraryView,
     asset_actions: &'a mut Vec<AssetAction>,
+    reviews: &'a mut HashMap<ReviewId, ReviewTab>,
+    review_actions: &'a mut Vec<(ReviewId, ReviewAction)>,
+    closed_reviews: &'a mut Vec<ReviewId>,
 }
 
 impl TabViewer for Viewer<'_> {
@@ -3202,6 +3395,12 @@ impl TabViewer for Viewer<'_> {
                 .map(|v| v.info().name.clone())
                 .unwrap_or_default()
                 .into(),
+            Tab::Review(id) => self
+                .reviews
+                .get(id)
+                .map(|r| format!("{} review", r.video))
+                .unwrap_or_default()
+                .into(),
         }
     }
 
@@ -3221,6 +3420,13 @@ impl TabViewer for Viewer<'_> {
                 self.frame_set_actions.extend(actions);
             }
             Tab::Document(id) => self.document_view(ui, id),
+            Tab::Review(id) => {
+                if let Some(review) = self.reviews.get_mut(&id) {
+                    let actions = review.show(ui);
+                    self.review_actions
+                        .extend(actions.into_iter().map(|a| (id, a)));
+                }
+            }
             Tab::Video(id) => {
                 if let Some(video) = self.videos.get_mut(&id) {
                     let actions = video.show(ui);
@@ -3242,13 +3448,16 @@ impl TabViewer for Viewer<'_> {
         if let Tab::Video(id) = tab {
             self.closed_videos.push(*id);
         }
+        if let Tab::Review(id) = tab {
+            self.closed_reviews.push(*id);
+        }
         OnCloseResponse::Close
     }
 
     fn scroll_bars(&self, tab: &Tab) -> [bool; 2] {
         // The canvas handles its own scrolling.
         match tab {
-            Tab::Document(_) | Tab::Video(_) => [false, false],
+            Tab::Document(_) | Tab::Video(_) | Tab::Review(_) => [false, false],
             Tab::Panel(_) => [true, true],
         }
     }

@@ -424,7 +424,7 @@ pub fn draw_overlays(
 #[derive(Default)]
 pub struct AssetLibraryView {
     pub selected: BTreeSet<u64>,
-    textures: HashMap<u64, TextureHandle>,
+    textures: HashMap<(u64, usize), TextureHandle>,
 }
 
 /// What the user did in the Asset Library panel.
@@ -444,7 +444,8 @@ pub fn asset_library_panel(
     view: &mut AssetLibraryView,
 ) -> Vec<AssetAction> {
     let mut actions = Vec::new();
-    view.textures.retain(|id, _| library.get(*id).is_some());
+    view.textures
+        .retain(|(id, _), _| library.get(*id).is_some());
     view.selected.retain(|id| library.get(*id).is_some());
     let single = (view.selected.len() == 1).then(|| *view.selected.first().expect("one selected"));
     ui.horizontal_wrapped(|ui| {
@@ -486,35 +487,60 @@ pub fn asset_library_panel(
     let modifiers = ui.input(|i| i.modifiers);
     let ids: Vec<u64> = library.assets().iter().map(|a| a.id).collect();
     for asset in library.assets() {
-        let texture = view.textures.entry(asset.id).or_insert_with(|| {
-            let image = egui::ColorImage::from_rgba_unmultiplied(
-                [asset.image.width() as usize, asset.image.height() as usize],
-                asset.image.as_raw(),
-            );
-            ui.ctx()
-                .load_texture(format!("asset-{}", asset.id), image, TextureOptions::LINEAR)
-        });
+        // A thumbnail, or a filmstrip of up to four frames for an animation.
+        let frames = asset.all_frames();
+        let shown = frames.len().min(4);
+        let textures: Vec<TextureHandle> = (0..shown)
+            .map(|i| {
+                let image = frames[i];
+                view.textures
+                    .entry((asset.id, i))
+                    .or_insert_with(|| {
+                        let c = egui::ColorImage::from_rgba_unmultiplied(
+                            [image.width() as usize, image.height() as usize],
+                            image.as_raw(),
+                        );
+                        ui.ctx().load_texture(
+                            format!("asset-{}-{i}", asset.id),
+                            c,
+                            TextureOptions::LINEAR,
+                        )
+                    })
+                    .clone()
+            })
+            .collect();
         let selected = view.selected.contains(&asset.id);
         let response = ui
             .horizontal(|ui| {
-                let (rect, _) = ui.allocate_exact_size(Vec2::splat(THUMB), Sense::hover());
                 let (w, h) = (asset.image.width() as f32, asset.image.height() as f32);
                 let scale = (THUMB / w).min(THUMB / h).min(4.0);
-                ui.painter()
-                    .rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
-                ui.painter().image(
-                    texture.id(),
-                    Rect::from_center_size(rect.center(), Vec2::new(w, h) * scale),
-                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                    Color32::WHITE,
-                );
+                for texture in &textures {
+                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(THUMB), Sense::hover());
+                    ui.painter()
+                        .rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
+                    ui.painter().image(
+                        texture.id(),
+                        Rect::from_center_size(rect.center(), Vec2::new(w, h) * scale),
+                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                }
                 ui.vertical(|ui| {
                     ui.label(&asset.name);
-                    ui.small(format!(
-                        "{} × {}",
-                        asset.image.width(),
-                        asset.image.height()
-                    ));
+                    if asset.is_animation() {
+                        ui.small(format!(
+                            "{} frames, {} × {}",
+                            frames.len(),
+                            asset.image.width(),
+                            asset.image.height()
+                        ));
+                    } else {
+                        ui.small(format!(
+                            "{} × {}",
+                            asset.image.width(),
+                            asset.image.height()
+                        ));
+                    }
                 });
             })
             .response;

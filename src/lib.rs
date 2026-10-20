@@ -14,6 +14,7 @@ pub mod layers;
 pub mod layers_panel;
 pub mod paint;
 pub mod project;
+pub mod review_ui;
 pub mod selection;
 pub mod tools;
 pub mod transform;

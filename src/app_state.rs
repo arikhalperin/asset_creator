@@ -284,6 +284,21 @@ impl AppState {
         Ok(self.insert(document))
     }
 
+    /// Opens animation frames (same size) as a new document with one layer
+    /// per frame, "Frame 1" at the bottom.
+    pub fn new_document_from_frames(
+        &mut self,
+        name: impl Into<String>,
+        frames: Vec<image::RgbaImage>,
+    ) -> Result<DocId, DocumentError> {
+        let (w, h) = frames.first().map(|f| f.dimensions()).unwrap_or((1, 1));
+        let mut document = Document::new(name, w, h, DEFAULT_DPI)?;
+        for (i, frame) in frames.into_iter().enumerate() {
+            document.add_layer(Layer::new(format!("Frame {}", i + 1), frame))?;
+        }
+        Ok(self.insert(document))
+    }
+
     /// Loads an image file into a new current document. On failure nothing changes.
     pub fn open(&mut self, path: &Path) -> Result<DocId, OpenError> {
         let document = if project::is_project_path(path) {

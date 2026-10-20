@@ -8,6 +8,7 @@ mod maxflow;
 pub mod models;
 pub mod sam;
 pub mod segment;
+pub mod video;
 
 use image::{GrayImage, RgbaImage};
 
