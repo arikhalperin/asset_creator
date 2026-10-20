@@ -2,8 +2,8 @@ schema: comet.native.v4
 name: asset-library
 language: en
 phase: archive
-status: active
-state_version: 14
+status: done
+state_version: 16
 brief: brief.md
 document_constraints_version: 1
 shape_confirmation_hash: 96a2b039391da54c4e8649d75a85f58599bd80fdaed835527c4cc6b9c42bf261
@@ -17,7 +17,7 @@ workspace:
   target_branch: master
   finish: merge
 loop:
-  stage: archive-ready
+  stage: done
   goal_cycle: 2
   iteration: 2
   attempt: 1
@@ -26,7 +26,7 @@ loop:
   no_progress_count: 0
   execution_failure_count: 0
   previous_unresolved_ids: []
-  next_action: archive
+  next_action: null
 acceptance:
   - id: A1
     source: brief.md
@@ -607,5 +607,5 @@ history_overflow:
     recovery: 0
 verification_result: pass
 verification_report: verification.md
-archived: false
+archived: true
 created_at: 2026-10-20T06:12:58.479Z
