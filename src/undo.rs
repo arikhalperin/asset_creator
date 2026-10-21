@@ -513,6 +513,65 @@ impl Command for SetSelection {
     }
 }
 
+/// Replaces the whole document (size, layers, selection) with another
+/// version of it, e.g. Image ▸ Clean Up; undo swaps the original back.
+pub struct SwapDocument {
+    label: &'static str,
+    other: Document,
+}
+
+impl SwapDocument {
+    pub fn new(label: &'static str, replacement: Document) -> Self {
+        Self {
+            label,
+            other: replacement,
+        }
+    }
+
+    fn swap(&mut self, doc: &mut Document) {
+        // Keep the name and file path of the open document.
+        self.other.name = doc.name.clone();
+        self.other.source_path = doc.source_path.clone();
+        std::mem::swap(doc, &mut self.other);
+    }
+}
+
+impl Command for SwapDocument {
+    fn label(&self) -> &str {
+        self.label
+    }
+
+    fn apply(&mut self, doc: &mut Document) -> Result<(), CommandError> {
+        self.swap(doc);
+        Ok(())
+    }
+
+    fn revert(&mut self, doc: &mut Document) {
+        self.swap(doc);
+    }
+
+    fn dirty_rect(&self, doc: &Document) -> PixelRect {
+        PixelRect::new(
+            0,
+            0,
+            doc.width().max(self.other.width()),
+            doc.height().max(self.other.height()),
+        )
+    }
+
+    fn memory_cost(&self) -> usize {
+        self.other
+            .layers()
+            .iter()
+            .map(|l| l.pixels.as_raw().len() + l.mask().map_or(0, |m| m.as_raw().len()))
+            .sum()
+    }
+
+    fn changes_selection(&self) -> bool {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

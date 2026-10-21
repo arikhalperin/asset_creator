@@ -3,6 +3,7 @@
 pub mod app_state;
 pub mod asset_library;
 pub mod canvas;
+pub mod cleanup;
 pub mod document;
 pub mod extract;
 pub mod extract_ui;

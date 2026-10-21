@@ -29,19 +29,29 @@ pub struct RemoveBackgroundDialog {
     pub picking: bool,
     /// The layer before keying (colors are picked from it).
     pub original: RgbaImage,
+    /// Source: the visible canvas (keyed onto a new layer) or the active layer.
+    pub canvas: bool,
 }
 
 /// What the user did in a dialog this frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DialogOutcome {
-    Open { changed: bool },
+    Open {
+        changed: bool,
+    },
     Ok,
     Cancel,
+    /// The Source switch changed (true: canvas).
+    Source(bool),
 }
 
 impl RemoveBackgroundDialog {
-    pub fn new(doc: DocId, layer: &RgbaImage) -> Self {
-        let key = KeyParams::auto(layer);
+    /// `layer`: the pixels being keyed (the color is chosen from `region`
+    /// of it, the selection's bounds).
+    pub fn new(doc: DocId, layer: &RgbaImage, region: PixelRect, canvas: bool) -> Self {
+        let r = region;
+        let area = image::imageops::crop_imm(layer, r.x, r.y, r.width, r.height).to_image();
+        let key = KeyParams::auto(&area);
         Self {
             doc,
             params: RemoveBackground::params_for(&key),
@@ -49,6 +59,7 @@ impl RemoveBackgroundDialog {
             auto_color: key.color,
             picking: false,
             original: layer.clone(),
+            canvas,
         }
     }
 
@@ -79,6 +90,9 @@ impl RemoveBackgroundDialog {
             .resizable(false)
             .anchor(egui::Align2::RIGHT_TOP, Vec2::new(-24.0, 72.0))
             .show(ctx, |ui| {
+                if let Some(canvas) = source_switch(ui, self.canvas) {
+                    outcome = Some(DialogOutcome::Source(canvas));
+                }
                 egui::Grid::new("remove_background")
                     .num_columns(2)
                     .show(ui, |ui| {
@@ -140,12 +154,36 @@ impl RemoveBackgroundDialog {
     }
 }
 
+/// "Source: Canvas | Active layer"; returns the new choice when it changed.
+pub fn source_switch(ui: &mut egui::Ui, canvas: bool) -> Option<bool> {
+    let mut value = canvas;
+    ui.horizontal(|ui| {
+        ui.label("Source");
+        ui.selectable_value(&mut value, true, "Canvas");
+        ui.selectable_value(&mut value, false, "Active layer");
+    });
+    (value != canvas).then_some(value)
+}
+
+/// Multiplies alpha by the selection (outside → transparent).
+pub fn clip_to_selection(image: &mut RgbaImage, selection: &GrayImage) {
+    for (x, y, p) in image.enumerate_pixels_mut() {
+        let m = selection.get_pixel(x, y)[0] as u16;
+        p[3] = ((p[3] as u16 * m + 127) / 255) as u8;
+        if p[3] == 0 {
+            p.0 = [0, 0, 0, 0];
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Auto-Detect Objects
 
 /// The open Auto-Detect Objects dialog.
 pub struct AutoDetectDialog {
     pub doc: DocId,
+    /// Source: the visible canvas or the active layer.
+    pub canvas: bool,
     /// The pixels assets are cut from (the layer, keyed when it had no
     /// transparency).
     pub source: RgbaImage,
@@ -160,18 +198,34 @@ pub enum DetectOutcome {
     Open,
     Add,
     Cancel,
+    /// The Source switch changed (true: canvas).
+    Source(bool),
 }
 
 impl AutoDetectDialog {
-    /// Detects objects in `layer`, keying it first when it has no transparency.
-    pub fn new(doc: DocId, layer: &RgbaImage) -> Self {
-        let source = if layer.pixels().any(|p| p[3] < 255) {
+    /// Detects objects in `layer`, keying it first when it has no
+    /// transparency. With a `selection`, only the selected area counts: it is
+    /// keyed when it has no transparency, and everything outside is cleared.
+    pub fn new(doc: DocId, layer: &RgbaImage, selection: Option<&GrayImage>, canvas: bool) -> Self {
+        let inside = |x: u32, y: u32| selection.is_none_or(|s| s.get_pixel(x, y)[0] > 0);
+        let transparent = layer
+            .enumerate_pixels()
+            .any(|(x, y, p)| p[3] < 255 && inside(x, y));
+        let mut source = if transparent {
             layer.clone()
         } else {
-            keying::key(layer, &KeyParams::auto(layer))
+            let r = selection
+                .and_then(crate::selection::bounds)
+                .unwrap_or(PixelRect::new(0, 0, layer.width(), layer.height()));
+            let area = image::imageops::crop_imm(layer, r.x, r.y, r.width, r.height).to_image();
+            keying::key(layer, &KeyParams::auto(&area))
         };
+        if let Some(sel) = selection {
+            clip_to_selection(&mut source, sel);
+        }
         let mut dialog = Self {
             doc,
+            canvas,
             source,
             params: DetectParams::default(),
             proposals: Vec::new(),
@@ -202,6 +256,9 @@ impl AutoDetectDialog {
             .resizable(false)
             .anchor(egui::Align2::RIGHT_TOP, Vec2::new(-24.0, 72.0))
             .show(ctx, |ui| {
+                if let Some(canvas) = source_switch(ui, self.canvas) {
+                    outcome = DetectOutcome::Source(canvas);
+                }
                 egui::Grid::new("auto_detect")
                     .num_columns(2)
                     .show(ui, |ui| {
@@ -292,13 +349,20 @@ pub struct ExtractSession {
     pub mask: Option<(GrayImage, Engine)>,
     pub note: Option<String>,
     pub busy: bool,
+    /// Segments the visible canvas (true) or the active layer.
+    pub canvas: bool,
     texture: Option<TextureHandle>,
 }
 
 impl ExtractSession {
     pub fn new(doc: DocId) -> Self {
+        Self::with_source(doc, false)
+    }
+
+    pub fn with_source(doc: DocId, canvas: bool) -> Self {
         Self {
             doc,
+            canvas,
             prompt: Prompt::default(),
             request: 0,
             mask: None,

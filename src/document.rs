@@ -297,6 +297,31 @@ impl Document {
         Ok(doc)
     }
 
+    /// The document cropped to `rect` (clipped to the canvas): every layer,
+    /// layer mask, and the selection. `None` if nothing remains.
+    pub fn cropped(&self, rect: PixelRect) -> Option<Self> {
+        let r = rect.intersect(self.bounds())?;
+        let crop_rgba = |img: &RgbaImage| {
+            image::imageops::crop_imm(img, r.x, r.y, r.width, r.height).to_image()
+        };
+        let crop_gray = |img: &GrayImage| {
+            image::imageops::crop_imm(img, r.x, r.y, r.width, r.height).to_image()
+        };
+        let mut doc = self.clone();
+        doc.width = r.width;
+        doc.height = r.height;
+        for layer in &mut doc.layers {
+            layer.pixels = crop_rgba(&layer.pixels);
+            layer.mask = layer.mask.as_ref().map(crop_gray);
+        }
+        doc.selection = doc
+            .selection
+            .as_ref()
+            .map(crop_gray)
+            .filter(|m| m.pixels().any(|p| p[0] > 0));
+        Some(doc)
+    }
+
     pub fn width(&self) -> u32 {
         self.width
     }

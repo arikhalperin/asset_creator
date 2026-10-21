@@ -1,0 +1,664 @@
+schema: comet.native.v4
+name: editor-pipeline
+language: en
+phase: archive
+status: done
+state_version: 15
+brief: brief.md
+document_constraints_version: 1
+shape_confirmation_hash: 020cfeff7c8d2cada573770b148314c8cea26bebb03e8bbd61930087012b9311
+spec_changes:
+  - capability: editor-pipeline
+    operation: create
+    source: specs/editor-pipeline/spec.md
+workspace:
+  isolation: branch
+  change_branch: comet/editor-pipeline
+  target_branch: master
+  finish: merge
+loop:
+  stage: done
+  goal_cycle: 1
+  iteration: 3
+  attempt: 1
+  retry_epoch: 0
+  failed_iteration_count: 2
+  no_progress_count: 0
+  execution_failure_count: 0
+  previous_unresolved_ids: []
+  next_action: null
+acceptance:
+  - id: A1
+    source: brief.md
+    text: 'A1: Library "Edit a Copy" opens the selected asset as a document titled
+      "<asset name> (library)" (animations: one layer per frame); File ▸ Save
+      Back to Library (enabled only for such documents) stores the document into
+      that asset as version n+1 (single: the visible composite; animation: one
+      frame per top-level layer in order), the panel thumbnail and Versions…
+      show the new image immediately, and the document is no longer marked
+      modified; if the asset was removed, Save Back adds a new asset instead.'
+    result: passed
+    reason:
+      text: Edit a Copy opens '<name> (library)' linked docs (animations one layer per
+        frame); File > Save Back is enabled only for linked docs with no live
+        edit/preview layer, writes version n+1 (single = visible composite incl.
+        hidden-layer handling; animation = one frame per layer), clears the
+        modified mark, and the panel thumbnail is keyed by (id, version) so it
+        refreshes next frame; Versions... shows the new version. Removed asset
+        -> Save Back adds a new asset of the same kind (single and animation,
+        via UI menu). Save Back via the File menu during a Remove Background
+        preview is refused (version stays 1, image unchanged); after OK it saves
+        the real composite as v2. Builder tests + round-1/2 probes + new r3
+        probe pass.
+      truncated: false
+  - id: A2
+    source: brief.md
+    text: "A2: Versions are kept on disk and survive restarts; Versions… lists every
+      version (number, date, size, thumbnail) and Restore makes the chosen
+      version current as a new version; removing the asset deletes all its
+      version files; library.json from C10/C11 loads unchanged (assets start at
+      version 1)."
+    result: passed
+    reason:
+      text: "Versions stored as assets/<id>.v<n>.png (frames _<nn>), files written via
+        atomic PNG save before library.json; failed version write keeps the
+        previous version and writes no metadata. Versions survive restart (probe
+        re-opened library: 3 versions newest first with date and size), Restore
+        creates a new version, Remove deletes every version file (assets dir
+        empty). Master/C10/C11 library.json load unchanged as version 1 with
+        original file names."
+      truncated: false
+  - id: A3
+    source: brief.md
+    text: "A3: Remove Background, Auto-Detect Objects, and Extract Object use the
+      visible canvas composite by default and only the active selection's area
+      when there is one (pixels outside the selection are ignored/transparent,
+      results never extend beyond it); each tool has a Source: Canvas / Active
+      layer switch; with Canvas, Remove Background adds a new layer \"Background
+      removed\"; assets record source \"canvas\" or \"layer\" and the selection
+      bounds in their extraction parameters."
+    result: passed
+    reason:
+      text: "Round-2 defect fixed: with Extract Object tool and Remove Background
+        (Canvas) open from the Extract menu, a real canvas box drag creates no
+        session/request (status 'Finish or cancel Remove Background first'), the
+        strip 'Add to Library' button, extract_accept, and To Selection are
+        refused, no asset is added; after Cancel the extracted asset equals the
+        real composite pixel for pixel (625/625). An in-flight mask arriving
+        during the preview cannot be accepted. Auto-Detect, Find Repeating
+        Pattern, Add Selection to Library (API and menu) are refused;
+        Save/Export refused (live edit) and write no files; Image > Clean Up and
+        drops onto the previewing doc are refused; Filter menu (Invert/Gaussian
+        Blur) during the preview removes the preview layer first; undo/redo
+        traversal and saved .gac never contain the preview layer; 33-case UI
+        adversarial sweep (shortcuts, layer menu, layer rows, strokes, tab
+        switches, Edit a Copy + Save Back) clean. Functional A3: Canvas is the
+        default with a Source switch in all three tools; Canvas RB adds one
+        'Background removed' layer above active in one undo step (nothing
+        outside selection); Auto-Detect/Extract Object honour the selection (no
+        results outside it) and record source canvas|layer and region."
+      truncated: false
+  - id: A4
+    source: brief.md
+    text: "A4: Dragging a library thumbnail onto a document canvas adds a new layer
+      named after the asset above the active layer, centred on the drop point
+      (clipped to the canvas), as one undo step; an animation adds its first
+      frame; dropping anywhere else does nothing."
+    result: passed
+    reason:
+      text: Dragging a library thumbnail onto a document canvas adds a layer named
+        after the asset at active+1, centred on the drop point (verified at
+        several zooms), clipped to the canvas, one undo step; animations add
+        their first frame; drops on the grey area, the layers panel, or the
+        library do nothing.
+      truncated: false
+  - id: A5
+    source: brief.md
+    text: "A5: Clean Up on selected library assets removes stray alpha (alpha < 8
+      cleared; 8-connected specks below max(4 px, 0.1 % of content) removed) and
+      crops to the remaining content (animations: one crop for all frames),
+      saving a new version; Image ▸ Clean Up does the same to the active layer
+      and crops the canvas to the visible content as one undo step; already
+      clean assets are left unchanged (no new version)."
+    result: passed
+    reason:
+      text: "Despeckle clears alpha<8 and removes 8-connected specks below max(4 px,
+        0.1% of content) (threshold boundary probed), then crops; library Clean
+        Up adds a version only for changed assets (animations: one union crop
+        for all frames); Image > Clean Up despeckles the active layer and crops
+        canvas, masks and selection as one undo step (undo/redo restore size and
+        pixels)."
+      truncated: false
+  - id: A6
+    source: brief.md
+    text: "A6: Full loop (headless UI test on a fixture video of a CC0 skeleton
+      sprite): open the video, grab a frame into a document, extract the
+      skeleton with Extract Object (or Auto-Detect) into the library, Edit a
+      Copy, paint on it, Save Back (version 2, thumbnail updated), create a new
+      document, drag the asset onto it — the new layer holds the edited skeleton
+      pixel-for-pixel at the drop position."
+    result: passed
+    reason:
+      text: tests/fixtures/video/skeleton.mp4 is H.264 320x240 30 frames generated
+        from the CC0 Kenney Tiny Dungeon skeleton (license in
+        tests/fixtures/tagging/LICENSE.txt, recipe in generate.sh). Headless
+        full_loop_video_to_composition passes (video -> grab frame ->
+        Auto-Detect -> library -> Edit a Copy -> paint -> Save Back v2 via File
+        menu -> new document -> drag thumbnail -> layer equals edited skeleton
+        pixel for pixel at the drop position); an independent Extract Object
+        variant of the loop also passes.
+      truncated: false
+builder_handoff:
+  candidate_id: 4a38dda6-797d-48b4-bfe8-fa927bf758d3
+  identity_provider: skill-coordinated
+  builder_execution_ref: skill-coordinated:builder:f0dda1a4-9175-41ce-9d57-e09818546856
+  iteration: 3
+  summary:
+    text: "Round 3 (fixes the round-2 A3 defect). Extraction never reads Remove
+      Background's preview layer: while the Remove Background dialog is open or
+      a preview layer exists, Extract Object prompts (canvas or extract_prompt),
+      Accept, To Selection, and Add Selection to Library are refused (status
+      message). New test extraction_waits_while_remove_background_is_open (an
+      existing mask cannot be accepted, prompts and a real canvas box drag are
+      ignored, Add Selection refused, and after Cancel the asset equals the real
+      canvas composite pixel for pixel). Round 2 (fixes the review's A1/A3
+      defects). The Remove Background (Canvas) preview layer can no longer leak:
+      AppState::execute refuses every command while it exists,
+      preview_layer_props ignores it, EditorApp::layer_action ignores
+      layer-panel/menu actions while it exists (status message), and Save Back
+      is disabled/refused (can_save_back: linked and no stroke, transform,
+      filter preview, or preview layer). Save Back after the asset was removed
+      keeps the asset's kind from when the copy was opened (library_links store
+      asset + animation), so an animation copy becomes a new animation with one
+      frame per layer. Drops outside the image (grey area) do nothing. set_image
+      no longer writes metadata when a version PNG fails to save (previous
+      version stays current, partial files removed, notice). New regression
+      tests in tests/editor_pipeline.rs:
+      save_back_of_a_removed_animation_keeps_its_frames,
+      the_remove_background_preview_layer_never_leaks (Save Back disabled +
+      refused, Duplicate via layer action and direct execute refused,
+      visibility/opacity actions ignored, no undo entries, layers unchanged
+      after cancel), drops_outside_the_image_do_nothing,
+      a_failed_version_write_keeps_the_current_version. Round 1: Editor ↔
+      pipeline loop. asset_library.rs: Asset.version + versions
+      (Version{version, created, files, width, height}); set_image() writes
+      <id>.v<n>.png / <id>.v<n>_<nn>.png then library.json; version_images()
+      (disk, or memory for in-memory libraries); restore_version() (as a new
+      version); remove() deletes every version's files; older entries load as
+      version 1 with their original file names; clean_up(ids) adds a version
+      only for changed assets. cleanup.rs: despeckle (alpha<8 cleared;
+      8-connected specks < max(4, 0.1 % of content) removed), content_bounds,
+      clean_frames (one union crop for animation frames), clean_document (active
+      layer despeckled, canvas cropped to the visible composite). document.rs
+      Document::cropped (layers, masks, selection); undo.rs SwapDocument
+      (whole-document undo step, keeps name/path). ui.rs: Edit a Copy (library
+      Open/double-click) opens '<name> (library)' linked in library_links,
+      marked saved; File ▸ Save Back to Library (enabled for linked docs) →
+      set_image (composite, or one frame per layer for animations), status,
+      mark_saved; removed asset → new asset, relinked; Image ▸ Clean Up (one
+      'Clean Up' step); drop_asset (new layer named after the asset above the
+      active one, centred, clipped, 'Add Asset Layer' step; animations: first
+      frame) via CanvasEvent::DropAsset when an AssetDrag payload is released
+      over a canvas. Extraction source: ToolOptions.extract_from_canvas (default
+      true); extraction_input() gives composite or active layer + selection;
+      Remove Background (Canvas: keyed copy previewed on a temporary layer
+      outside the undo history via
+      AppState::begin_layer_filter/end_layer_filter, OK = one 'Remove
+      Background' step adding 'Background removed'; Cancel leaves no
+      layer/undo/redo), Auto-Detect (keys the selected area if it has no
+      transparency, clears outside the selection), Extract Object (canvas or
+      layer image, mask intersected with the selection, crop from the same
+      image) and Add Selection to Library record params source/region; Source
+      switch in both windows and in the Extract Object options strip.
+      library_ui.rs: Edit a Copy, Versions… window (newest first, thumbnails,
+      date, size, Restore), Clean Up button, draggable thumbnails (AssetDrag
+      payload, preview follows the pointer), thumbnails keyed by (id, version)
+      so they refresh on a new version. Fixture
+      tests/fixtures/video/skeleton.mp4 (Kenney CC0 skeleton_01 scaled 2× over
+      teal, generate.sh updated)."
+    truncated: false
+  addressed_acceptance_ids:
+    - A1
+    - A2
+    - A3
+    - A4
+    - A5
+    - A6
+  checks:
+    - name:
+        text: cargo test
+        truncated: false
+      result: passed
+      note:
+        text: "372 passed, 0 failed (GAC_CLIP_DIR/GAC_MODEL_DIR set). 367 passed, 0
+          failed (GAC_CLIP_DIR/GAC_MODEL_DIR set). New tests/editor_pipeline.rs
+          (14): versions store/restore/persist/remove, older library → v1,
+          animation versions, library Clean Up (action + panel button, unchanged
+          asset keeps v1), Image ▸ Clean Up via the menu with undo, Edit a Copy
+          → brush edit → File ▸ Save Back (v2, document clean, thumbnail rebuilt
+          from v2 next frame) → Versions… Restore (v3), Save Back after removal,
+          animation copies (frames follow layers), Auto-Detect canvas vs Active
+          layer vs selection with params, Remove Background canvas (cancel
+          leaves nothing, OK one step, selection clipping), Extract Object
+          canvas within selection + Active layer source, drag-and-drop (centred,
+          clipped, ignored off-canvas), animation drop, full loop on
+          skeleton.mp4 (grab frame, Auto-Detect finds the 96×112 skeleton
+          exactly, Edit a Copy, brush, Save Back v2, new 320×240 document, drag
+          → layer equals the edited skeleton pixel for pixel). Unit tests in
+          cleanup.rs and library_ui.rs (dates). Existing tests updated:
+          extract_ui Open now names '(library)'."
+        truncated: false
+    - name:
+        text: clippy -D warnings
+        truncated: false
+      result: passed
+      note: null
+    - name:
+        text: fmt --check
+        truncated: false
+      result: passed
+      note: null
+    - name:
+        text: release benchmarks (all dispatch commands run locally, exit 0)
+        truncated: false
+      result: passed
+      note:
+        text: "unchanged: library load 0.09 s, extraction, video, filters, canvas,
+          transform, patterns."
+        truncated: false
+  checks_truncated: false
+  known_limits:
+    - text: The full-loop test extracts the skeleton with Auto-Detect (exact); Extract
+        Object's GrabCut on the 2×-scaled pixel skeleton returned only part of
+        it (96×64) in a trial, so A6 uses the 'or Auto-Detect' path.
+      truncated: false
+    - text: Find Repeating Pattern (C11) still reads the active layer only (not part
+        of this change's tools).
+      truncated: false
+    - text: Dragging needs the library panel and the canvas visible at the same time
+        (dock layout).
+      truncated: false
+    - text: Version history keeps every version indefinitely (no pruning, per
+        non-goals).
+      truncated: false
+    - text: Thumbnails refresh on the next panel frame after Save Back.
+      truncated: false
+    - text: Animation Save Back uses each layer's raw pixels (visibility, opacity, and
+        masks are not applied), as the spec defines frames per top-level layer.
+      truncated: false
+    - text: Some canvas actions during the Remove Background preview (brush stroke,
+        Undo, Free Transform) end the preview as before, discarding the keying
+        without a message.
+      truncated: false
+  known_limits_truncated: false
+  review: null
+  submitted_at: 2026-10-21T07:13:22.266Z
+blockers: []
+verification:
+  candidate_id: 4a38dda6-797d-48b4-bfe8-fa927bf758d3
+  identity_provider: skill-coordinated
+  verifier_execution_ref: skill-coordinated:verifier:4e956dbf-9d16-4f85-a251-eaf66bbc60fe
+  iteration: 3
+  attempt: 1
+  assurance: skill-coordinated
+  verdict: pass
+  checks:
+    - id: cargo-test
+      name:
+        text: cargo test (with the tagging model)
+        truncated: false
+      argv_display:
+        - text: GAC_CLIP_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/clip
+          truncated: false
+        - text: GAC_MODEL_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/models
+          truncated: false
+        - text: cargo
+          truncated: false
+        - text: test
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 315283
+    - id: clippy
+      name:
+        text: clippy -D warnings
+        truncated: false
+      argv_display:
+        - text: clippy
+          truncated: false
+        - text: --all-targets
+          truncated: false
+        - text: --
+          truncated: false
+        - text: -D
+          truncated: false
+        - text: warnings
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 4924
+    - id: fmt
+      name:
+        text: fmt --check
+        truncated: false
+      argv_display:
+        - text: fmt
+          truncated: false
+        - text: --check
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 392
+    - id: bench-patterns
+      name:
+        text: release pattern detection / make seamless benchmark
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: patterns
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 7205
+    - id: bench-pattern-ui
+      name:
+        text: release pattern preview benchmark
+        truncated: false
+      argv_display:
+        - text: GAC_CLIP_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/clip
+          truncated: false
+        - text: cargo
+          truncated: false
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: pattern_ui
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --include-ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 3649
+    - id: bench-filters
+      name:
+        text: release filter preview benchmark
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: filters
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 3119
+    - id: bench-library
+      name:
+        text: release library/tagging benchmark
+        truncated: false
+      argv_display:
+        - text: GAC_CLIP_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/clip
+          truncated: false
+        - text: cargo
+          truncated: false
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: library
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 4648
+    - id: bench-extract
+      name:
+        text: release extraction benchmarks
+        truncated: false
+      argv_display:
+        - text: GAC_MODEL_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/models
+          truncated: false
+        - text: cargo
+          truncated: false
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: extract
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 2931
+    - id: bench-video
+      name:
+        text: release video benchmark
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: video
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 4091
+    - id: bench-canvas
+      name:
+        text: release pan/zoom benchmark
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: canvas
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 2208
+    - id: bench-transform
+      name:
+        text: release transform benchmark
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --lib
+          truncated: false
+        - text: bench_transform
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 3219
+  summary:
+    text: "Round 3 passes. The round-2 A3 leak is fixed: while Remove Background
+      (Canvas) is open, Extract Object prompts/drags, Accept, To Selection, Add
+      Selection to Library, Auto-Detect, Find Repeating Pattern, Save, Export,
+      Save Back, Clean Up, drops and every history-recording command are refused
+      or remove the preview first; no path in a 40+ case UI/API sweep reads the
+      preview layer or records it in history, files, or the library. A1-A6
+      independently verified by builder tests, earlier probes re-run against
+      this candidate (remaining failures are probe misdrives), and new round-3
+      probes. cargo test (all suites), clippy --all-targets -D warnings and fmt
+      --check pass; Runtime benchmark logs pass."
+    truncated: false
+  risks:
+    - text: Extract Object segments the full canvas composite and clips the resulting
+        mask to the selection afterwards (output never extends beyond the
+        selection, but the segmenter sees context outside it rather than only
+        the selection's bounds); the clip uses the selection at result time, so
+        changing the selection before Accept is not re-applied.
+      truncated: false
+    - text: "Filter menu stays enabled while Remove Background is open: opening a
+        parameter filter (e.g. Gaussian Blur...) during the preview leaves both
+        dialogs open sharing one filter session, and RB OK then silently cancels
+        the other filter (no leak, but the blur is lost). Pre-existing
+        interaction."
+      truncated: false
+    - text: Drops onto a document with an open Remove Background preview are silently
+        ignored (no status message).
+      truncated: false
+    - text: Cancelling a Canvas Remove Background resets the edit target to Pixels
+        even if a layer mask was being edited before.
+      truncated: false
+  risks_truncated: false
+  completed_at: 2026-10-21T07:33:47.567Z
+history:
+  - goal_cycle: 1
+    iteration: 1
+    attempt: 1
+    outcome: fail
+    unresolved_ids:
+      - A1
+      - A3
+    summary:
+      text: "Full cargo test (367 passed), clippy -D warnings and fmt --check all
+        pass, both in my run and in the Runtime logs. A2, A4, A5 and A6 pass,
+        confirmed by independent UI-level probes, old-format libraries generated
+        by the real C10/C11 code, and a SAM-based full loop. A1 and A3 fail on
+        two concrete defects: (1) the temporary Canvas Remove Background preview
+        layer leaks into the document, undo history, .gac files and library
+        versions through Layer > Duplicate Layer, Layers-panel
+        opacity/visibility changes and File > Save Back while the dialog is
+        open; (2) Save Back of an animation copy whose asset was removed creates
+        a flattened single-image asset and loses the frames."
+      truncated: false
+    completed_at: 2026-10-21T06:32:07.720Z
+  - goal_cycle: 1
+    iteration: 2
+    attempt: 1
+    outcome: fail
+    unresolved_ids:
+      - A3
+    summary:
+      text: "Fail on A3: while the Remove Background (Canvas) preview is open, Extract
+        Object (box drag on the canvas, then Accept) reads the composite with
+        the temporary preview layer in it and saves an asset made from the
+        preview pixels to the library. All round-1 defects are fixed. The
+        removed-animation Save Back, history, save, export, wrong-layer and
+        grey-area drop issues are gone, and the set_image rollback works. A1,
+        A2, A4, A5 and A6 pass. cargo test passes (23 test binaries, 0
+        failures), clippy -D warnings is clean and fmt --check is clean."
+      truncated: false
+    completed_at: 2026-10-21T07:06:34.041Z
+  - goal_cycle: 1
+    iteration: 3
+    attempt: 1
+    outcome: pass
+    unresolved_ids: []
+    summary:
+      text: "Round 3 passes. The round-2 A3 leak is fixed: while Remove Background
+        (Canvas) is open, Extract Object prompts/drags, Accept, To Selection,
+        Add Selection to Library, Auto-Detect, Find Repeating Pattern, Save,
+        Export, Save Back, Clean Up, drops and every history-recording command
+        are refused or remove the preview first; no path in a 40+ case UI/API
+        sweep reads the preview layer or records it in history, files, or the
+        library. A1-A6 independently verified by builder tests, earlier probes
+        re-run against this candidate (remaining failures are probe misdrives),
+        and new round-3 probes. cargo test (all suites), clippy --all-targets -D
+        warnings and fmt --check pass; Runtime benchmark logs pass."
+      truncated: false
+    completed_at: 2026-10-21T07:33:47.567Z
+history_overflow:
+  dropped_entries: 0
+  first_dropped_at: null
+  last_dropped_at: null
+  outcome_counts:
+    pass: 0
+    fail: 0
+    blocked: 0
+    execution-error: 0
+    recovery: 0
+verification_result: pass
+verification_report: verification.md
+archived: true
+created_at: 2026-10-21T04:39:47.355Z

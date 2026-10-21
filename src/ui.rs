@@ -11,7 +11,7 @@ use crate::app_state::{AppState, DocId, EditTarget};
 use crate::asset_library::{AssetLibrary, CategorySource, Origin};
 use crate::canvas::{self, CanvasState, ViewAction};
 use crate::canvas::{CanvasEvent, PointMode, TransformBox};
-use crate::document::DEFAULT_DPI;
+use crate::document::{PixelRect, DEFAULT_DPI};
 use crate::extract::segment::{self, Availability, Engine, Prompt, Segmenter};
 use crate::extract::{self as extraction, keying::RemoveBackground, models};
 use crate::extract_ui::{
@@ -25,7 +25,9 @@ use crate::layers::{self, LayerProps};
 use crate::layers_panel::{layers_panel, LayerAction, LayerOp};
 use crate::library::pack::{self, ExportFormat};
 use crate::library::tagger::{TagConfig, TagEvent, TagJob, Tagger};
-use crate::library_ui::{library_panel, library_windows, LibraryAction, LibraryView, TagStatus};
+use crate::library_ui::{
+    library_panel, library_windows, AssetDrag, LibraryAction, LibraryView, TagStatus,
+};
 use crate::paint::{
     self, mask_gray, BucketFill, GradientColors, GradientFill, GradientKind, StrokeKind,
 };
@@ -209,6 +211,8 @@ impl NewDocumentForm {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
     New,
+    SaveBack,
+    CleanUpDocument,
     Open,
     Export,
     Close,
@@ -328,6 +332,8 @@ pub struct EditorApp {
     auto_detect: Option<AutoDetectDialog>,
     /// Extract → Find Repeating Pattern… window.
     pattern: Option<PatternDialog>,
+    /// Documents opened with Edit a Copy, and their library asset.
+    library_links: HashMap<DocId, LibraryLink>,
     extract: Option<ExtractSession>,
     /// Created on the first Extract Object prompt.
     segmenter: Option<Segmenter>,
@@ -395,6 +401,7 @@ impl EditorApp {
             remove_background: None,
             auto_detect: None,
             pattern: None,
+            library_links: HashMap::new(),
             extract: None,
             segmenter: None,
             segment_config: segment::Config::default(),
@@ -585,6 +592,55 @@ impl EditorApp {
         }
     }
 
+    /// What the extraction tools read from the current document: the visible
+    /// composite or the active layer (per the Source option), the selection,
+    /// and the region it limits work to.
+    fn extraction_input(&self) -> Option<ExtractionInput> {
+        let open = self.state.current_document()?;
+        let canvas = self.tool_options.extract_from_canvas;
+        let image = if canvas {
+            open.document.composite()
+        } else {
+            open.document.layer(open.active_layer())?.pixels.clone()
+        };
+        let selection = open.document.selection().cloned();
+        Some(ExtractionInput {
+            id: open.id,
+            region: open.document.editable_bounds(),
+            image,
+            selection,
+            canvas,
+        })
+    }
+
+    /// Adds the extraction source (and the selection's bounds) to `params`.
+    fn with_source(
+        params: serde_json::Value,
+        canvas: bool,
+        region: Option<PixelRect>,
+    ) -> serde_json::Value {
+        let mut map = match params {
+            serde_json::Value::Object(m) => m,
+            serde_json::Value::Null => serde_json::Map::new(),
+            other => {
+                let mut m = serde_json::Map::new();
+                m.insert("params".to_owned(), other);
+                m
+            }
+        };
+        map.insert(
+            "source".to_owned(),
+            serde_json::json!(if canvas { "canvas" } else { "layer" }),
+        );
+        if let Some(r) = region {
+            map.insert(
+                "region".to_owned(),
+                serde_json::json!([r.x, r.y, r.width, r.height]),
+            );
+        }
+        serde_json::Value::Object(map)
+    }
+
     /// The active layer's pixels of the current document.
     fn active_pixels(&self) -> Option<(DocId, image::RgbaImage)> {
         let open = self.state.current_document()?;
@@ -607,21 +663,41 @@ impl EditorApp {
         if self.transform_active() || self.dialog_open() {
             return false;
         }
-        let Some((id, pixels)) = self.active_pixels() else {
+        let Some(input) = self.extraction_input() else {
             return false;
         };
-        if self
-            .state
-            .document(id)
-            .is_some_and(|o| o.edit_target() == EditTarget::Mask)
-        {
-            return false;
-        }
-        if let Err(err) = self.state.begin_filter(id) {
+        let id = input.id;
+        let started = if input.canvas {
+            // The keyed canvas goes onto a new layer (previewed on a
+            // temporary one).
+            let mut pixels = input.image.clone();
+            if let Some(sel) = &input.selection {
+                crate::extract_ui::clip_to_selection(&mut pixels, sel);
+            }
+            self.state.begin_layer_filter(
+                id,
+                crate::document::Layer::new("Background removed", pixels),
+            )
+        } else {
+            if self
+                .state
+                .document(id)
+                .is_some_and(|o| o.edit_target() == EditTarget::Mask)
+            {
+                return false;
+            }
+            self.state.begin_filter(id)
+        };
+        if let Err(err) = started {
             self.error = Some(format!("Remove Background: {err}"));
             return false;
         }
-        self.remove_background = Some(RemoveBackgroundDialog::new(id, &pixels));
+        self.remove_background = Some(RemoveBackgroundDialog::new(
+            id,
+            &input.image,
+            input.region,
+            input.canvas,
+        ));
         self.refresh_remove_background();
         true
     }
@@ -662,6 +738,14 @@ impl EditorApp {
         let Some(dialog) = self.remove_background.take() else {
             return false;
         };
+        if dialog.canvas {
+            return self.state.end_layer_filter(
+                dialog.doc,
+                &RemoveBackground,
+                &dialog.params,
+                Some(("Remove Background", "Background removed")),
+            );
+        }
         self.state
             .commit_filter(dialog.doc, &RemoveBackground, &dialog.params)
     }
@@ -694,6 +778,11 @@ impl EditorApp {
                 self.remove_background_ok();
             }
             crate::extract_ui::DialogOutcome::Cancel => self.remove_background_cancel(),
+            crate::extract_ui::DialogOutcome::Source(canvas) => {
+                self.remove_background_cancel();
+                self.tool_options.extract_from_canvas = canvas;
+                self.open_remove_background();
+            }
         }
     }
 
@@ -704,10 +793,15 @@ impl EditorApp {
         if self.transform_active() || self.dialog_open() {
             return false;
         }
-        let Some((id, pixels)) = self.active_pixels() else {
+        let Some(input) = self.extraction_input() else {
             return false;
         };
-        self.auto_detect = Some(AutoDetectDialog::new(id, &pixels));
+        self.auto_detect = Some(AutoDetectDialog::new(
+            input.id,
+            &input.image,
+            input.selection.as_ref(),
+            input.canvas,
+        ));
         true
     }
 
@@ -727,10 +821,18 @@ impl EditorApp {
         let name = self.document_name(dialog.doc);
         let crops = dialog.crops();
         let added = crops.len();
-        let params = serde_json::json!({
-            "min_size": dialog.params.min_size,
-            "merge_distance": dialog.params.merge_distance,
-        });
+        let region = self
+            .state
+            .document(dialog.doc)
+            .and_then(|o| o.document.selection().and_then(selection::bounds));
+        let params = Self::with_source(
+            serde_json::json!({
+                "min_size": dialog.params.min_size,
+                "merge_distance": dialog.params.merge_distance,
+            }),
+            dialog.canvas,
+            region,
+        );
         for (image, rect) in crops {
             let origin = self.origin_of(dialog.doc, "auto_detect", params.clone());
             self.state.assets.add_with(&name, image, rect, origin);
@@ -741,6 +843,140 @@ impl EditorApp {
 
     pub fn auto_detect_cancel(&mut self) {
         self.auto_detect = None;
+    }
+
+    // --- Library round trip -----------------------------------------------------
+
+    /// The library asset the document was opened from (Edit a Copy).
+    pub fn library_link(&self, doc: DocId) -> Option<u64> {
+        self.library_links.get(&doc).map(|l| l.asset)
+    }
+
+    /// Whether File ▸ Save Back to Library can run on `doc` now: linked, and
+    /// no stroke, transform, filter preview, or preview layer in progress.
+    pub fn can_save_back(&self, doc: DocId) -> bool {
+        self.library_links.contains_key(&doc)
+            && self
+                .state
+                .document(doc)
+                .is_some_and(|o| !o.has_live_edit() && !o.has_temp_layer())
+    }
+
+    /// File → Save Back to Library: the current document becomes a new
+    /// version of its asset (single: the visible composite; animation: one
+    /// frame per layer, bottom to top). If the asset was removed, a new asset
+    /// is added and linked. Returns the asset id.
+    pub fn save_back_to_library(&mut self) -> Option<u64> {
+        let doc = self.state.current_id()?;
+        if !self.can_save_back(doc) {
+            return None;
+        }
+        let link = *self.library_links.get(&doc)?;
+        let open = self.state.document(doc)?;
+        // The kind of the asset when it was opened (it may have been removed).
+        let animation = link.animation;
+        let frames: Vec<image::RgbaImage> = if animation {
+            open.document
+                .layers()
+                .iter()
+                .map(|l| l.pixels.clone())
+                .collect()
+        } else {
+            vec![open.document.composite()]
+        };
+        let id = if self.state.assets.get(link.asset).is_some() {
+            let first = frames[0].clone();
+            let rest = if animation { frames } else { Vec::new() };
+            self.state.assets.set_image(link.asset, first, rest)?;
+            self.status_message = Some(format!(
+                "Saved back to the library (version {})",
+                self.state.assets.get(link.asset).map_or(1, |a| a.version)
+            ));
+            link.asset
+        } else {
+            let name = open.document.name.trim_end_matches(" (library)").to_owned();
+            let size = PixelRect::new(0, 0, frames[0].width(), frames[0].height());
+            let origin = self.origin_of(doc, "edit", serde_json::Value::Null);
+            let id = if animation {
+                self.state
+                    .assets
+                    .add_animation_with(&name, frames, size, origin)
+            } else {
+                self.state
+                    .assets
+                    .add_with(&name, frames[0].clone(), size, origin)
+            };
+            if let Some(n) = self.state.assets.get(id).map(|a| a.name.clone()) {
+                if n != name {
+                    self.state.assets.rename(id, &name);
+                }
+            }
+            self.library_links.insert(
+                doc,
+                LibraryLink {
+                    asset: id,
+                    animation,
+                },
+            );
+            self.after_assets_added(1);
+            id
+        };
+        self.state.mark_saved(doc);
+        Some(id)
+    }
+
+    /// Image → Clean Up: despeckle the active layer and crop the canvas to
+    /// the visible content (one undo step). Returns whether anything changed.
+    pub fn clean_up_document(&mut self) -> bool {
+        let Some(open) = self.state.current_document() else {
+            return false;
+        };
+        let id = open.id;
+        let Some(clean) = crate::cleanup::clean_document(&open.document) else {
+            self.status_message = Some("Already clean".to_owned());
+            return false;
+        };
+        match self.state.execute(
+            id,
+            Box::new(crate::undo::SwapDocument::new("Clean Up", clean)),
+        ) {
+            Ok(()) => true,
+            Err(err) => {
+                self.error = Some(err.to_string());
+                false
+            }
+        }
+    }
+
+    /// A library asset dropped on document `doc` at an image point: a new
+    /// layer named after it above the active layer, centred on the point and
+    /// clipped to the canvas (animations: the first frame). One undo step.
+    /// Drops outside the image do nothing.
+    pub fn drop_asset(&mut self, doc: DocId, asset: u64, point: (f32, f32)) -> bool {
+        let Some(a) = self.state.assets.get(asset) else {
+            return false;
+        };
+        let Some(open) = self.state.document(doc) else {
+            return false;
+        };
+        let (w, h) = (open.document.width(), open.document.height());
+        // Only drops on the image itself (not the grey area around it).
+        if !(0.0..w as f32).contains(&point.0) || !(0.0..h as f32).contains(&point.1) {
+            return false;
+        }
+        let image = &a.image;
+        let x = (point.0 - image.width() as f32 / 2.0).round() as i64;
+        let y = (point.1 - image.height() as f32 / 2.0).round() as i64;
+        let mut pixels = image::RgbaImage::new(w, h);
+        image::imageops::replace(&mut pixels, image, x, y);
+        let layer = crate::document::Layer::new(a.name.clone(), pixels);
+        let index = open.document.active_layer() + 1;
+        self.state
+            .execute(
+                doc,
+                Box::new(layers::insert_layer("Add Asset Layer", index, layer)),
+            )
+            .is_ok()
     }
 
     // --- Find Repeating Pattern -----------------------------------------------
@@ -847,6 +1083,11 @@ impl EditorApp {
                 self.auto_detect_add();
             }
             DetectOutcome::Cancel => self.auto_detect_cancel(),
+            DetectOutcome::Source(canvas) => {
+                self.auto_detect_cancel();
+                self.tool_options.extract_from_canvas = canvas;
+                self.open_auto_detect();
+            }
         }
     }
 
@@ -873,9 +1114,13 @@ impl EditorApp {
 
     /// Extract → Add Selection to Library.
     pub fn add_selection_to_library(&mut self) -> bool {
-        let Some((id, pixels)) = self.active_pixels() else {
+        if self.extraction_blocked() {
+            return false;
+        }
+        let Some(input) = self.extraction_input() else {
             return false;
         };
+        let (id, pixels) = (input.id, input.image);
         let Some(selection) = self
             .state
             .document(id)
@@ -887,7 +1132,11 @@ impl EditorApp {
             return false;
         };
         let name = self.document_name(id);
-        let origin = self.origin_of(id, "selection", serde_json::Value::Null);
+        let origin = self.origin_of(
+            id,
+            "selection",
+            Self::with_source(serde_json::Value::Null, input.canvas, Some(input.region)),
+        );
         self.state.assets.add_with(&name, image, rect, origin);
         self.after_assets_added(1);
         true
@@ -937,9 +1186,28 @@ impl EditorApp {
     }
 
     /// An Extract Object click or box on document `id`.
+    /// Whether extraction must wait: Remove Background is open (its preview
+    /// would be read as part of the canvas or layer).
+    fn extraction_blocked(&self) -> bool {
+        self.remove_background.is_some()
+            || self
+                .state
+                .current_document()
+                .is_some_and(|o| o.has_temp_layer())
+    }
+
     fn extract_event(&mut self, id: DocId, event: CanvasEvent) {
-        if self.extract.as_ref().is_none_or(|s| s.doc != id) {
-            self.extract = Some(ExtractSession::new(id));
+        if self.extraction_blocked() {
+            self.status_message = Some("Finish or cancel Remove Background first".to_owned());
+            return;
+        }
+        let canvas = self.tool_options.extract_from_canvas;
+        if self
+            .extract
+            .as_ref()
+            .is_none_or(|s| s.doc != id || s.canvas != canvas)
+        {
+            self.extract = Some(ExtractSession::with_source(id, canvas));
         }
         let session = self.extract.as_mut().expect("session just set");
         match event {
@@ -967,13 +1235,20 @@ impl EditorApp {
         let Some(open) = self.state.document(session.doc) else {
             return;
         };
-        let Some(layer) = open.document.layer(open.active_layer()) else {
-            return;
+        let pixels = if session.canvas {
+            open.document.composite()
+        } else {
+            let Some(layer) = open.document.layer(open.active_layer()) else {
+                return;
+            };
+            layer.pixels.clone()
         };
-        // Cache key for the MobileSAM embedding: document, layer, and content.
-        let key =
-            (open.id.0 << 40) ^ ((open.active_layer() as u64) << 32) ^ open.undo_stack().state_id();
-        let image = std::sync::Arc::new(layer.pixels.clone());
+        // Cache key for the MobileSAM embedding: document, source, and content.
+        let key = (open.id.0 << 40)
+            ^ ((open.active_layer() as u64) << 32)
+            ^ ((session.canvas as u64) << 63)
+            ^ open.undo_stack().state_id();
+        let image = std::sync::Arc::new(pixels);
         if self.segmenter.is_none() {
             self.segmenter = Some(Segmenter::new(self.segment_config.clone(), self.notify()));
         }
@@ -999,12 +1274,18 @@ impl EditorApp {
         let Some(id) = self.state.current_id() else {
             return false;
         };
+        if self.extraction_blocked() {
+            return false;
+        }
         self.extract_event(id, event);
         true
     }
 
     /// Add to Library: the mask over the active layer becomes an asset.
     pub fn extract_accept(&mut self) -> bool {
+        if self.extraction_blocked() {
+            return false;
+        }
         let Some(session) = &self.extract else {
             return false;
         };
@@ -1015,10 +1296,17 @@ impl EditorApp {
         let Some(open) = self.state.document(doc) else {
             return false;
         };
-        let Some(layer) = open.document.layer(open.active_layer()) else {
-            return false;
+        let pixels = if session.canvas {
+            open.document.composite()
+        } else {
+            let Some(layer) = open.document.layer(open.active_layer()) else {
+                return false;
+            };
+            layer.pixels.clone()
         };
-        let Some((image, rect)) = extraction::tight_crop(&layer.pixels, mask) else {
+        let region = open.document.selection().and_then(selection::bounds);
+        let canvas = session.canvas;
+        let Some((image, rect)) = extraction::tight_crop(&pixels, mask) else {
             return false;
         };
         let name = self.document_name(doc);
@@ -1026,11 +1314,15 @@ impl EditorApp {
             Some(Engine::Sam) => "MobileSAM",
             _ => "GrabCut",
         };
-        let params = serde_json::json!({
-            "engine": engine,
-            "points": session.prompt.points,
-            "box": session.prompt.rect,
-        });
+        let params = Self::with_source(
+            serde_json::json!({
+                "engine": engine,
+                "points": session.prompt.points,
+                "box": session.prompt.rect,
+            }),
+            canvas,
+            region,
+        );
         let origin = self.origin_of(doc, "extract_object", params);
         self.state.assets.add_with(&name, image, rect, origin);
         self.extract = None;
@@ -1040,6 +1332,9 @@ impl EditorApp {
 
     /// To Selection: the mask becomes the document selection (undoable).
     pub fn extract_to_selection(&mut self) -> bool {
+        if self.extraction_blocked() {
+            return false;
+        }
         let Some(session) = &self.extract else {
             return false;
         };
@@ -1109,6 +1404,19 @@ impl EditorApp {
                 } => {
                     if let Some(session) = &mut self.extract {
                         if session.request == id {
+                            // Results never extend beyond the selection.
+                            let selection = self
+                                .state
+                                .document(session.doc)
+                                .and_then(|o| o.document.selection().cloned());
+                            let mut mask = mask;
+                            if let Some(sel) =
+                                selection.filter(|s| s.dimensions() == mask.dimensions())
+                            {
+                                for (m, s) in mask.pixels_mut().zip(sel.pixels()) {
+                                    m[0] = m[0].min(s[0]);
+                                }
+                            }
                             session.set_mask(mask, engine, note);
                         }
                     }
@@ -1491,14 +1799,27 @@ impl EditorApp {
                 self.state.assets.remove_category(&c);
             }
             LibraryAction::AutoTag(ids) => self.queue_tagging(&ids, true),
+            LibraryAction::CleanUp(ids) => {
+                let changed = self.state.assets.clean_up(&ids);
+                self.status_message = Some(match changed.len() {
+                    0 => "Already clean".to_owned(),
+                    1 => "Cleaned up 1 asset".to_owned(),
+                    n => format!("Cleaned up {n} assets"),
+                });
+            }
+            LibraryAction::RestoreVersion(id, version) => {
+                if let Some(v) = self.state.assets.restore_version(id, version) {
+                    self.status_message = Some(format!("Restored as version {v}"));
+                }
+            }
             LibraryAction::DownloadTagger => self.start_tag_download(),
             LibraryAction::Reveal(id) => {
                 if let (Some(dir), Some(a)) = (self.state.assets.dir(), self.state.assets.get(id)) {
-                    let file = if a.is_animation() {
-                        format!("{id}_01.png")
-                    } else {
-                        format!("{id}.png")
-                    };
+                    let file = a
+                        .versions
+                        .last()
+                        .and_then(|v| v.files.first().cloned())
+                        .unwrap_or_else(|| format!("{id}.png"));
                     let _ = std::process::Command::new("open")
                         .arg("-R")
                         .arg(dir.join("assets").join(file))
@@ -1578,10 +1899,12 @@ impl EditorApp {
                 None
             }
             AssetAction::Open(id) => {
+                // Edit a Copy: a document linked to the asset.
                 let asset = self.state.assets.get(id)?;
-                if asset.is_animation() {
-                    let (name, frames) = (asset.name.clone(), asset.frames.clone());
-                    return match self.state.new_document_from_frames(name, frames) {
+                let name = format!("{} (library)", asset.name);
+                let doc = if asset.is_animation() {
+                    let frames = asset.frames.clone();
+                    match self.state.new_document_from_frames(name, frames) {
                         Ok(doc) => {
                             self.add_document_tab(doc);
                             Some(doc)
@@ -1590,10 +1913,21 @@ impl EditorApp {
                             self.error = Some(err.to_string());
                             None
                         }
-                    };
-                }
-                let (name, image) = (asset.name.clone(), asset.image.clone());
-                self.open_image_document(name, image)
+                    }
+                } else {
+                    let image = asset.image.clone();
+                    self.open_image_document(name, image)
+                }?;
+                let animation = self.state.assets.get(id).is_some_and(|a| a.is_animation());
+                self.library_links.insert(
+                    doc,
+                    LibraryLink {
+                        asset: id,
+                        animation,
+                    },
+                );
+                self.state.mark_saved(doc);
+                Some(doc)
             }
             AssetAction::Remove(ids) => {
                 self.state.assets.remove(&ids);
@@ -1990,6 +2324,15 @@ impl EditorApp {
         let Some(id) = self.state.current_id() else {
             return;
         };
+        if self
+            .state
+            .current_document()
+            .is_some_and(|o| o.has_temp_layer())
+        {
+            // Rows and indices include Remove Background's preview layer.
+            self.status_message = Some("Finish or cancel Remove Background first".to_owned());
+            return;
+        }
         let active = self
             .state
             .current_document()
@@ -2303,6 +2646,9 @@ impl EditorApp {
             }
         }
         match event {
+            CanvasEvent::DropAsset { asset, point } => {
+                self.drop_asset(id, asset, point);
+            }
             CanvasEvent::ExtractPoint { .. } | CanvasEvent::ExtractBox { .. } => {
                 self.extract_event(id, event);
             }
@@ -3202,6 +3548,11 @@ impl EditorApp {
 
     fn menu_bar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         let has_document = self.state.current_document().is_some();
+        let linked = self
+            .state
+            .current_id()
+            .is_some_and(|id| self.can_save_back(id));
+        let mut save_back = false;
         ui.menu_button("File", |ui| {
             let mut item = |ui: &mut egui::Ui, label: &str, shortcut, enabled, action| {
                 let button =
@@ -3221,10 +3572,19 @@ impl EditorApp {
                 Action::SaveAs,
             );
             item(ui, "Export…", SHORTCUT_EXPORT, has_document, Action::Export);
+            if ui
+                .add_enabled(linked, egui::Button::new("Save Back to Library"))
+                .clicked()
+            {
+                save_back = true;
+            }
             ui.separator();
             item(ui, "Close", SHORTCUT_CLOSE, has_document, Action::Close);
             item(ui, "Quit", SHORTCUT_QUIT, true, Action::Quit);
         });
+        if save_back {
+            actions.push(Action::SaveBack);
+        }
         let stack = self.state.current_document().map(|open| open.undo_stack());
         let undo_label = stack.and_then(|s| s.undo_label()).map(str::to_owned);
         let redo_label = stack.and_then(|s| s.redo_label()).map(str::to_owned);
@@ -3329,6 +3689,16 @@ impl EditorApp {
                 has_selection,
                 Action::Radius(RadiusOp::Feather),
             );
+        });
+        let can_clean = has_document && !self.transform_active() && !self.dialog_open();
+        ui.menu_button("Image", |ui| {
+            if ui
+                .add_enabled(can_clean, egui::Button::new("Clean Up"))
+                .on_hover_text("Remove stray alpha specks on the active layer and crop the canvas to the visible content")
+                .clicked()
+            {
+                actions.push(Action::CleanUpDocument);
+            }
         });
         if let Some(open) = self.state.current_document() {
             ui.menu_button("Layer", |ui| {
@@ -3532,6 +3902,12 @@ impl EditorApp {
                 }
             }
             Action::Close => self.close_current(),
+            Action::SaveBack => {
+                self.save_back_to_library();
+            }
+            Action::CleanUpDocument => {
+                self.clean_up_document();
+            }
             Action::Quit => {
                 let _ = ctx;
                 self.request_quit();
@@ -3805,6 +4181,7 @@ impl EditorApp {
     }
 
     fn forget_document(&mut self, id: DocId) {
+        self.library_links.remove(&id);
         self.state.close(id);
         self.canvases.remove(&id);
     }
@@ -4013,6 +4390,24 @@ impl Viewer<'_> {
                 draw_overlays(ui, rect, &view, size, session, detect);
             }
         }
+        // A library asset released over the canvas.
+        if let (Some(rect), Some(view)) = (canvas.rect(), canvas.view()) {
+            let released = ui.input(|i| i.pointer.any_released());
+            let pos = ui.ctx().pointer_latest_pos();
+            if let Some(pos) = pos.filter(|p| released && rect.contains(*p)) {
+                if let Some(drag) = egui::DragAndDrop::take_payload::<AssetDrag>(ui.ctx()) {
+                    let ppp = ui.ctx().pixels_per_point();
+                    let p = view.view_to_image(pos - rect.min.to_vec2(), ppp);
+                    self.requests.push((
+                        id,
+                        CanvasEvent::DropAsset {
+                            asset: drag.0,
+                            point: (p.x, p.y),
+                        },
+                    ));
+                }
+            }
+        }
         if let (Some(dialog), Some(rect), Some(view)) = (pattern, canvas.rect(), canvas.view()) {
             pattern_ui::draw_overlay(ui, rect, &view, dialog);
         }
@@ -4081,6 +4476,10 @@ fn tool_options_strip(
     ui.horizontal(|ui| {
         if let (Some(strip), false) = (extract, transform_active) {
             ui.label(tool.label());
+            ui.separator();
+            ui.label("Source");
+            ui.selectable_value(&mut options.extract_from_canvas, true, "Canvas");
+            ui.selectable_value(&mut options.extract_from_canvas, false, "Active layer");
             ui.separator();
             ui.label(&strip.status);
             ui.separator();
@@ -4263,4 +4662,22 @@ fn export_file_dialog(document_name: &str) -> Option<PathBuf> {
         path.set_extension("png");
     }
     Some(path)
+}
+
+/// What an extraction tool reads (see `EditorApp::extraction_input`).
+struct ExtractionInput {
+    id: DocId,
+    image: image::RgbaImage,
+    selection: Option<image::GrayImage>,
+    /// The selection's bounds, or the whole canvas.
+    region: PixelRect,
+    canvas: bool,
+}
+
+/// A document opened with Edit a Copy: its asset and whether it was an
+/// animation when opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LibraryLink {
+    asset: u64,
+    animation: bool,
 }
