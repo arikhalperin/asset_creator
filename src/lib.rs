@@ -15,6 +15,8 @@ pub mod layers_panel;
 pub mod library;
 pub mod library_ui;
 pub mod paint;
+pub mod pattern;
+pub mod pattern_ui;
 pub mod project;
 pub mod review_ui;
 pub mod selection;

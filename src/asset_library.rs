@@ -11,15 +11,22 @@ use serde::{Deserialize, Serialize};
 use crate::document::PixelRect;
 
 /// Categories a new library starts with.
-pub const DEFAULT_CATEGORIES: [&str; 7] = [
+pub const DEFAULT_CATEGORIES: [&str; 8] = [
     "chalice",
     "skeleton",
     "potion",
     "deathtrap",
     "wall",
     "prop",
+    "pattern",
     "other",
 ];
+
+/// Category of tiles saved by the pattern tool (never chosen by auto-tagging).
+pub const PATTERN: &str = "pattern";
+
+/// `library.json` format version (2 added the "pattern" category).
+const MANIFEST_VERSION: u32 = 2;
 
 /// The category that always exists (assets of removed categories move here).
 pub const OTHER: &str = "other";
@@ -255,6 +262,12 @@ impl AssetLibrary {
         }
         if !lib.categories.iter().any(|c| c == OTHER) {
             lib.categories.push(OTHER.to_owned());
+        }
+        // Libraries from before patterns get the category once (a later
+        // removal by the user sticks).
+        if manifest.version < 2 && !lib.categories.iter().any(|c| c == PATTERN) {
+            let other = lib.categories.iter().position(|c| c == OTHER).unwrap();
+            lib.categories.insert(other, PATTERN.to_owned());
         }
         lib.next_id = manifest.next_id;
         lib.counters = manifest.counters;
@@ -530,7 +543,7 @@ impl AssetLibrary {
     fn persist(&mut self) {
         let Some(dir) = &self.dir else { return };
         let manifest = Manifest {
-            version: 1,
+            version: MANIFEST_VERSION,
             categories: self.categories.clone(),
             next_id: self.next_id,
             counters: self.counters.clone(),

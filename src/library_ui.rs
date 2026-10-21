@@ -32,6 +32,7 @@ pub enum ExportKind {
     Pngs,
     Sheet,
     Strips,
+    Tileable,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -43,6 +44,8 @@ pub struct ExportDialog {
     pub columns: u32,
     pub padding: u32,
     pub power_of_two: bool,
+    /// Tileable PNG repeats (columns, rows), 1–16 each.
+    pub repeat: (u32, u32),
 }
 
 impl ExportDialog {
@@ -54,12 +57,17 @@ impl ExportDialog {
             columns: 0,
             padding: 2,
             power_of_two: false,
+            repeat: (1, 1),
         }
     }
 
     pub fn format(&self) -> ExportFormat {
         match self.kind {
             ExportKind::Pngs => ExportFormat::Pngs,
+            ExportKind::Tileable => ExportFormat::Tileable {
+                columns: self.repeat.0,
+                rows: self.repeat.1,
+            },
             ExportKind::Strips => ExportFormat::Strips {
                 padding: self.padding,
             },
@@ -541,11 +549,20 @@ pub fn library_windows(
                 dialog.ids.len(),
                 if dialog.ids.len() == 1 { "" } else { "s" }
             ));
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.selectable_value(&mut dialog.kind, ExportKind::Pngs, "PNG files");
                 ui.selectable_value(&mut dialog.kind, ExportKind::Sheet, "Sprite sheet");
                 ui.selectable_value(&mut dialog.kind, ExportKind::Strips, "Animation strips");
+                ui.selectable_value(&mut dialog.kind, ExportKind::Tileable, "Tileable PNG");
             });
+            if dialog.kind == ExportKind::Tileable {
+                ui.horizontal(|ui| {
+                    ui.label("Repeat");
+                    ui.add(egui::DragValue::new(&mut dialog.repeat.0).range(1..=16));
+                    ui.label("×");
+                    ui.add(egui::DragValue::new(&mut dialog.repeat.1).range(1..=16));
+                });
+            }
             if dialog.kind == ExportKind::Sheet {
                 ui.horizontal(|ui| {
                     ui.label("Layout");
@@ -560,7 +577,7 @@ pub fn library_windows(
                 }
                 ui.checkbox(&mut dialog.power_of_two, "Power-of-two size");
             }
-            if dialog.kind != ExportKind::Pngs {
+            if !matches!(dialog.kind, ExportKind::Pngs | ExportKind::Tileable) {
                 ui.horizontal(|ui| {
                     ui.label("Padding");
                     ui.add(

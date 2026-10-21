@@ -1,0 +1,8 @@
+brick_red, brick_grey, cobblestone, stone: built from ambientCG textures
+(Bricks097, Bricks085, PavingStones138, Rock051), https://ambientcg.com,
+licensed CC0 1.0 Universal (public domain). The color maps were downscaled to
+the tile size in patterns.json and repeated from a shifted origin; *_source.png
+are the whole textures downscaled to 256 px. *_q80.jpg are JPEG quality 80;
+*_noise8.png add Gaussian noise (sigma 8).
+
+brick_synthetic*: generated running-bond brick (no license restrictions).

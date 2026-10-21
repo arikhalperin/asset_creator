@@ -398,6 +398,9 @@ pub enum ExportFormat {
     /// Each animation as a horizontal strip with its atlas (single assets
     /// as PNGs).
     Strips { padding: u32 },
+    /// One PNG per asset (frames numbered) into a folder, each image the
+    /// asset repeated `columns` × `rows` times (1 × 1: the tile itself).
+    Tileable { columns: u32, rows: u32 },
 }
 
 /// Exports `assets` to `target` (a folder for PNGs and strips; the sheet
@@ -409,6 +412,23 @@ pub fn export(
 ) -> Result<Vec<PathBuf>, String> {
     match format {
         ExportFormat::Pngs => crate::asset_library::save_assets(assets.iter().copied(), target),
+        ExportFormat::Tileable { columns, rows } => {
+            let (columns, rows) = (columns.clamp(1, 16), rows.clamp(1, 16));
+            let tiled: Vec<Asset> = assets
+                .iter()
+                .map(|a| {
+                    let mut t = (*a).clone();
+                    t.image = crate::pattern::repeat(&a.image, columns, rows);
+                    t.frames = a
+                        .frames
+                        .iter()
+                        .map(|f| crate::pattern::repeat(f, columns, rows))
+                        .collect();
+                    t
+                })
+                .collect();
+            crate::asset_library::save_assets(tiled.iter(), target)
+        }
         ExportFormat::Sheet(opts) => {
             let (frames, animations) = frames_of(assets);
             write_sheet(&pack(&frames, animations, &opts)?, target)

@@ -18,6 +18,7 @@ mod gaussian_blur;
 mod hue_saturation;
 mod invert;
 mod levels;
+mod make_seamless;
 mod median;
 mod motion_blur;
 mod posterize;
@@ -39,10 +40,17 @@ pub enum Category {
     Blur,
     Sharpen,
     Noise,
+    Tile,
 }
 
 impl Category {
-    pub const ALL: [Category; 4] = [Self::Adjustments, Self::Blur, Self::Sharpen, Self::Noise];
+    pub const ALL: [Category; 5] = [
+        Self::Adjustments,
+        Self::Blur,
+        Self::Sharpen,
+        Self::Noise,
+        Self::Tile,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -50,6 +58,7 @@ impl Category {
             Self::Blur => "Blur",
             Self::Sharpen => "Sharpen",
             Self::Noise => "Noise",
+            Self::Tile => "Tile",
         }
     }
 }
@@ -256,7 +265,7 @@ pub trait Filter: Sync {
 
 /// Every filter, in menu order.
 pub fn registry() -> &'static [&'static dyn Filter] {
-    static FILTERS: [&dyn Filter; 14] = [
+    static FILTERS: [&dyn Filter; 15] = [
         &brightness_contrast::BrightnessContrast,
         &levels::Levels,
         &curves::Curves,
@@ -271,6 +280,7 @@ pub fn registry() -> &'static [&'static dyn Filter] {
         &unsharp_mask::UnsharpMask,
         &add_noise::AddNoise,
         &median::Median,
+        &make_seamless::MakeSeamless,
     ];
     &FILTERS
 }
@@ -637,10 +647,10 @@ mod tests {
     #[test]
     fn registry_ids_are_unique_and_schemas_valid() {
         let mut ids: Vec<&str> = registry().iter().map(|f| f.id()).collect();
-        assert_eq!(ids.len(), 14);
+        assert_eq!(ids.len(), 15);
         ids.sort();
         ids.dedup();
-        assert_eq!(ids.len(), 14, "unique ids");
+        assert_eq!(ids.len(), 15, "unique ids");
         for f in registry() {
             let schema = f.params();
             let mut keys: Vec<&str> = schema.iter().map(|s| s.key).collect();
