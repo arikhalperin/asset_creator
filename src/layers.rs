@@ -102,6 +102,16 @@ fn layer_bytes(layer: Option<&Layer>) -> usize {
     })
 }
 
+/// Inserts `layer` at `index` (made active) as one undo step named `label`.
+pub fn insert_layer(label: &'static str, index: usize, layer: Layer) -> InsertLayer {
+    InsertLayer {
+        label,
+        index,
+        layer: Some(layer),
+        previous_active: 0,
+    }
+}
+
 /// Layer → New Layer: a transparent layer above the active one.
 pub fn new_layer(doc: &Document) -> InsertLayer {
     InsertLayer {

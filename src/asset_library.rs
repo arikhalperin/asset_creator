@@ -78,6 +78,22 @@ pub struct Asset {
     pub origin: Origin,
     /// Seconds since the Unix epoch.
     pub created: u64,
+    /// Current version (1 = as added).
+    pub version: u32,
+    /// Every version, oldest first (the last is the current one).
+    pub versions: Vec<Version>,
+}
+
+/// One stored version of an asset's image(s).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Version {
+    pub version: u32,
+    /// Seconds since the Unix epoch.
+    pub created: u64,
+    /// File names in the library's `assets/` folder.
+    pub files: Vec<String>,
+    pub width: u32,
+    pub height: u32,
 }
 
 impl Asset {
@@ -142,6 +158,11 @@ struct Entry {
     source: EntrySource,
     extraction: Extraction,
     created: u64,
+    /// 0 in libraries from before versions (read as 1).
+    #[serde(default)]
+    version: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    versions: Vec<Version>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -172,6 +193,9 @@ pub struct AssetLibrary {
     /// Entries that could not be loaded: kept (metadata and files untouched)
     /// so they survive later saves and can be repaired.
     broken: Vec<Entry>,
+    /// Older versions' images of an in-memory library (on disk they are
+    /// read from their files).
+    memory_versions: HashMap<(u64, u32), Vec<RgbaImage>>,
 }
 
 impl Default for AssetLibrary {
@@ -184,6 +208,7 @@ impl Default for AssetLibrary {
             dir: None,
             notices: Vec::new(),
             broken: Vec::new(),
+            memory_versions: HashMap::new(),
         }
     }
 }
@@ -390,7 +415,17 @@ impl AssetLibrary {
             tags: Vec::new(),
             origin,
             created: now(),
+            version: 1,
+            versions: Vec::new(),
         };
+        let mut asset = asset;
+        asset.versions = vec![Version {
+            version: 1,
+            created: asset.created,
+            files: version_files(&asset, 1),
+            width: asset.image.width(),
+            height: asset.image.height(),
+        }];
         if let Some(dir) = &self.dir {
             for (file, frame) in entry_files(&asset).iter().zip(asset.all_frames()) {
                 if let Err(e) = save_png_atomic(frame, &dir.join("assets").join(file)) {
@@ -412,10 +447,123 @@ impl AssetLibrary {
         self.persist();
         if let Some(dir) = &self.dir {
             for asset in &gone {
-                for file in entry_files(asset) {
+                for v in &asset.versions {
+                    for file in &v.files {
+                        let _ = std::fs::remove_file(dir.join("assets").join(file));
+                    }
+                }
+            }
+        }
+        self.memory_versions.retain(|(id, _), _| !ids.contains(id));
+    }
+
+    /// Stores new image(s) for an asset as its next version (`frames` empty:
+    /// a single image). Files are written before the metadata. Returns the
+    /// new version number.
+    pub fn set_image(&mut self, id: u64, image: RgbaImage, frames: Vec<RgbaImage>) -> Option<u32> {
+        let dir = self.dir.clone();
+        let asset = self.assets.iter_mut().find(|a| a.id == id)?;
+        let old = (
+            asset.version,
+            asset.all_frames().into_iter().cloned().collect::<Vec<_>>(),
+        );
+        let previous = (asset.image.clone(), asset.frames.clone());
+        let next = asset.versions.iter().map(|v| v.version).max().unwrap_or(1) + 1;
+        let image = if frames.is_empty() {
+            image
+        } else {
+            frames[0].clone()
+        };
+        asset.image = image;
+        asset.frames = frames;
+        asset.version = next;
+        let version = Version {
+            version: next,
+            created: now(),
+            files: version_files(asset, next),
+            width: asset.image.width(),
+            height: asset.image.height(),
+        };
+        let mut errors = Vec::new();
+        if let Some(dir) = &dir {
+            for (file, frame) in version.files.iter().zip(asset.all_frames()) {
+                if let Err(e) = save_png_atomic(frame, &dir.join("assets").join(file)) {
+                    errors.push(e);
+                }
+            }
+        }
+        if !errors.is_empty() {
+            // Keep the previous version current; never reference missing files.
+            if let Some(dir) = &dir {
+                for file in &version.files {
                     let _ = std::fs::remove_file(dir.join("assets").join(file));
                 }
             }
+            asset.version = old.0;
+            (asset.image, asset.frames) = previous;
+            self.notices.extend(errors);
+            return None;
+        }
+        if dir.is_none() {
+            self.memory_versions.insert((id, old.0), old.1);
+        }
+        asset.versions.push(version);
+        self.persist();
+        Some(next)
+    }
+
+    /// Clean Up: despeckles and crops each asset; changed ones get a new
+    /// version. Returns the ids that changed.
+    pub fn clean_up(&mut self, ids: &[u64]) -> Vec<u64> {
+        let mut changed = Vec::new();
+        for &id in ids {
+            let Some(asset) = self.get(id) else { continue };
+            let frames: Vec<RgbaImage> = asset.all_frames().into_iter().cloned().collect();
+            let animation = asset.is_animation();
+            let Some(clean) = crate::cleanup::clean_frames(&frames) else {
+                continue;
+            };
+            if clean == frames {
+                continue;
+            }
+            let first = clean[0].clone();
+            let frames = if animation { clean } else { Vec::new() };
+            if self.set_image(id, first, frames).is_some() {
+                changed.push(id);
+            }
+        }
+        changed
+    }
+
+    /// The image(s) of one version of an asset (frames for animations).
+    pub fn version_images(&self, id: u64, version: u32) -> Option<Vec<RgbaImage>> {
+        let asset = self.get(id)?;
+        if asset.version == version {
+            return Some(asset.all_frames().into_iter().cloned().collect());
+        }
+        let v = asset.versions.iter().find(|v| v.version == version)?;
+        match &self.dir {
+            Some(dir) => v
+                .files
+                .iter()
+                .map(|f| {
+                    image::open(dir.join("assets").join(f))
+                        .ok()
+                        .map(|i| i.into_rgba8())
+                })
+                .collect(),
+            None => self.memory_versions.get(&(id, version)).cloned(),
+        }
+    }
+
+    /// Makes an older version current again (as a new version).
+    pub fn restore_version(&mut self, id: u64, version: u32) -> Option<u32> {
+        let images = self.version_images(id, version)?;
+        let animation = self.get(id)?.is_animation() || images.len() > 1;
+        if animation {
+            self.set_image(id, images[0].clone(), images)
+        } else {
+            self.set_image(id, images[0].clone(), Vec::new())
         }
     }
 
@@ -585,12 +733,27 @@ pub fn save_assets<'a>(
 
 /// File names of an asset inside the library's `assets/` folder.
 fn entry_files(asset: &Asset) -> Vec<String> {
+    match asset.versions.last() {
+        Some(v) => v.files.clone(),
+        None => version_files(asset, 1),
+    }
+}
+
+/// File names of one version: version 1 keeps the original names
+/// (`<id>.png`, `<id>_01.png`, …), later ones are `<id>.v<n>.png`,
+/// `<id>.v<n>_01.png`, ….
+fn version_files(asset: &Asset, version: u32) -> Vec<String> {
+    let base = if version <= 1 {
+        asset.id.to_string()
+    } else {
+        format!("{}.v{version}", asset.id)
+    };
     if asset.is_animation() {
         (1..=asset.frames.len())
-            .map(|i| format!("{}_{i:02}.png", asset.id))
+            .map(|i| format!("{base}_{i:02}.png"))
             .collect()
     } else {
-        vec![format!("{}.png", asset.id)]
+        vec![format!("{base}.png")]
     }
 }
 
@@ -622,6 +785,8 @@ fn entry_of(a: &Asset) -> Entry {
             params: a.origin.params.clone(),
         },
         created: a.created,
+        version: a.version,
+        versions: a.versions.clone(),
     }
 }
 
@@ -662,6 +827,18 @@ fn load_entry(dir: &Path, e: &Entry) -> Result<Asset, String> {
             params: e.extraction.params.clone(),
         },
         created: e.created,
+        version: e.version.max(1),
+        versions: if e.versions.is_empty() {
+            vec![Version {
+                version: 1,
+                created: e.created,
+                files: e.files.clone(),
+                width: e.width,
+                height: e.height,
+            }]
+        } else {
+            e.versions.clone()
+        },
     })
 }
 

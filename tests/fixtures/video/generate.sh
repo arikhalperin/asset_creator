@@ -43,3 +43,11 @@ printf '{\n  "frames": 245,\n  "cuts": [45, 85, 115, 165, 200]\n}\n' > scenes.js
 
 # Not a video.
 head -c 4096 /dev/urandom > corrupt.mp4
+
+# Full-loop fixture: the CC0 Kenney skeleton sprite (tests/fixtures/tagging/
+# skeleton_01.png, Tiny Dungeon) scaled 2x with nearest neighbour, walking
+# across a plain teal background, 30 frames.
+$FF -f lavfi -i "color=c=0x1e465a:size=320x240:rate=30:duration=1" \
+    -loop 1 -i ../tagging/skeleton_01.png \
+    -filter_complex "[1]scale=96:112:flags=neighbor[s];[0][s]overlay=x='40+t*120':y=64:shortest=1,format=yuv420p" \
+    -frames:v 30 -c:v libx264 -g 30 -pix_fmt yuv420p skeleton.mp4

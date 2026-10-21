@@ -433,7 +433,7 @@ fn asset_library_panel_saves_opens_and_removes() {
     assert_eq!(selected, vec![h.app.state.assets.assets()[1].id]);
     let doc = h.app.asset_action(AssetAction::Open(selected[0])).unwrap();
     let opened = h.app.state.document(doc).unwrap();
-    assert_eq!(opened.document.name, "sheet_transparent 2");
+    assert_eq!(opened.document.name, "sheet_transparent 2 (library)");
     assert_eq!(
         opened.document.layer(0).unwrap().pixels,
         h.app.state.assets.assets()[1].image

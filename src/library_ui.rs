@@ -24,7 +24,15 @@ pub enum LibraryAction {
     /// Export… was confirmed in the dialog.
     Export(Vec<u64>, ExportFormat),
     DownloadTagger,
+    /// Clean Up: despeckle and crop (a new version for each changed asset).
+    CleanUp(Vec<u64>),
+    /// Make an older version current again.
+    RestoreVersion(u64, u32),
 }
+
+/// Drag-and-drop payload: a library asset being dragged onto a canvas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AssetDrag(pub u64);
 
 /// Choices in the Export dialog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,7 +103,8 @@ pub struct LibraryView {
     /// Category chips that are on (empty = All).
     pub chips: BTreeSet<String>,
     pub selected: BTreeSet<u64>,
-    textures: HashMap<(u64, usize), TextureHandle>,
+    /// Thumbnails by asset id and version.
+    textures: HashMap<(u64, u32), TextureHandle>,
     pub rename: Option<(u64, String)>,
     pub tags: Option<(u64, String)>,
     pub confirm_remove: Option<Vec<u64>>,
@@ -103,6 +112,21 @@ pub struct LibraryView {
     pub new_category: String,
     pub category_rename: Option<(String, String)>,
     pub export: Option<ExportDialog>,
+    /// The asset whose Versions… window is open.
+    pub versions: Option<u64>,
+    /// Version thumbnails by asset id and version.
+    version_textures: HashMap<(u64, u32), TextureHandle>,
+}
+
+impl LibraryView {
+    /// The version whose thumbnail the panel currently shows for an asset.
+    pub fn thumbnail_version(&self, id: u64) -> Option<u32> {
+        self.textures
+            .keys()
+            .filter(|(a, _)| *a == id)
+            .map(|(_, v)| *v)
+            .max()
+    }
 }
 
 impl Default for LibraryView {
@@ -119,6 +143,8 @@ impl Default for LibraryView {
             categories_open: false,
             new_category: String::new(),
             category_rename: None,
+            versions: None,
+            version_textures: HashMap::new(),
             export: None,
         }
     }
@@ -151,7 +177,7 @@ pub fn library_panel(
 ) -> Vec<LibraryAction> {
     let mut actions = Vec::new();
     view.textures
-        .retain(|(id, _), _| library.get(*id).is_some());
+        .retain(|(id, v), _| library.get(*id).is_some_and(|a| a.version == *v));
     view.selected.retain(|id| library.get(*id).is_some());
     view.chips.retain(|c| library.categories().contains(c));
 
@@ -270,10 +296,26 @@ pub fn library_panel(
             ));
         }
         if ui
-            .add_enabled(single.is_some(), egui::Button::new("Open as Document"))
+            .add_enabled(single.is_some(), egui::Button::new("Edit a Copy"))
+            .on_hover_text(
+                "Open as a document; File ▸ Save Back to Library stores it as a new version",
+            )
             .clicked()
         {
             actions.push(LibraryAction::Open(single.expect("enabled with one")));
+        }
+        if ui
+            .add_enabled(single.is_some(), egui::Button::new("Versions…"))
+            .clicked()
+        {
+            view.versions = single;
+        }
+        if ui
+            .add_enabled(!sel.is_empty(), egui::Button::new("Clean Up"))
+            .on_hover_text("Remove stray alpha specks and crop transparent borders")
+            .clicked()
+        {
+            actions.push(LibraryAction::CleanUp(sel.clone()));
         }
         if ui
             .add_enabled(single.is_some(), egui::Button::new("Reveal in Finder"))
@@ -309,7 +351,7 @@ pub fn library_panel(
                     let frames = asset.all_frames();
                     let texture = view
                         .textures
-                        .entry((asset.id, 0))
+                        .entry((asset.id, asset.version))
                         .or_insert_with(|| {
                             let image = frames[0];
                             let c = egui::ColorImage::from_rgba_unmultiplied(
@@ -317,7 +359,7 @@ pub fn library_panel(
                                 image.as_raw(),
                             );
                             ui.ctx().load_texture(
-                                format!("asset-{}", asset.id),
+                                format!("asset-{}-v{}", asset.id, asset.version),
                                 c,
                                 TextureOptions::NEAREST,
                             )
@@ -385,8 +427,31 @@ pub fn library_panel(
                             ui.small(category);
                         })
                         .response;
-                    let click =
-                        ui.interact(cell.rect, ui.id().with(("asset", asset.id)), Sense::click());
+                    let click = ui.interact(
+                        cell.rect,
+                        ui.id().with(("asset", asset.id)),
+                        Sense::click_and_drag(),
+                    );
+                    if click.drag_started() {
+                        egui::DragAndDrop::set_payload(ui.ctx(), AssetDrag(asset.id));
+                    }
+                    if click.dragged() {
+                        // The thumbnail follows the pointer while dragging.
+                        if let Some(p) = ui.ctx().pointer_latest_pos() {
+                            let painter = ui.ctx().layer_painter(egui::LayerId::new(
+                                egui::Order::Tooltip,
+                                egui::Id::new("asset-drag"),
+                            ));
+                            let (w, h) = (asset.image.width() as f32, asset.image.height() as f32);
+                            let s = (48.0 / w.max(h)).min(4.0);
+                            painter.image(
+                                texture.id(),
+                                Rect::from_center_size(p, Vec2::new(w, h) * s),
+                                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                Color32::from_white_alpha(200),
+                            );
+                        }
+                    }
                     if selected {
                         ui.painter().rect_stroke(
                             cell.rect.expand(2.0),
@@ -434,6 +499,91 @@ pub fn library_windows(
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
     };
+    view.version_textures
+        .retain(|(id, _), _| library.get(*id).is_some());
+    if let Some(id) = view.versions {
+        match library.get(id) {
+            None => view.versions = None,
+            Some(asset) => {
+                let mut open = true;
+                egui::Window::new(format!("Versions of {}", asset.name))
+                    .collapsible(false)
+                    .resizable(false)
+                    .open(&mut open)
+                    .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                    .show(ctx, |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height(360.0)
+                            .show(ui, |ui| {
+                                for v in asset.versions.iter().rev() {
+                                    ui.horizontal(|ui| {
+                                        let texture = view
+                                            .version_textures
+                                            .entry((id, v.version))
+                                            .or_insert_with(|| {
+                                                let image = library
+                                                    .version_images(id, v.version)
+                                                    .and_then(|f| f.into_iter().next())
+                                                    .unwrap_or_else(|| image::RgbaImage::new(1, 1));
+                                                let c = egui::ColorImage::from_rgba_unmultiplied(
+                                                    [
+                                                        image.width() as usize,
+                                                        image.height() as usize,
+                                                    ],
+                                                    image.as_raw(),
+                                                );
+                                                ctx.load_texture(
+                                                    format!("asset-{id}-version-{}", v.version),
+                                                    c,
+                                                    TextureOptions::NEAREST,
+                                                )
+                                            })
+                                            .clone();
+                                        let (rect, _) = ui
+                                            .allocate_exact_size(Vec2::splat(48.0), Sense::hover());
+                                        ui.painter().rect_filled(
+                                            rect,
+                                            2.0,
+                                            ui.visuals().extreme_bg_color,
+                                        );
+                                        let (w, h) =
+                                            (v.width.max(1) as f32, v.height.max(1) as f32);
+                                        let s = (48.0 / w).min(48.0 / h).min(8.0);
+                                        ui.painter().image(
+                                            texture.id(),
+                                            Rect::from_center_size(
+                                                rect.center(),
+                                                Vec2::new(w, h) * s,
+                                            ),
+                                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                            Color32::WHITE,
+                                        );
+                                        let current = v.version == asset.version;
+                                        ui.label(format!(
+                                            "Version {}{}\n{}   {} × {}",
+                                            v.version,
+                                            if current { " (current)" } else { "" },
+                                            format_time(v.created),
+                                            v.width,
+                                            v.height
+                                        ));
+                                        if ui
+                                            .add_enabled(!current, egui::Button::new("Restore"))
+                                            .clicked()
+                                        {
+                                            actions
+                                                .push(LibraryAction::RestoreVersion(id, v.version));
+                                        }
+                                    });
+                                }
+                            });
+                    });
+                if !open {
+                    view.versions = None;
+                }
+            }
+        }
+    }
     if let Some((id, mut text)) = view.rename.take() {
         let mut keep = true;
         small_window("Rename Asset").show(ctx, |ui| {
@@ -602,4 +752,33 @@ pub fn library_windows(
         }
     }
     actions
+}
+
+/// `YYYY-MM-DD HH:MM` (UTC) for seconds since the Unix epoch.
+pub fn format_time(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let (h, m) = ((secs % 86_400) / 3600, (secs % 3600) / 60);
+    // Civil date from days (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(mo <= 2);
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}")
+}
+
+#[cfg(test)]
+mod time_tests {
+    #[test]
+    fn formats_dates() {
+        assert_eq!(super::format_time(0), "1970-01-01 00:00");
+        assert_eq!(
+            super::format_time(1_792_540_800 + 3_660),
+            "2026-10-21 01:01"
+        );
+    }
 }

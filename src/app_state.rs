@@ -45,6 +45,9 @@ pub struct OpenDocument {
     transform: Option<TransformSession>,
     filter: Option<FilterSession>,
     last_stroke_end: Option<(f32, f32)>,
+    /// A preview-only layer (index, previously active layer) shown while a
+    /// canvas-source filter runs; never in the undo history.
+    temp_layer: Option<(usize, usize)>,
 }
 
 impl OpenDocument {
@@ -63,6 +66,7 @@ impl OpenDocument {
             transform: None,
             filter: None,
             last_stroke_end: None,
+            temp_layer: None,
         }
     }
 
@@ -135,12 +139,25 @@ impl OpenDocument {
             );
             self.repainted(Some(session.rect));
         }
+        if let Some((index, previous)) = self.temp_layer.take() {
+            let _ = self.document.remove_layer(index);
+            self.document.set_active_layer(previous);
+            self.edit_target = EditTarget::Pixels;
+            self.target_layer = previous;
+            self.repainted(Some(self.document.bounds()));
+        }
     }
 
     /// Whether a stroke, transform, or filter preview is showing unrecorded
     /// changes (Save and Export wait for it to finish).
     pub fn has_live_edit(&self) -> bool {
         self.stroke.is_some() || self.transform.is_some() || self.filter.is_some()
+    }
+
+    /// Whether a preview-only layer (Remove Background from the canvas) is
+    /// in the document; layer edits and history wait until it ends.
+    pub fn has_temp_layer(&self) -> bool {
+        self.temp_layer.is_some()
     }
 
     /// Whether a filter preview is in progress.
@@ -338,7 +355,7 @@ impl AppState {
     /// Previews layer properties live (e.g. while dragging the opacity
     /// slider) without recording history; finish with [`Self::commit_layer_props`].
     pub fn preview_layer_props(&mut self, id: DocId, index: usize, props: &LayerProps) {
-        if let Some(open) = self.document_mut(id) {
+        if let Some(open) = self.document_mut(id).filter(|o| o.temp_layer.is_none()) {
             if let Some(layer) = open.document.layer_mut(index) {
                 props.apply_to(layer);
                 let bounds = open.document.bounds();
@@ -460,6 +477,78 @@ impl AppState {
         self.cancel_stroke(id);
     }
 
+    /// Starts a filter preview on a temporary `layer` inserted above the
+    /// active one (outside the undo history); see [`Self::end_layer_filter`].
+    pub fn begin_layer_filter(&mut self, id: DocId, layer: Layer) -> Result<(), CommandError> {
+        let open = self
+            .document_mut(id)
+            .ok_or_else(|| CommandError::Invalid("no such document".to_owned()))?;
+        open.cancel_stroke();
+        let previous = open.document.active_layer();
+        let index = previous + 1;
+        open.document
+            .insert_layer(index, layer)
+            .map_err(|e| CommandError::Invalid(e.to_string()))?;
+        open.document.set_active_layer(index);
+        open.edit_target = EditTarget::Pixels;
+        open.target_layer = index;
+        open.repainted(Some(open.document.bounds()));
+        // The filter session snapshots the (now active) temporary layer; only
+        // then is the layer marked temporary (starting a session cancels
+        // previous ones, which would remove it).
+        let started = self.begin_filter(id);
+        let Some(open) = self.document_mut(id) else {
+            return started;
+        };
+        open.temp_layer = Some((index, previous));
+        if started.is_err() {
+            open.cancel_stroke();
+        }
+        started
+    }
+
+    /// Ends a [`Self::begin_layer_filter`] preview: the temporary layer is
+    /// removed and, with `keep` (undo label, layer name), `filter` applied to
+    /// it is added as a new layer in one undo step. Returns whether a layer
+    /// was added.
+    pub fn end_layer_filter(
+        &mut self,
+        id: DocId,
+        filter: &dyn Filter,
+        params: &Params,
+        keep: Option<(&'static str, &str)>,
+    ) -> bool {
+        let Some(open) = self.document_mut(id) else {
+            return false;
+        };
+        let (Some((index, previous)), Some(session)) = (open.temp_layer, &open.filter) else {
+            open.cancel_stroke();
+            return false;
+        };
+        let pixels = filters::render_filter(
+            &session.snapshot,
+            open.document.selection(),
+            session.rect,
+            filter,
+            params,
+        );
+        let mut layer = open.document.layer(index).cloned();
+        if let Some(layer) = &mut layer {
+            let r = session.rect;
+            image::imageops::replace(&mut layer.pixels, &pixels, r.x as i64, r.y as i64);
+        }
+        open.cancel_stroke();
+        let (Some((label, name)), Some(mut layer)) = (keep, layer) else {
+            return false;
+        };
+        layer.name = name.to_owned();
+        self.execute(
+            id,
+            Box::new(layers::insert_layer(label, previous + 1, layer)),
+        )
+        .is_ok()
+    }
+
     /// Applies a filter immediately (filters without parameters).
     pub fn apply_filter(
         &mut self,
@@ -577,6 +666,12 @@ impl AppState {
         let open = self
             .document_mut(id)
             .ok_or_else(|| CommandError::Invalid("no such document".to_owned()))?;
+        if open.temp_layer.is_some() {
+            // The preview layer must never reach the history.
+            return Err(CommandError::Invalid(
+                "finish or cancel Remove Background first".to_owned(),
+            ));
+        }
         open.cancel_stroke();
         let dirty = open.undo.execute(&mut open.document, command)?;
         open.changed(dirty);

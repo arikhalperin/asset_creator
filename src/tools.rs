@@ -191,6 +191,9 @@ pub struct ToolOptions {
     pub gradient_opacity: f32,
     /// Eyedropper reads the visible composite (true) or the active layer.
     pub sample_all_layers: bool,
+    /// Extraction tools (Remove Background, Auto-Detect, Extract Object, Add
+    /// Selection to Library) read the visible canvas (true) or the active layer.
+    pub extract_from_canvas: bool,
     /// Free Transform resampling.
     pub transform_interpolation: Interpolation,
 }
@@ -234,6 +237,7 @@ impl Default for ToolOptions {
             gradient_colors: GradientColors::ForegroundToBackground,
             gradient_opacity: 1.0,
             sample_all_layers: true,
+            extract_from_canvas: true,
             transform_interpolation: Interpolation::Bilinear,
         }
     }

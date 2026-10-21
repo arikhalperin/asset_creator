@@ -20,6 +20,11 @@ use crate::transform::{self, Affine, Handle};
 #[derive(Debug, Clone, PartialEq)]
 pub enum CanvasEvent {
     Selection(SelectionRequest),
+    /// A library asset dropped on the canvas at an image point.
+    DropAsset {
+        asset: u64,
+        point: (f32, f32),
+    },
     /// Start a paint stroke at `point`; `straight` (Shift+click) paints a line
     /// from the previous stroke's end and is followed by `StrokeEnd`.
     StrokeBegin {
