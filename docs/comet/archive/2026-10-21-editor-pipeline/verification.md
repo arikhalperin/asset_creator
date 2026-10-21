@@ -1,12 +1,12 @@
 ---
-generated_from_state_version: 13
+generated_from_state_version: 15
 ---
 
 # Verification
 
 ## Current result
 
-- Result: **Verification passed; ready to archive**
+- Result: **Archived**
 - Verification status: **Checks completed; result confirmed**
 - Goal cycle: 1
 - Iteration: 3
