@@ -29,6 +29,7 @@ use crate::library_ui::{library_panel, library_windows, LibraryAction, LibraryVi
 use crate::paint::{
     self, mask_gray, BucketFill, GradientColors, GradientFill, GradientKind, StrokeKind,
 };
+use crate::pattern_ui::{self, PatternDialog, PatternOutcome};
 use crate::project;
 use crate::review_ui::{AssetsOutcome, ReviewAction, ReviewId, ReviewTab, VideoAssetsDialog};
 use crate::selection::{self, CombineMode};
@@ -237,6 +238,7 @@ enum Action {
     Video(Transport),
     RemoveBackground,
     AutoDetect,
+    FindPattern,
     AddSelectionToLibrary,
     ExtractAccept,
     ExtractToSelection,
@@ -324,6 +326,8 @@ pub struct EditorApp {
     repaint: Option<egui::Context>,
     remove_background: Option<RemoveBackgroundDialog>,
     auto_detect: Option<AutoDetectDialog>,
+    /// Extract → Find Repeating Pattern… window.
+    pattern: Option<PatternDialog>,
     extract: Option<ExtractSession>,
     /// Created on the first Extract Object prompt.
     segmenter: Option<Segmenter>,
@@ -390,6 +394,7 @@ impl EditorApp {
             repaint: None,
             remove_background: None,
             auto_detect: None,
+            pattern: None,
             extract: None,
             segmenter: None,
             segment_config: segment::Config::default(),
@@ -592,6 +597,7 @@ impl EditorApp {
         self.filter_dialog.is_some()
             || self.remove_background.is_some()
             || self.auto_detect.is_some()
+            || self.pattern.is_some()
     }
 
     // --- Remove Background ------------------------------------------------
@@ -735,6 +741,95 @@ impl EditorApp {
 
     pub fn auto_detect_cancel(&mut self) {
         self.auto_detect = None;
+    }
+
+    // --- Find Repeating Pattern -----------------------------------------------
+
+    /// Extract → Find Repeating Pattern…: analyzes the selection's bounds (or
+    /// the whole active layer).
+    pub fn open_pattern(&mut self) -> bool {
+        if self.transform_active() || self.dialog_open() {
+            return false;
+        }
+        let Some((id, pixels)) = self.active_pixels() else {
+            return false;
+        };
+        let Some(region) = self
+            .state
+            .document(id)
+            .map(|o| o.document.editable_bounds())
+            .filter(|r| r.width > 0 && r.height > 0)
+        else {
+            return false;
+        };
+        self.pattern = Some(PatternDialog::new(id, pixels, region));
+        true
+    }
+
+    pub fn pattern_dialog(&self) -> Option<&PatternDialog> {
+        self.pattern.as_ref()
+    }
+
+    pub fn pattern_dialog_mut(&mut self) -> Option<&mut PatternDialog> {
+        self.pattern.as_mut()
+    }
+
+    /// Detect: re-reads the active layer and selection and analyzes again.
+    pub fn pattern_redetect(&mut self) {
+        let Some(dialog) = &self.pattern else {
+            return;
+        };
+        let (doc, manual, blend) = (dialog.doc, dialog.manual, dialog.blend);
+        let found = self.state.document(doc).and_then(|o| {
+            let layer = o.document.layer(o.active_layer())?;
+            Some((layer.pixels.clone(), o.document.editable_bounds()))
+        });
+        if let Some((pixels, region)) = found.filter(|(_, r)| r.width > 0 && r.height > 0) {
+            let mut fresh = PatternDialog::new(doc, pixels, region);
+            fresh.manual = manual;
+            fresh.blend = blend;
+            self.pattern = Some(fresh);
+        }
+    }
+
+    /// Add to Library: the current tile (seamless if made) becomes an asset in
+    /// the "pattern" category. Returns its id.
+    pub fn pattern_add(&mut self) -> Option<u64> {
+        let dialog = self.pattern.as_ref()?;
+        let name = self.document_name(dialog.doc);
+        let origin = self.origin_of(dialog.doc, "pattern", dialog.params());
+        let (image, tile) = (dialog.tile_image(), dialog.tile);
+        let id = self.state.assets.add_with(&name, image, tile, origin);
+        let pattern = crate::asset_library::PATTERN;
+        if !self.state.assets.categories().iter().any(|c| c == pattern) {
+            self.state.assets.add_category(pattern);
+        }
+        self.state.assets.set_category(&[id], pattern);
+        self.after_assets_added(1);
+        Some(id)
+    }
+
+    pub fn pattern_close(&mut self) {
+        self.pattern = None;
+    }
+
+    fn show_pattern_window(&mut self, ctx: &egui::Context) {
+        if let Some(dialog) = &self.pattern {
+            if self.state.document(dialog.doc).is_none() {
+                self.pattern = None;
+            }
+        }
+        let Some(dialog) = &mut self.pattern else {
+            return;
+        };
+        match dialog.show(ctx) {
+            PatternOutcome::Open => {}
+            PatternOutcome::Detect => self.pattern_redetect(),
+            PatternOutcome::Add => {
+                self.pattern_add();
+            }
+            PatternOutcome::Close => self.pattern_close(),
+        }
     }
 
     fn show_auto_detect_window(&mut self, ctx: &egui::Context) {
@@ -1195,7 +1290,15 @@ impl EditorApp {
         if self.tagger.is_none() {
             self.tagger = Some(Tagger::new(self.tag_config.clone(), self.notify()));
         }
-        let categories = self.state.assets.categories().to_vec();
+        // "pattern" is set by the pattern tool only.
+        let categories: Vec<String> = self
+            .state
+            .assets
+            .categories()
+            .iter()
+            .filter(|c| c.as_str() != crate::asset_library::PATTERN)
+            .cloned()
+            .collect();
         if let Some(t) = &self.tagger {
             t.tag(jobs, categories);
         }
@@ -2177,6 +2280,28 @@ impl EditorApp {
             return;
         };
         let active = open.active_layer();
+        if let Some(dialog) = self.pattern.as_mut().filter(|d| d.doc == id && d.manual) {
+            let zoom = self
+                .canvases
+                .get(&id)
+                .and_then(|c| c.view())
+                .map_or(1.0, |v| v.zoom);
+            match event {
+                CanvasEvent::MoveBegin(p) => {
+                    dialog.drag_begin(p, pattern_ui::grab_tolerance(zoom));
+                    return;
+                }
+                CanvasEvent::MoveDrag(p) => {
+                    dialog.drag_to(p);
+                    return;
+                }
+                CanvasEvent::MoveEnd => {
+                    dialog.drag_end();
+                    return;
+                }
+                _ => {}
+            }
+        }
         match event {
             CanvasEvent::ExtractPoint { .. } | CanvasEvent::ExtractBox { .. } => {
                 self.extract_event(id, event);
@@ -2795,6 +2920,7 @@ impl EditorApp {
                     frame_set_actions: &mut frame_set_actions,
                     extract: &mut self.extract,
                     auto_detect: self.auto_detect.as_ref(),
+                    pattern: self.pattern.as_ref(),
                     picking: self.remove_background.as_ref().is_some_and(|d| d.picking),
                     asset_view: &mut self.asset_view,
                     asset_actions: &mut asset_actions,
@@ -2898,6 +3024,7 @@ impl EditorApp {
         self.show_video_assets_window(ui.ctx());
         self.show_remove_background_window(ui.ctx());
         self.show_auto_detect_window(ui.ctx());
+        self.show_pattern_window(ui.ctx());
         self.show_consent_window(ui.ctx());
         self.show_tag_consent_window(ui.ctx());
         self.show_prompt_window(ui.ctx());
@@ -3308,6 +3435,15 @@ impl EditorApp {
             {
                 actions.push(Action::AutoDetect);
             }
+            if ui
+                .add_enabled(
+                    extract_enabled,
+                    egui::Button::new("Find Repeating Pattern…"),
+                )
+                .clicked()
+            {
+                actions.push(Action::FindPattern);
+            }
             ui.separator();
             if ui
                 .add_enabled(
@@ -3434,6 +3570,9 @@ impl EditorApp {
             }
             Action::AutoDetect => {
                 self.open_auto_detect();
+            }
+            Action::FindPattern => {
+                self.open_pattern();
             }
             Action::AddSelectionToLibrary => {
                 self.add_selection_to_library();
@@ -3726,6 +3865,7 @@ struct Viewer<'a> {
     frame_set_actions: &'a mut Vec<FrameSetAction>,
     extract: &'a mut Option<ExtractSession>,
     auto_detect: Option<&'a AutoDetectDialog>,
+    pattern: Option<&'a PatternDialog>,
     /// Remove Background's Pick: canvas clicks sample a color.
     picking: bool,
     asset_view: &'a mut LibraryView,
@@ -3841,8 +3981,12 @@ impl Viewer<'_> {
         else {
             return;
         };
+        let pattern = self.pattern.filter(|d| d.doc == id);
         let tool = if self.picking {
             Tool::Eyedropper
+        } else if pattern.is_some_and(|d| d.manual) {
+            // Manual crop: canvas drags edit the pattern tile.
+            Tool::Move
         } else {
             self.tool
         };
@@ -3868,6 +4012,9 @@ impl Viewer<'_> {
                 let size = [open.document.width(), open.document.height()];
                 draw_overlays(ui, rect, &view, size, session, detect);
             }
+        }
+        if let (Some(dialog), Some(rect), Some(view)) = (pattern, canvas.rect(), canvas.view()) {
+            pattern_ui::draw_overlay(ui, rect, &view, dialog);
         }
     }
 }

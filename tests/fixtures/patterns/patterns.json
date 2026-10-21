@@ -1,0 +1,158 @@
+{
+ "license": "Textures: ambientCG.com, CC0 1.0. Synthetic brick: generated.",
+ "images": [
+  {
+   "file": "brick_red.png",
+   "source": "Bricks097",
+   "variant": "png",
+   "tile": [
+    160,
+    80
+   ]
+  },
+  {
+   "file": "brick_red_q80.jpg",
+   "source": "Bricks097",
+   "variant": "jpeg80",
+   "tile": [
+    160,
+    80
+   ]
+  },
+  {
+   "file": "brick_red_noise8.png",
+   "source": "Bricks097",
+   "variant": "noise8",
+   "tile": [
+    160,
+    80
+   ]
+  },
+  {
+   "file": "brick_grey.png",
+   "source": "Bricks085",
+   "variant": "png",
+   "tile": [
+    120,
+    60
+   ]
+  },
+  {
+   "file": "brick_grey_q80.jpg",
+   "source": "Bricks085",
+   "variant": "jpeg80",
+   "tile": [
+    120,
+    60
+   ]
+  },
+  {
+   "file": "brick_grey_noise8.png",
+   "source": "Bricks085",
+   "variant": "noise8",
+   "tile": [
+    120,
+    60
+   ]
+  },
+  {
+   "file": "cobblestone.png",
+   "source": "PavingStones138",
+   "variant": "png",
+   "tile": [
+    72,
+    144
+   ]
+  },
+  {
+   "file": "cobblestone_q80.jpg",
+   "source": "PavingStones138",
+   "variant": "jpeg80",
+   "tile": [
+    72,
+    144
+   ]
+  },
+  {
+   "file": "cobblestone_noise8.png",
+   "source": "PavingStones138",
+   "variant": "noise8",
+   "tile": [
+    72,
+    144
+   ]
+  },
+  {
+   "file": "stone.png",
+   "source": "Rock051",
+   "variant": "png",
+   "tile": [
+    100,
+    100
+   ]
+  },
+  {
+   "file": "stone_q80.jpg",
+   "source": "Rock051",
+   "variant": "jpeg80",
+   "tile": [
+    100,
+    100
+   ]
+  },
+  {
+   "file": "stone_noise8.png",
+   "source": "Rock051",
+   "variant": "noise8",
+   "tile": [
+    100,
+    100
+   ]
+  },
+  {
+   "file": "brick_synthetic.png",
+   "source": "synthetic",
+   "variant": "png",
+   "tile": [
+    40,
+    32
+   ]
+  },
+  {
+   "file": "brick_synthetic_q80.jpg",
+   "source": "synthetic",
+   "variant": "jpeg80",
+   "tile": [
+    40,
+    32
+   ]
+  },
+  {
+   "file": "brick_synthetic_noise8.png",
+   "source": "synthetic",
+   "variant": "noise8",
+   "tile": [
+    40,
+    32
+   ]
+  }
+ ],
+ "sources": [
+  {
+   "file": "brick_red_source.png",
+   "source": "Bricks097"
+  },
+  {
+   "file": "brick_grey_source.png",
+   "source": "Bricks085"
+  },
+  {
+   "file": "cobblestone_source.png",
+   "source": "PavingStones138"
+  },
+  {
+   "file": "stone_source.png",
+   "source": "Rock051"
+  }
+ ]
+}
