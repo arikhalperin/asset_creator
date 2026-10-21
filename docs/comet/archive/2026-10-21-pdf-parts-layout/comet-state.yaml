@@ -1,0 +1,886 @@
+schema: comet.native.v4
+name: pdf-parts-layout
+language: en
+phase: archive
+status: done
+state_version: 32
+brief: brief.md
+document_constraints_version: 1
+shape_confirmation_hash: db1e2961629e453f2825655211c00d36721938b4814bdc22ce70dff2d0546d81
+spec_changes:
+  - capability: pdf-parts-layout
+    operation: create
+    source: specs/pdf-parts-layout/spec.md
+workspace:
+  isolation: branch
+  change_branch: comet/pdf-parts-layout
+  target_branch: master
+  finish: merge
+loop:
+  stage: done
+  goal_cycle: 4
+  iteration: 3
+  attempt: 1
+  retry_epoch: 0
+  failed_iteration_count: 4
+  no_progress_count: 0
+  execution_failure_count: 0
+  previous_unresolved_ids: []
+  next_action: null
+acceptance:
+  - id: A1
+    source: brief.md
+    text: "A1: File ▸ Open of a PDF asks before downloading PDFium the first time
+      (SHA-256 checked, progress, failure keeps the app usable), then opens a
+      Parts Layout tab with every page rendered at 300 dpi and its size in mm
+      shown (A3 = 297 × 420 mm)."
+    result: passed
+    reason:
+      text: I re-ran the consent probe as a separate process. Nothing downloads before
+        consent. Cancel declines. A failing source shows 'PDFium could not be
+        installed' and the app stays usable. A good Directory source installs
+        libpdfium.dylib and opens the waiting PDF. Pages render at 300 dpi
+        (3508x4961 = 297x420 mm, 4961x3508 = 420x297 mm) and their sizes are
+        shown. The repo pdf_ui consent and open tests pass.
+      truncated: false
+  - id: A2
+    source: brief.md
+    text: "A2: On the fixture sheets, part detection finds every model part (each
+      known part rectangle matched by one proposal within 2 mm, part numbers and
+      tabs inside their part — also for unfilled (white) parts with a number
+      printed inside, whose inside is part of the part) and nothing else except
+      proposals the user can delete (title block); a click selects the innermost
+      proposal under it; the user can merge two proposals, delete one, and (with
+      MobileSAM installed) click to add or refine a part (a click inside a part,
+      filled or not, replaces it)."
+    result: passed
+    reason:
+      text: The detect, white/tan, nested and L-notch probes give the same results as
+        before. Every known rectangle is matched within 2 mm on white and tan
+        sheets. Clicks select the innermost proposal, and a click in the notch
+        selects nothing. Cmd-select and Merge work, and deleting the title
+        works. The repo MobileSAM refine test (inside a white part) passes.
+      truncated: false
+  - id: A3
+    source: brief.md
+    text: "A3: Auto-pack places all parts that fit onto A4 sheets at exactly their
+      printed size (mm), within 5 mm margins, at least 2 mm apart, never
+      overlapping, rotated only by 90°, using no more sheets than a simple shelf
+      packing would; parts can be dragged within and between sheets, rotated
+      90°, and the sheets re-packed; illegal placements (overlap or outside the
+      margin) are refused or flagged."
+    result: passed
+    reason:
+      text: "Pack probe: 600 random cases, none worse than shelf packing, all within
+        margins, spacing and no overlap, rotations of 0 and 90 only, worst 2.05
+        ms. Of 3000 random moves, 1279 legal ones were accepted and 1721 illegal
+        ones refused. The repo drag, rotate and repack UI tests pass."
+      truncated: false
+  - id: A4
+    source: brief.md
+    text: "A4: A part larger than A4's printable area in both orientations is not
+      placed; the tab shows a warning naming it and its size; the user draws a
+      straight cut line across it; the result is two pieces with an 8 mm glue
+      strip (configurable 0–20 mm) on one and alignment marks on both; pieces
+      that still do not fit are flagged again; after splitting, every piece can
+      be placed."
+    result: passed
+    reason:
+      text: "The Split-window probe shows the warning 'Part 2.22 does not fit on A4:
+        340 x 75 mm'. With a 12 mm strip on Piece 1 the piece is 238.9 mm, which
+        is cut + 12 mm, and marks appear on both pieces. After a diagonal
+        re-split the status reads 'All parts fit on A4' and everything is
+        placed."
+      truncated: false
+  - id: A5
+    source: brief.md
+    text: "A5: Export A4 Pages… writes one A4 PDF (210 × 297 mm pages, 300 dpi
+      images) with one page per sheet; printed at 100 % every part has its
+      original size (verified by measuring the exported pages: ±0.5 mm);
+      optional PNGs per page."
+    result: passed
+    reason:
+      text: Export pages are 210x297 mm with one 2480x3508 image each. The worst
+        printed-size error against the items is 0.085 mm. PNGs are written per
+        sheet.
+      truncated: false
+  - id: A6
+    source: brief.md
+    text: 'A7: A page can be marked "Manual (A4 frames)" in the tab: its parts leave
+      the layout; A4 frames (full A4, 210 × 297 mm, shown at true scale on the
+      page; the first frame is turned to match the page so that two frames tile
+      an A3 page exactly) can be added, removed, dragged freely, and turned 90°,
+      and may overlap; the page view zooms in (buttons and Cmd+scroll) for
+      placing them; Export A4 Pages… adds one portrait A4 sheet per frame after
+      the packed sheets, filled edge to edge with exactly the framed page area
+      at true scale (±0.5 mm), turned 90° for landscape frames; unmarking the
+      page brings its parts back into the layout.'
+    result: passed
+    reason:
+      text: "Release bench: render 142 ms, detect 264 ms, pack 100 parts 0 ms. Release
+        perf probe on 6 pages and 288 parts: open returns in under 0.2 ms, load
+        takes about 2 s on a worker, p95 frame 0.2-0.36 ms, worst frame 38-147
+        ms across 3 runs. During export, start returns in 7 ms and the worst UI
+        frame is 0.38 ms. The release pdf_ui suite passes 20/20."
+      truncated: false
+  - id: A7
+    source: brief.md
+    text: "A8: File ▸ Open Folder of Images… opens a folder's images (PNG, JPEG,
+      BMP, WebP; other files ignored; natural name order, e.g. page2 before
+      page10) as one Parts Layout tab without blocking the UI; a 300-dpi
+      PNG/JPEG scan of an A3 sheet gets its size from the file (297 × 420 mm ± 1
+      mm) and yields the same parts as the PDF page; an image without DPI is
+      taken as A3 by its shape; each image page shows \"W × H mm (from file DPI
+      | assumed A3)\" and a DPI override that re-scales the page and re-detects
+      its parts in the background; an empty folder shows a message."
+    result: passed
+    reason:
+      text: "The frame-drag defect is fixed. My drag probe tested zoom
+        100/125/200/300/500/800 % with slow drags (0.1 pt per frame over 300-400
+        frames), fast drags (2 steps of 100+ pt), and x, y, diagonal and
+        negative directions. Every final frame position is within 0.48 px (0.04
+        mm) of pointer delta / scale. The pointer-to-frame screen offset drifts
+        at most 0.66 pt. A slow out-and-back drag at 800 % returns exactly to
+        (500,500). The rest of A7 still holds: full-A4 frames, the first frame
+        turned to match the page so two frames tile A3, zoom with +/-/Fit,
+        Cmd+scroll and pinch clamped to 100-800 %, and unmarking a page brings
+        its parts back. Frame export: 7 files, 0.38 s, with progress and
+        Cancel."
+      truncated: false
+  - id: A8
+    source: brief.md
+    text: "A6: Rendering an A3 page takes under 2 s, detection on a page under 2 s,
+      and auto-pack of 100 parts under 1 s in a release build; the UI stays
+      responsive (work on worker threads with progress)."
+    result: passed
+    reason:
+      text: "The defect where one bad file aborted a folder is fixed. Folder with ._
+        files, .DS_Store, .hidden.png, a truncated PNG, a zero-byte WebP, a
+        truncated JPEG, a garbage BMP and a chmod-000 PNG: the 5 good images
+        load in natural order. The 5 bad ones are listed in 'Skipped 5
+        unreadable file(s): …'. Page indices stay consistent: each page's part
+        count and size equal a fresh load+detect of that file. DPI Apply on the
+        last page reloads the right file (p10.png). An all-unreadable folder
+        shows 'none of the images could be read' with no hang. A folder of
+        hidden files only shows 'No images in …' and opens no tab. Guards: a
+        file DPI of 25 or 100 that would exceed A0 gives assumed A3, explained
+        in the header. A DPI below 20 is ignored and the page is taken as A3. A
+        50-dpi override (2520 mm) is refused with the page unchanged. Natural
+        order, sizes (300/150 dpi gives 297x420 mm ±0.1 mm), the same parts as
+        the PDF (16/16 and 13/13 within 1 mm) and loading off the UI thread all
+        hold again."
+      truncated: false
+builder_handoff:
+  candidate_id: 6a040dc6-f874-4989-9f45-dd5081730da0
+  identity_provider: skill-coordinated
+  builder_execution_ref: skill-coordinated:builder:2c6bd5e6-383b-436e-a4d9-ce4cfd903932
+  iteration: 3
+  summary:
+    text: "Round 6 (fixes the review's A7/A8 defects). A7: frame drags are measured
+      from the press origin (frame position at press + pointer offset / scale),
+      so frames follow the pointer exactly at any zoom. A8: list_images skips
+      hidden files (macOS '._' forks, .DS_Store); the folder loader skips
+      unreadable images (listed in the tab as 'Skipped N unreadable file(s): …',
+      page indices stay consistent) and loads the rest; a folder with no
+      readable image shows 'none of the images could be read'; pages loaded
+      before an error stay visible. From the review's risks: a file DPI that
+      would make a page larger than A0 is ignored (assumed A3, said so), a DPI
+      override that large is refused, the DPI field starts at 50; export PNGs
+      are written under temporary names and renamed only on completion, so a
+      cancel never touches an earlier export's files. New tests:
+      zoomed_frame_drags_follow_the_pointer (800 %, 40 half-point steps),
+      unreadable_folder_images_are_skipped,
+      a_cancelled_export_keeps_earlier_files, images unit tests for hidden files
+      and the A0 guard. Responsiveness frame-time limits are asserted in release
+      builds only (new check pdf-ui-release); the debug suite runs in parallel
+      and its timings are not meaningful. Round 5 (user-requested changes, all
+      confirmed): manual frames are full A4 (210 × 297 mm; layout::compose_frame
+      fills the portrait sheet edge to edge; Frame::size = sheet_px), the first
+      frame on a page is turned to match it (rotated when the page is taller
+      than wide) so two frames tile an A3 page; the page view zooms (− / + /
+      Fit, 100–800 %, Cmd+scroll or pinch via egui zoom delta while hovering,
+      ScrollArea both ways). Round 4. (1) Export no longer freezes the app (user
+      report): layout::write_export builds the PDF one sheet at a time
+      (PdfBuilder) with progress and cancel, writing to a temporary file renamed
+      at the end (cancel removes PNGs written so far); PartsTab::start_export
+      runs it on a worker with its own copies of the layout and the frame pages;
+      the toolbar shows a progress bar 'Exporting sheet i of n' and Cancel
+      Export; status reports the result. (2) A8 image folders (user request):
+      File ▸ Open Folder of Images… → list_images (png/jpg/jpeg/bmp/webp,
+      natural order), load_page (DPI from PNG pHYs / JPEG JFIF, else full A3 by
+      shape, resampled to 300 dpi, transparency on white) on a worker; page
+      header shows 'W × H mm (from file DPI | assumed A3 | N dpi set by you)', a
+      DPI field and Apply DPI, which reloads that page on a worker and
+      re-detects its parts; empty folder → 'No images in …'. (3) On-screen
+      previews are capped at 2048 px per side (large or re-scaled pages exceeded
+      GPU texture limits). Earlier rounds: Round 3 (fixes the review's A2
+      defect). PartsTab::proposal_at now uses masks only (no bounding-box
+      fallback): empty paper inside a concave/tapered part's box is no part, so
+      a click there selects nothing and a MobileSAM refine there adds a new part
+      instead of replacing the neighbour. Also from the review's risks: export
+      skips packed sheets without parts (no blank first page when every page is
+      manual); set_manual deselects the page's now-hidden proposals; the app
+      refreshes sam_ready every frame (MobileSAM installed later enables
+      Refine); the debug-build responsiveness test allows 500 ms per frame
+      (release keeps 250 ms). New tests:
+      empty_paper_beside_a_tapered_part_is_not_that_part,
+      all_manual_pages_export_only_frames. Round 2 (fixes the review's A2 defect
+      and adds the user's update). A2: detect() fills everything enclosed by a
+      part's outline (fill_holes) and merges proposals lying ≥90 % inside a
+      larger part's mask (absorb_enclosed), so an unfilled (white) part owns its
+      inside and the number printed in it; PartsTab::proposal_at picks the
+      smallest proposal whose mask (else box) contains the point, used for
+      clicks and MobileSAM refine (a refine inside an unfilled part replaces
+      it). Fixture: page 2 gains an unfilled 70 × 45 mm part '27' with its
+      number in the middle. Split: split::GlueOn {Smaller, First, Second}; the
+      Split window labels the pieces 1/2 beside the line and offers 'Strip on:
+      Smaller piece / Piece 1 / Piece 2'. A7 manual decompose (user update,
+      confirmed): per page 'Manual (A4 frames)' checkbox; manual pages' parts
+      leave the layout (rebuild filters them; unmarking brings them back); Frame
+      {page, x, y, rotated} = the 200 × 287 mm printable area at true scale; Add
+      Frame (top-left, then beside the last frame / next row), Rotate Frame,
+      Remove Frame, drag to move, overlap allowed, past-the-page = white;
+      layout::compose_frame puts the framed area into the printable area of a
+      portrait A4 sheet (landscape frames turned 90° clockwise); export = packed
+      sheets then frame sheets (page, then creation order) via
+      layout::export_sheets; status line counts frame sheets; edits that re-pack
+      say 'Parts changed: the sheets were re-packed'. Round 1: PDF parts → A4.
+      src/pdf/: pdfium.rs (pdfium-binaries chromium/7881 archive per arch,
+      SHA-256 pinned as a ModelSet; install_from_archive re-verifies and
+      extracts lib/libpdfium.dylib; default dir <app data>/Game Asset
+      Creator/pdfium, GAC_PDFIUM_DIR overrides; one process-wide binding),
+      render.rs (page_count, render_page at 300 dpi on white, page size in mm),
+      parts.rs (paper colour = mode of a sparse quantized sample; ink = channel
+      difference > 30; square closing by 1.5 mm via separable running counts;
+      parts = components of the grown mask keeping their closed/ink pixels; < 4
+      mm² dropped; merge; from_page_mask for MobileSAM), pack.rs (A4 portrait
+      printable 200 × 287 mm, 5 mm margin, 2 mm spacing; max-rects
+      best-short-side-fit with 0°/90°, largest first, earlier sheets first;
+      fits/valid/shelf_sheets bound), split.rs (straight cut, smaller piece gets
+      a glue strip 0–20 mm (default 8) copied from the other side with an outer
+      outline and a dashed fold line on the cut; red alignment ticks across the
+      cut every 20 mm, at least two, drawn only over piece pixels), layout.rs
+      (items/placements/sheets; repack, move_item, move_item_near (snap within a
+      radius, clamped), rotate, unplace, add/remove sheet, split → two tray
+      pieces, place_tray, compose A4 at 300 dpi, export one PDF via pdf-writer
+      with Flate RGB images drawn at exactly 300 dpi plus optional PNGs).
+      parts_ui.rs: Parts Layout tab (worker thread renders, detects, and cuts
+      out parts with previews; progress line; toolbar Merge/Delete/Refine
+      (MobileSAM)/Re-pack/Add Sheet/Remove Empty Sheets/Place Tray Items/Rotate
+      90°/To Tray/Split…/Also PNGs/Export A4 Pages…; oversize warnings 'Part X
+      does not fit on A4: W × H mm'; pages with outlined numbered proposals
+      (click/Cmd-click select, refine clicks); sheets with draggable parts (grab
+      from press origin, drop snaps within 3 mm, refusal message); tray; Split
+      window with drawn line and glue slider). ui.rs: File ▸ Open (and dialog
+      filter) accepts .pdf → open_pdf; PDFium consent window + download
+      (models::Download, then install) and progress; failure keeps the app
+      usable; PdfConfig (dir/source) for tests; MobileSAM refine routes
+      segmenter masks to the tab. Fixtures tests/fixtures/pdf: generated A3
+      sheets (portrait page with 12 parts, landscape page with a 340 × 75 mm
+      wing, a 260 × 35 spine, 5 more parts) + json truth + generate.py +
+      LICENSE.txt."
+    truncated: false
+  addressed_acceptance_ids:
+    - A1
+    - A2
+    - A3
+    - A4
+    - A5
+    - A6
+    - A7
+    - A8
+  checks:
+    - name:
+        text: cargo test
+        truncated: false
+      result: passed
+      note:
+        text: "All dispatch checks run locally exactly as the Runtime runs them: exit 0
+          (debug cargo test with GAC env, clippy, fmt, all release benches,
+          release pdf_ui 20/20). 410 passed, 0 failed
+          (GAC_CLIP_DIR/GAC_MODEL_DIR/GAC_PDFIUM_DIR/GAC_PDFIUM_ARCHIVE set).
+          New: two_a4_frames_tile_an_a3_page, the_page_view_zooms; frame tests
+          updated to full A4. New: pdf_ui exporting_keeps_the_ui_responsive
+          (worker export of 8 sheets + PNGs, frames keep coming, progress shown,
+          PDF complete), a_cancelled_export_leaves_nothing,
+          a_folder_of_page_images_opens_like_a_pdf (PNG 300 dpi + JPEG without
+          DPI + txt; natural order; sizes; every fixture part found; Apply DPI
+          150 doubles page and parts; empty folder message); unit tests
+          pdf::images (order, DPI from PNG/JPEG, A3 fallback, override) and
+          preview size cap. New/changed: parts unit test for an unfilled part
+          with an inner label; fixture tests now 20 parts (12 + 8) with part 27
+          found as one proposal; layout
+          frame_sheets_hold_exactly_the_framed_area; split
+          the_glue_strip_goes_on_the_chosen_piece; pdf_ui: Split window with
+          'Piece 2' chosen (strip on piece 2),
+          manual_pages_export_their_a4_frames (UI checkbox, Add Frame, drag,
+          Rotate Frame, export renders back equal to compose_frame, overlap,
+          unmark), clicks_inside_an_unfilled_part_select_it, MobileSAM refine
+          inside part 27 replaces it."
+        truncated: false
+    - name:
+        text: clippy -D warnings
+        truncated: false
+      result: passed
+      note: null
+    - name:
+        text: fmt --check
+        truncated: false
+      result: passed
+      note: null
+    - name:
+        text: release benchmarks
+        truncated: false
+      result: passed
+      note:
+        text: All dispatch benchmark commands exit 0; render A3 page 94 ms, detect 259
+          ms, pack 100 parts < 1 ms.
+        truncated: false
+  checks_truncated: false
+  known_limits:
+    - text: The title line can come out as several proposals (each deletable).
+      truncated: false
+    - text: Export embeds 300-dpi raster images (not the PDF's vectors), per the
+        confirmed scope.
+      truncated: false
+    - text: The tab's look was checked only through headless UI tests (no screenshot
+        review).
+      truncated: false
+    - text: Editing proposals (Merge/Delete/Refine) or toggling a manual page re-packs
+        the layout (manual moves and splits are discarded; the status line says
+        so).
+      truncated: false
+    - text: A ring-shaped part would absorb other parts printed inside its hole
+        (filled inside).
+      truncated: false
+    - text: A DPI override re-detects that page's parts and re-packs the layout (hand
+        moves are lost, as for other edits).
+      truncated: false
+    - text: Images are flattened onto white; TIFF and PDF-in-folder are not loaded.
+      truncated: false
+    - text: Full-A4 frame sheets print edge to edge; printers without borderless
+        printing may clip about 5 mm at the sheet edges (the user's choice).
+      truncated: false
+  known_limits_truncated: false
+  review: null
+  submitted_at: 2026-10-21T13:55:07.854Z
+blockers: []
+verification:
+  candidate_id: 6a040dc6-f874-4989-9f45-dd5081730da0
+  identity_provider: skill-coordinated
+  verifier_execution_ref: skill-coordinated:verifier:b59bc2d3-8a51-4e4c-bd34-29279fcf1da4
+  iteration: 3
+  attempt: 1
+  assurance: skill-coordinated
+  verdict: pass
+  checks:
+    - id: cargo-test
+      name:
+        text: cargo test (with the tagging model)
+        truncated: false
+      argv_display:
+        - text: GAC_CLIP_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/clip
+          truncated: false
+        - text: GAC_MODEL_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/models
+          truncated: false
+        - text: GAC_PDFIUM_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/pdfium-installed
+          truncated: false
+        - text: GAC_PDFIUM_ARCHIVE=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/pdfium-dl
+          truncated: false
+        - text: cargo
+          truncated: false
+        - text: test
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 523205
+    - id: clippy
+      name:
+        text: clippy -D warnings
+        truncated: false
+      argv_display:
+        - text: clippy
+          truncated: false
+        - text: --all-targets
+          truncated: false
+        - text: --
+          truncated: false
+        - text: -D
+          truncated: false
+        - text: warnings
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 5262
+    - id: fmt
+      name:
+        text: fmt --check
+        truncated: false
+      argv_display:
+        - text: fmt
+          truncated: false
+        - text: --check
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 490
+    - id: bench-patterns
+      name:
+        text: release pattern detection / make seamless benchmark
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: patterns
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 17061
+    - id: bench-pattern-ui
+      name:
+        text: release pattern preview benchmark
+        truncated: false
+      argv_display:
+        - text: GAC_CLIP_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/clip
+          truncated: false
+        - text: cargo
+          truncated: false
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: pattern_ui
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --include-ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 6953
+    - id: bench-filters
+      name:
+        text: release filter preview benchmark
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: filters
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 4897
+    - id: bench-library
+      name:
+        text: release library/tagging benchmark
+        truncated: false
+      argv_display:
+        - text: GAC_CLIP_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/clip
+          truncated: false
+        - text: cargo
+          truncated: false
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: library
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 6400
+    - id: bench-extract
+      name:
+        text: release extraction benchmarks
+        truncated: false
+      argv_display:
+        - text: GAC_MODEL_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/models
+          truncated: false
+        - text: cargo
+          truncated: false
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: extract
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 3868
+    - id: bench-video
+      name:
+        text: release video benchmark
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: video
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 5179
+    - id: bench-canvas
+      name:
+        text: release pan/zoom benchmark
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: canvas
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 3244
+    - id: bench-transform
+      name:
+        text: release transform benchmark
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --lib
+          truncated: false
+        - text: bench_transform
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 9076
+    - id: bench-pdf
+      name:
+        text: release PDF render/detect/pack benchmark
+        truncated: false
+      argv_display:
+        - text: GAC_PDFIUM_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/pdfium-installed
+          truncated: false
+        - text: cargo
+          truncated: false
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: pdf_parts
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 2637
+    - id: pdf-ui-release
+      name:
+        text: release PDF UI tests (frame-time limits)
+        truncated: false
+      argv_display:
+        - text: GAC_PDFIUM_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/pdfium-installed
+          truncated: false
+        - text: GAC_PDFIUM_ARCHIVE=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/pdfium-dl
+          truncated: false
+        - text: GAC_MODEL_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/models
+          truncated: false
+        - text: cargo
+          truncated: false
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: pdf_ui
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 12336
+  summary:
+    text: "All A1-A8 pass. Both A7 and A8 defects from round 5 are fixed: frame
+      drags follow the pointer to under 0.5 px at every zoom up to 800 %, and
+      unreadable or hidden folder files are skipped and listed with consistent
+      page indices. The new guards work: an over-A0 file DPI is taken as A3, a
+      huge override is refused, and a cancelled export leaves an earlier
+      export's PDF and PNGs byte-identical with no .part leftovers. Checks:
+      cargo fmt --check OK, clippy --all-targets -D warnings OK, cargo test all
+      green, release pdf_ui 20/20, bench_pdf render 142 ms / detect 264 ms /
+      pack 0 ms."
+    truncated: false
+  risks:
+    - text: "images::load_page accepts non-finite or huge overrides: inf or 1e9 dpi
+        gives a 1x1 px page. This is unreachable from the UI, because the
+        DragValue clamps to 50-4800, but the API does not guard against it."
+      truncated: false
+    - text: A new export with fewer sheets, or without PNGs, leaves stale
+        <stem>_NN.png files from an earlier export next to the new PDF.
+      truncated: false
+    - text: "If a loader or export worker thread panics, the tab stays in 'loading' or
+        'exporting' because a disconnected channel is not detected. I could not
+        trigger this with corrupt inputs: decode errors are skipped."
+      truncated: false
+    - text: Whole images are decoded and resampled in memory, so a page near A0 at 300
+        dpi needs about 0.5 GB.
+      truncated: false
+    - text: A one-off UI frame of about 150 ms can occur when a large multi-page load
+        finishes (final rebuild). It was 38-50 ms in other runs; p95 stays under
+        0.4 ms.
+      truncated: false
+  risks_truncated: false
+  completed_at: 2026-10-21T14:19:13.499Z
+history:
+  - goal_cycle: 1
+    iteration: 1
+    attempt: 1
+    outcome: fail
+    unresolved_ids:
+      - A2
+    summary:
+      text: "cargo test passes (394 passed, 0 failed, PDF tests run with PDFium and
+        MobileSAM). clippy -D warnings and fmt --check are clean. A1, A3, A4, A5
+        and A6 passed my own probes: consent, cancel and failure flows plus a
+        real install; page sizes; packing invariants and UI drags, snapping and
+        refusal; repeated splits through the Split window; independently
+        measured export scale; release timings and responsiveness. A2 fails for
+        unfilled or white parts, which are typical in papercraft. Numbers
+        printed inside them become separate proposals because the mask is not
+        cut along the outer contour. Those enclosed proposals cannot be clicked
+        to merge or delete them. A MobileSAM click inside a white part adds a
+        duplicate instead of refining it."
+      truncated: false
+    completed_at: 2026-10-21T09:00:36.784Z
+  - goal_cycle: 1
+    iteration: 2
+    attempt: 0
+    outcome: recovery
+    unresolved_ids: []
+    summary:
+      text: Native confirmed acceptance criteria changed
+      truncated: false
+    completed_at: 2026-10-21T10:24:40.637Z
+  - goal_cycle: 2
+    iteration: 1
+    attempt: 1
+    outcome: fail
+    unresolved_ids:
+      - A2
+    summary:
+      text: "A1 and A3 to A7 pass on independent probes. Those covered consent and
+        download through the UI, 600 random packings against an independent
+        shelf bound, the Split window's glue choice, true scale measured on
+        re-rendered exports (within 0.1 mm), manual A4 frames through the real
+        UI including turned, overlapping and past-the-page frames, and release
+        performance. A2 improved: unfilled parts now own their inside and their
+        numbers, on the fixture and on 10 adversarial white, tan and concave
+        parts, and a refine inside a white part replaces it. It still fails one
+        spec rule: 'a click outside all parts adds a part'. A refine click in a
+        concave part's bounding box but outside its mask replaces and destroys
+        that part (the L part was lost in notch.pdf). cargo fmt --check and
+        clippy -D warnings are clean. cargo test passed except one
+        load-sensitive debug responsiveness test (278 ms vs 250 ms) in a
+        parallel run, which passes on its own."
+      truncated: false
+    completed_at: 2026-10-21T10:46:13.011Z
+  - goal_cycle: 2
+    iteration: 2
+    attempt: 1
+    outcome: pass
+    unresolved_ids: []
+    summary:
+      text: "All of A1–A7 pass. The round-2 A2 defect (bounding-box fallback in the
+        click/refine hit test) is fixed: hit tests use masks only. Empty paper
+        in a concave part's notch selects nothing, and a MobileSAM refine there
+        adds a new part without touching the L; refines inside unfilled parts
+        still replace them. cargo test (all suites, PDFium + MobileSAM + ONNX
+        Runtime env), clippy --all-targets -D warnings and fmt --check pass.
+        Release benchmarks are well under the limits."
+      truncated: false
+    completed_at: 2026-10-21T11:11:37.043Z
+  - goal_cycle: 2
+    iteration: 2
+    attempt: 1
+    outcome: recovery
+    unresolved_ids: []
+    summary:
+      text: User reports the app stops responding while exporting A4 sheets; move
+        export to a worker thread with progress and cancel (A6 responsiveness),
+        then re-verify.
+      truncated: false
+    completed_at: 2026-10-21T11:30:11.458Z
+  - goal_cycle: 2
+    iteration: 3
+    attempt: 0
+    outcome: recovery
+    unresolved_ids: []
+    summary:
+      text: Native confirmed acceptance criteria changed
+      truncated: false
+    completed_at: 2026-10-21T12:06:35.681Z
+  - goal_cycle: 3
+    iteration: 0
+    attempt: 0
+    outcome: recovery
+    unresolved_ids: []
+    summary:
+      text: Native confirmed acceptance criteria changed
+      truncated: false
+    completed_at: 2026-10-21T13:02:42.619Z
+  - goal_cycle: 4
+    iteration: 1
+    attempt: 0
+    outcome: recovery
+    unresolved_ids: []
+    summary:
+      text: "Builder handoff Runtime checks failed: cargo-test"
+      truncated: false
+    completed_at: 2026-10-21T13:11:47.020Z
+  - goal_cycle: 4
+    iteration: 2
+    attempt: 1
+    outcome: fail
+    unresolved_ids:
+      - A7
+      - A8
+    summary:
+      text: "Fail. A1-A6 still pass: I re-ran the earlier probes on the current tree,
+        and the repo checks pass (cargo test, clippy -D warnings, fmt --check,
+        release pdf_ui with frame-time asserts, bench_pdf). New behaviour that
+        works: export runs on a worker with progress and Cancel Export, cancel
+        leaves no files, and true scale holds. For the full-A4 frames, two tile
+        an A3 page and the exports re-rendered with PyMuPDF are within 0.084 mm.
+        Zoom works with buttons, Cmd+scroll and pinch. Image folders handle
+        natural order, file DPI vs assumed A3, Apply DPI and the empty-folder
+        message. A7 fails because frame dragging at zoom rounds each frame's
+        delta to whole pixels: at 400-800 % slow drags do not move the frame at
+        all, and elsewhere it drifts by about ±18 %. A8 fails because one
+        undecodable file with an image extension (for example a macOS
+        '._scan1.png') aborts the whole folder and hides all its pages. My check
+        run: fmt --check OK, clippy --all-targets -D warnings OK, cargo test
+        with 27 test binaries all ok and 0 failures, release pdf_ui 17/17 and
+        release pdf_parts 4/4 (on the release fixture, detection takes 442 and
+        482 ms per page)."
+      truncated: false
+    completed_at: 2026-10-21T13:42:14.258Z
+  - goal_cycle: 4
+    iteration: 3
+    attempt: 1
+    outcome: pass
+    unresolved_ids: []
+    summary:
+      text: "All A1-A8 pass. Both A7 and A8 defects from round 5 are fixed: frame
+        drags follow the pointer to under 0.5 px at every zoom up to 800 %, and
+        unreadable or hidden folder files are skipped and listed with consistent
+        page indices. The new guards work: an over-A0 file DPI is taken as A3, a
+        huge override is refused, and a cancelled export leaves an earlier
+        export's PDF and PNGs byte-identical with no .part leftovers. Checks:
+        cargo fmt --check OK, clippy --all-targets -D warnings OK, cargo test
+        all green, release pdf_ui 20/20, bench_pdf render 142 ms / detect 264 ms
+        / pack 0 ms."
+      truncated: false
+    completed_at: 2026-10-21T14:19:13.499Z
+history_overflow:
+  dropped_entries: 0
+  first_dropped_at: null
+  last_dropped_at: null
+  outcome_counts:
+    pass: 0
+    fail: 0
+    blocked: 0
+    execution-error: 0
+    recovery: 0
+verification_result: pass
+verification_report: verification.md
+archived: true
+created_at: 2026-10-21T07:52:38.024Z

@@ -31,6 +31,7 @@ use crate::library_ui::{
 use crate::paint::{
     self, mask_gray, BucketFill, GradientColors, GradientFill, GradientKind, StrokeKind,
 };
+use crate::parts_ui::{PartsAction, PartsId, PartsTab};
 use crate::pattern_ui::{self, PatternDialog, PatternOutcome};
 use crate::project;
 use crate::review_ui::{AssetsOutcome, ReviewAction, ReviewId, ReviewTab, VideoAssetsDialog};
@@ -165,6 +166,7 @@ pub enum Tab {
     Document(DocId),
     Video(VideoId),
     Review(ReviewId),
+    Parts(PartsId),
 }
 
 /// Text fields of the File → New dialog.
@@ -211,6 +213,7 @@ impl NewDocumentForm {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
     New,
+    OpenImageFolder,
     SaveBack,
     CleanUpDocument,
     Open,
@@ -357,6 +360,17 @@ pub struct EditorApp {
     video_assets: Option<VideoAssetsDialog>,
     reviews: HashMap<ReviewId, ReviewTab>,
     next_review: u64,
+    /// Parts Layout tabs (opened PDFs).
+    parts_tabs: HashMap<PartsId, PartsTab>,
+    next_parts: u64,
+    /// PDFium: where it lives and where it is downloaded from.
+    pdf_config: PdfConfig,
+    /// A PDF waiting for PDFium (asked / downloading).
+    pdf_pending: Option<PathBuf>,
+    pdf_consent: Consent,
+    pdf_download: Option<models::Download>,
+    /// MobileSAM refine request of a Parts tab: tab, page, point, request id.
+    parts_refine: Option<(PartsId, usize, (f32, f32), u64)>,
 }
 
 impl Default for EditorApp {
@@ -424,6 +438,13 @@ impl EditorApp {
             video_assets: None,
             reviews: HashMap::new(),
             next_review: 0,
+            parts_tabs: HashMap::new(),
+            next_parts: 0,
+            pdf_config: PdfConfig::default(),
+            pdf_pending: None,
+            pdf_consent: Consent::NotAsked,
+            pdf_download: None,
+            parts_refine: None,
         }
     }
 
@@ -843,6 +864,225 @@ impl EditorApp {
 
     pub fn auto_detect_cancel(&mut self) {
         self.auto_detect = None;
+    }
+
+    // --- Paper-model PDFs ----------------------------------------------------------
+
+    /// Where PDFium is installed and downloaded from (tests point it elsewhere).
+    pub fn set_pdf_config(&mut self, config: PdfConfig) {
+        self.pdf_config = config;
+    }
+
+    /// Opens a PDF in a Parts Layout tab, asking to download PDFium first if
+    /// it is not installed.
+    pub fn open_pdf(&mut self, path: &Path) -> Option<PartsId> {
+        if !crate::pdf::pdfium::installed(&self.pdf_config.dir) {
+            self.pdf_pending = Some(path.to_path_buf());
+            if self.pdf_download.is_none() {
+                self.pdf_consent = Consent::Asking;
+            }
+            return None;
+        }
+        self.next_parts += 1;
+        let id = PartsId(self.next_parts);
+        let mut tab = PartsTab::open(path, self.pdf_config.dir.clone(), self.notify());
+        tab.sam_ready = self.sam_installed();
+        self.parts_tabs.insert(id, tab);
+        self.add_center_tab(Tab::Parts(id));
+        Some(id)
+    }
+
+    /// File ▸ Open Folder of Images…: the folder's images as the pages of a
+    /// Parts Layout tab (no PDF engine needed).
+    pub fn open_image_folder(&mut self, dir: &Path) -> Option<PartsId> {
+        let files = match crate::pdf::images::list_images(dir) {
+            Ok(f) => f,
+            Err(e) => {
+                self.error = Some(format!("Could not open the folder:\n{e}"));
+                return None;
+            }
+        };
+        if files.is_empty() {
+            self.error = Some(format!("No images in {}", dir.display()));
+            return None;
+        }
+        self.next_parts += 1;
+        let id = PartsId(self.next_parts);
+        let mut tab = PartsTab::open_images(dir, files, self.notify());
+        tab.sam_ready = self.sam_installed();
+        self.parts_tabs.insert(id, tab);
+        self.add_center_tab(Tab::Parts(id));
+        Some(id)
+    }
+
+    pub fn pdf_consent(&self) -> Consent {
+        self.pdf_consent
+    }
+
+    pub fn pdf_download_in_progress(&self) -> bool {
+        self.pdf_download.is_some()
+    }
+
+    /// "Download": fetches PDFium (then opens the waiting PDF).
+    pub fn start_pdf_download(&mut self) {
+        self.pdf_consent = Consent::Accepted;
+        self.pdf_download = Some(models::Download::start_set(
+            crate::pdf::pdfium::PDFIUM,
+            self.pdf_config.source.clone(),
+            self.pdf_config.dir.clone(),
+            self.notify(),
+        ));
+    }
+
+    pub fn decline_pdf_download(&mut self) {
+        self.pdf_consent = Consent::Declined;
+        self.pdf_pending = None;
+    }
+
+    fn pump_pdf(&mut self) {
+        let sam = !self.parts_tabs.is_empty() && self.sam_installed();
+        for tab in self.parts_tabs.values_mut() {
+            tab.pump();
+            // MobileSAM may be installed after the tab opened.
+            tab.sam_ready = sam;
+        }
+        let finished = self.pdf_download.as_mut().and_then(|d| d.result().cloned());
+        let Some(result) = finished else {
+            return;
+        };
+        self.pdf_download = None;
+        let installed =
+            result.and_then(|()| crate::pdf::pdfium::install_from_archive(&self.pdf_config.dir));
+        match installed {
+            Ok(()) => {
+                if let Some(path) = self.pdf_pending.take() {
+                    self.open_pdf(&path);
+                }
+            }
+            Err(e) => {
+                self.pdf_pending = None;
+                self.pdf_consent = Consent::NotAsked;
+                self.error = Some(format!("PDFium could not be installed: {e}"));
+            }
+        }
+    }
+
+    fn show_pdf_consent_window(&mut self, ctx: &egui::Context) {
+        if let Some(d) = &self.pdf_download {
+            let progress = d.progress();
+            egui::Window::new("Downloading PDFium")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.add(egui::ProgressBar::new(progress).show_percentage());
+                });
+            return;
+        }
+        if self.pdf_consent != Consent::Asking {
+            return;
+        }
+        let mut answer = None;
+        egui::Window::new("Download the PDF engine?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "Opening PDFs needs PDFium (Google's PDF engine, BSD license).\nDownload it now (about {:.1} MB) into\n{}?",
+                    crate::pdf::pdfium::PDFIUM.total_size() as f64 / 1e6,
+                    self.pdf_config.dir.display()
+                ));
+                ui.horizontal(|ui| {
+                    if ui.button("Download").clicked() {
+                        answer = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        answer = Some(false);
+                    }
+                });
+            });
+        match answer {
+            Some(true) => self.start_pdf_download(),
+            Some(false) => self.decline_pdf_download(),
+            None => {}
+        }
+    }
+
+    /// Whether MobileSAM (and ONNX Runtime paths) are installed.
+    fn sam_installed(&self) -> bool {
+        !self.segment_config.runtime_paths.is_empty()
+            && models::present(&self.segment_config.model_dir)
+    }
+
+    pub fn parts_tabs(&self) -> Vec<PartsId> {
+        let mut ids: Vec<PartsId> = self.parts_tabs.keys().copied().collect();
+        ids.sort();
+        ids
+    }
+
+    pub fn parts_tab(&self, id: PartsId) -> Option<&PartsTab> {
+        self.parts_tabs.get(&id)
+    }
+
+    pub fn parts_tab_mut(&mut self, id: PartsId) -> Option<&mut PartsTab> {
+        self.parts_tabs.get_mut(&id)
+    }
+
+    /// Handles a Parts tab request.
+    pub fn parts_action(&mut self, id: PartsId, action: PartsAction) {
+        match action {
+            PartsAction::Export { pngs } => {
+                let name = self
+                    .parts_tabs
+                    .get(&id)
+                    .map(|t| t.name.trim_end_matches(".pdf").to_owned())
+                    .unwrap_or_default();
+                let target = rfd::FileDialog::new()
+                    .set_file_name(format!("{name} A4.pdf"))
+                    .add_filter("PDF", &["pdf"])
+                    .save_file();
+                let notify = self.notify();
+                if let (Some(target), Some(tab)) = (target, self.parts_tabs.get_mut(&id)) {
+                    tab.pngs = pngs;
+                    // On a worker thread, with progress and Cancel in the tab.
+                    tab.start_export(&target, notify);
+                }
+            }
+            PartsAction::Refine { page, point } => self.refine_part(id, page, point),
+            PartsAction::ReloadPage { page, dpi } => {
+                let notify = self.notify();
+                if let Some(tab) = self.parts_tabs.get_mut(&id) {
+                    tab.reload_page(page, dpi, notify);
+                }
+            }
+        }
+    }
+
+    /// Sends a MobileSAM click on a PDF page to the segmenter.
+    pub fn refine_part(&mut self, id: PartsId, page: usize, point: (f32, f32)) {
+        let Some(image) = self
+            .parts_tabs
+            .get(&id)
+            .and_then(|t| t.pages.get(page))
+            .map(|p| std::sync::Arc::new(p.image.clone()))
+        else {
+            return;
+        };
+        if self.segmenter.is_none() {
+            self.segmenter = Some(Segmenter::new(self.segment_config.clone(), self.notify()));
+        }
+        self.next_request += 1;
+        let request = segment::Request {
+            id: self.next_request,
+            key: (1u64 << 62) ^ (id.0 << 20) ^ page as u64,
+            image,
+            prompt: Prompt::click(point),
+        };
+        self.parts_refine = Some((id, page, point, self.next_request));
+        if let Some(segmenter) = &self.segmenter {
+            segmenter.request(request);
+        }
     }
 
     // --- Library round trip -----------------------------------------------------
@@ -1402,6 +1642,19 @@ impl EditorApp {
                     engine,
                     note,
                 } => {
+                    if let Some((tab, page, point, request)) = self.parts_refine {
+                        if request == id {
+                            self.parts_refine = None;
+                            if let Some(t) = self.parts_tabs.get_mut(&tab) {
+                                t.apply_refine(page, point, &mask);
+                                t.status = Some(format!(
+                                    "Refined with {engine:?}; the sheets were re-packed"
+                                ));
+                            }
+                            self.analyzing = false;
+                            continue;
+                        }
+                    }
                     if let Some(session) = &mut self.extract {
                         if session.request == id {
                             // Results never extend beyond the selection.
@@ -3075,6 +3328,13 @@ impl EditorApp {
             self.open_video(path);
             return None;
         }
+        if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
+        {
+            self.open_pdf(path);
+            return None;
+        }
         match self.state.open(path) {
             Ok(id) => {
                 self.add_document_tab(id);
@@ -3173,6 +3433,7 @@ impl EditorApp {
         self.pump_extraction();
         self.pump_video_assets();
         self.pump_tagging();
+        self.pump_pdf();
         let checker = self
             .checker
             .get_or_insert_with(|| canvas::checker_texture(ui.ctx()))
@@ -3241,6 +3502,8 @@ impl EditorApp {
         let tag_status = self.tag_status();
         let mut review_actions = Vec::new();
         let mut closed_reviews = Vec::new();
+        let mut parts_actions = Vec::new();
+        let mut closed_parts = Vec::new();
         egui::CentralPanel::default()
             .frame(egui::Frame::central_panel(ui.style()).inner_margin(0.0))
             .show(ui, |ui| {
@@ -3274,6 +3537,9 @@ impl EditorApp {
                     reviews: &mut self.reviews,
                     review_actions: &mut review_actions,
                     closed_reviews: &mut closed_reviews,
+                    parts_tabs: &mut self.parts_tabs,
+                    parts_actions: &mut parts_actions,
+                    closed_parts: &mut closed_parts,
                 };
                 DockArea::new(&mut self.dock)
                     .show_leaf_close_all_buttons(false)
@@ -3318,6 +3584,15 @@ impl EditorApp {
         ));
         for action in asset_actions {
             self.library_action(action);
+        }
+        for id in closed_parts {
+            self.parts_tabs.remove(&id);
+            if self.parts_refine.is_some_and(|r| r.0 == id) {
+                self.parts_refine = None;
+            }
+        }
+        for (id, action) in parts_actions {
+            self.parts_action(id, action);
         }
         for id in closed_reviews {
             self.reviews.remove(&id);
@@ -3373,6 +3648,7 @@ impl EditorApp {
         self.show_pattern_window(ui.ctx());
         self.show_consent_window(ui.ctx());
         self.show_tag_consent_window(ui.ctx());
+        self.show_pdf_consent_window(ui.ctx());
         self.show_prompt_window(ui.ctx());
         self.show_error_window(ui.ctx());
 
@@ -3553,6 +3829,7 @@ impl EditorApp {
             .current_id()
             .is_some_and(|id| self.can_save_back(id));
         let mut save_back = false;
+        let mut open_folder = false;
         ui.menu_button("File", |ui| {
             let mut item = |ui: &mut egui::Ui, label: &str, shortcut, enabled, action| {
                 let button =
@@ -3563,6 +3840,9 @@ impl EditorApp {
             };
             item(ui, "New…", SHORTCUT_NEW, true, Action::New);
             item(ui, "Open…", SHORTCUT_OPEN, true, Action::Open);
+            if ui.button("Open Folder of Images…").clicked() {
+                open_folder = true;
+            }
             item(ui, "Save", SHORTCUT_SAVE, has_document, Action::Save);
             item(
                 ui,
@@ -3584,6 +3864,9 @@ impl EditorApp {
         });
         if save_back {
             actions.push(Action::SaveBack);
+        }
+        if open_folder {
+            actions.push(Action::OpenImageFolder);
         }
         let stack = self.state.current_document().map(|open| open.undo_stack());
         let undo_label = stack.and_then(|s| s.undo_label()).map(str::to_owned);
@@ -3902,6 +4185,14 @@ impl EditorApp {
                 }
             }
             Action::Close => self.close_current(),
+            Action::OpenImageFolder => {
+                if let Some(dir) = rfd::FileDialog::new()
+                    .set_title("Open a folder of page images")
+                    .pick_folder()
+                {
+                    self.open_image_folder(&dir);
+                }
+            }
             Action::SaveBack => {
                 self.save_back_to_library();
             }
@@ -4137,9 +4428,12 @@ impl EditorApp {
             .dock
             .iter_leaves()
             .find(|(_, leaf)| {
-                leaf.tabs()
-                    .iter()
-                    .any(|t| matches!(t, Tab::Document(_) | Tab::Video(_) | Tab::Review(_)))
+                leaf.tabs().iter().any(|t| {
+                    matches!(
+                        t,
+                        Tab::Document(_) | Tab::Video(_) | Tab::Review(_) | Tab::Parts(_)
+                    )
+                })
             })
             .or_else(|| {
                 self.dock
@@ -4251,6 +4545,9 @@ struct Viewer<'a> {
     reviews: &'a mut HashMap<ReviewId, ReviewTab>,
     review_actions: &'a mut Vec<(ReviewId, ReviewAction)>,
     closed_reviews: &'a mut Vec<ReviewId>,
+    parts_tabs: &'a mut HashMap<PartsId, PartsTab>,
+    parts_actions: &'a mut Vec<(PartsId, PartsAction)>,
+    closed_parts: &'a mut Vec<PartsId>,
 }
 
 impl TabViewer for Viewer<'_> {
@@ -4287,6 +4584,12 @@ impl TabViewer for Viewer<'_> {
                 .map(|r| format!("{} review", r.video))
                 .unwrap_or_default()
                 .into(),
+            Tab::Parts(id) => self
+                .parts_tabs
+                .get(id)
+                .map(|t| format!("{} — Parts Layout", t.name))
+                .unwrap_or_default()
+                .into(),
         }
     }
 
@@ -4314,6 +4617,13 @@ impl TabViewer for Viewer<'_> {
                         .extend(actions.into_iter().map(|a| (id, a)));
                 }
             }
+            Tab::Parts(id) => {
+                if let Some(tab) = self.parts_tabs.get_mut(&id) {
+                    let actions = tab.show(ui);
+                    self.parts_actions
+                        .extend(actions.into_iter().map(|a| (id, a)));
+                }
+            }
             Tab::Video(id) => {
                 if let Some(video) = self.videos.get_mut(&id) {
                     let actions = video.show(ui);
@@ -4338,13 +4648,16 @@ impl TabViewer for Viewer<'_> {
         if let Tab::Review(id) = tab {
             self.closed_reviews.push(*id);
         }
+        if let Tab::Parts(id) = tab {
+            self.closed_parts.push(*id);
+        }
         OnCloseResponse::Close
     }
 
     fn scroll_bars(&self, tab: &Tab) -> [bool; 2] {
         // The canvas handles its own scrolling.
         match tab {
-            Tab::Document(_) | Tab::Video(_) | Tab::Review(_) => [false, false],
+            Tab::Document(_) | Tab::Video(_) | Tab::Review(_) | Tab::Parts(_) => [false, false],
             // The library wraps to the panel's width and scrolls its own grid.
             Tab::Panel(Panel::AssetLibrary) => [false, false],
             Tab::Panel(_) => [true, true],
@@ -4638,10 +4951,12 @@ fn open_file_dialog() -> Option<PathBuf> {
         .collect();
     all.push(project::EXTENSION);
     all.extend(video::EXTENSIONS);
+    all.push("pdf");
     let mut dialog = rfd::FileDialog::new()
-        .add_filter("Images, videos, and projects", &all)
+        .add_filter("Images, videos, PDFs, and projects", &all)
         .add_filter("Game Asset Creator project", &[project::EXTENSION])
-        .add_filter("Videos", &video::EXTENSIONS);
+        .add_filter("Videos", &video::EXTENSIONS)
+        .add_filter("Paper-model PDF", &["pdf"]);
     for format in FileFormat::ALL {
         dialog = dialog.add_filter(format.label(), format.extensions());
     }
@@ -4680,4 +4995,20 @@ struct ExtractionInput {
 struct LibraryLink {
     asset: u64,
     animation: bool,
+}
+
+/// Where PDFium is installed and where it is downloaded from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PdfConfig {
+    pub dir: PathBuf,
+    pub source: models::Source,
+}
+
+impl Default for PdfConfig {
+    fn default() -> Self {
+        Self {
+            dir: crate::pdf::pdfium::default_dir(),
+            source: models::Source::Http(crate::pdf::pdfium::PDFIUM.base_url.to_owned()),
+        }
+    }
 }
