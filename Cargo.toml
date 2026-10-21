@@ -37,6 +37,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 rustfft = "6"
+# PDF pages are rendered by PDFium, loaded at run time (downloaded on first use).
+pdfium-render = { version = "0.9", default-features = false, features = ["pdfium_7881", "image_025", "thread_safe"] }
+pdf-writer = "0.13"
+flate2 = "1"
+tar = "0.4"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
