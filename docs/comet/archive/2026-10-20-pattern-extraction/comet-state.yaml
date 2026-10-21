@@ -2,8 +2,8 @@ schema: comet.native.v4
 name: pattern-extraction
 language: en
 phase: archive
-status: active
-state_version: 23
+status: done
+state_version: 25
 brief: brief.md
 document_constraints_version: 1
 shape_confirmation_hash: 4e8c9e7a45766183616b29f15266c26e8c7bb3af8a5bb6783969f11ea3663ef7
@@ -15,9 +15,9 @@ workspace:
   isolation: branch
   change_branch: comet/pattern-extraction
   target_branch: master
-  finish: null
+  finish: merge
 loop:
-  stage: archive-ready
+  stage: done
   goal_cycle: 2
   iteration: 6
   attempt: 1
@@ -26,7 +26,7 @@ loop:
   no_progress_count: 0
   execution_failure_count: 0
   previous_unresolved_ids: []
-  next_action: archive
+  next_action: null
 acceptance:
   - id: A1
     source: brief.md
@@ -750,5 +750,5 @@ history_overflow:
     recovery: 0
 verification_result: pass
 verification_report: verification.md
-archived: false
+archived: true
 created_at: 2026-10-20T14:52:19.694Z
