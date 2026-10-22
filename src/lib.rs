@@ -21,6 +21,7 @@ pub mod pattern;
 pub mod pattern_ui;
 pub mod pdf;
 pub mod project;
+pub mod recolor;
 pub mod review_ui;
 pub mod selection;
 pub mod tools;

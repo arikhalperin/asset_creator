@@ -16,6 +16,7 @@ use crate::pdf::pack::{self, Placement};
 use crate::pdf::parts::{self, Part};
 use crate::pdf::render::{self, Page};
 use crate::pdf::{mm_to_px, split};
+use crate::recolor::{self, delta_e, Recolor};
 
 /// Id of a Parts Layout tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -91,7 +92,41 @@ pub enum PartsAction {
     Refine { page: usize, point: (f32, f32) },
     /// Load an image page again at another DPI.
     ReloadPage { page: usize, dpi: f32 },
+    /// MobileSAM outline of an area to protect from recolouring.
+    Protect { page: usize, point: (f32, f32) },
+    /// Apply the Recolor… window's mapping to all pages.
+    ApplyRecolor,
+    /// Open Page in Editor (page right-click).
+    OpenInEditor { page: usize },
 }
+
+/// The Recolor… window's state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecolorDialog {
+    pub rc: Recolor,
+    /// Swatch picked by a click on a page.
+    pub selected: Option<usize>,
+    /// Clicks on pages outline areas to protect (MobileSAM).
+    pub protect_mode: bool,
+    /// Drags on pages draw areas to recolour (rectangle; Shift: lasso).
+    pub area_mode: bool,
+}
+
+/// A running recolour of all pages.
+struct RecolorJob {
+    rx: Receiver<RecolorEvent>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    done: usize,
+    total: usize,
+}
+
+enum RecolorEvent {
+    Progress(usize, usize),
+    Finished(Option<Vec<RgbaImage>>),
+}
+
+/// A recorded split, replayed when part images are re-cut.
+type SplitOp = (usize, (f32, f32), (f32, f32), f32, split::GlueOn);
 
 /// The Split window's state.
 #[derive(Debug, Clone, PartialEq)]
@@ -188,6 +223,32 @@ pub struct PartsTab {
     frame_drag: Option<(usize, (i32, i32), Pos2)>,
     /// Image files of a folder that could not be read (name, reason).
     pub skipped: Vec<(String, String)>,
+    /// The Recolor… window.
+    pub recolor: Option<RecolorDialog>,
+    /// The pages before the first recolour (for Revert).
+    original_pages: Option<Vec<RgbaImage>>,
+    /// Areas never recoloured, per page (page pixels).
+    pub protect: Vec<Option<GrayImage>>,
+    /// Recolour Area: drawn areas (page, polygon in page pixels); once
+    /// there are any, only pixels inside them are recoloured.
+    pub areas: Vec<(usize, Vec<(f32, f32)>)>,
+    /// An area being drawn.
+    area_drag: Option<AreaDrag>,
+    recolor_job: Option<RecolorJob>,
+    /// Recoloured page previews while the window is open.
+    recolor_textures: Vec<Option<TextureHandle>>,
+    /// Per page preview: colours and swatch membership (valid for one
+    /// tolerance; colour/detail changes reuse it).
+    recolor_prepared: Vec<Option<recolor::Prepared>>,
+    /// Preview preparation running on a worker after the window opens.
+    recolor_preparing: Option<Receiver<Vec<recolor::Prepared>>>,
+    protect_textures: Vec<Option<TextureHandle>>,
+    /// Splits made since the last rebuild (replayed by `recut`).
+    splits: Vec<SplitOp>,
+    /// Bumps when page pixels change (MobileSAM cache key).
+    pub page_version: u64,
+    /// Where pages were drawn last frame (screen points) and their scale.
+    pub page_rects: Vec<(usize, Rect, f32)>,
     /// For image pages: the file and where its size came from.
     pub image_pages: Vec<Option<(PathBuf, SizeSource)>>,
     /// DPI field of each image page.
@@ -347,6 +408,19 @@ impl PartsTab {
             page_zoom: 1.0,
             frame_drag: None,
             skipped: Vec::new(),
+            recolor: None,
+            original_pages: None,
+            protect: Vec::new(),
+            areas: Vec::new(),
+            area_drag: None,
+            recolor_job: None,
+            recolor_textures: Vec::new(),
+            recolor_prepared: Vec::new(),
+            recolor_preparing: None,
+            protect_textures: Vec::new(),
+            splits: Vec::new(),
+            page_version: 0,
+            page_rects: Vec::new(),
             image_pages: Vec::new(),
             dpi_edit: Vec::new(),
             reloads: Vec::new(),
@@ -418,7 +492,7 @@ impl PartsTab {
     /// Takes finished pages from the loader and export progress. Returns
     /// whether anything changed.
     pub fn pump(&mut self) -> bool {
-        let mut exported = self.pump_export();
+        let mut exported = self.pump_export() | self.pump_recolor();
         // Page reloads (DPI overrides).
         let mut events = Vec::new();
         self.reloads.retain(|rx| match rx.try_recv() {
@@ -589,6 +663,7 @@ impl PartsTab {
 
     /// Re-creates the layout items from the proposals and packs them.
     pub fn rebuild(&mut self) {
+        self.splits.clear();
         let had_layout = !self.layout.items.is_empty();
         // Parts of manual pages are printed through their frames instead.
         let keep: Vec<usize> = (0..self.proposals.len())
@@ -736,6 +811,7 @@ impl PartsTab {
             self.status = Some("The line must cross the part".to_owned());
             return false;
         }
+        self.splits.push((i, a, b, glue_mm, on));
         self.item_previews.resize(self.layout.items.len(), None);
         self.item_previews[i] = None;
         self.generation += 1;
@@ -859,6 +935,656 @@ impl PartsTab {
             }
         }
         sheets
+    }
+
+    // --- Recolour ---------------------------------------------------------------
+
+    /// Recolor…: finds the paint palette of all pages and opens the window.
+    pub fn open_recolor(&mut self) {
+        if self.pages.is_empty() {
+            return;
+        }
+        let (swatches, paper) = self.recolor_palette();
+        if swatches.is_empty() {
+            self.status = Some("No paint colours found on these pages".to_owned());
+            return;
+        }
+        // Prepare the page previews in the background so the first change
+        // previews at once.
+        let previews = self.page_previews.clone();
+        let sizes: Vec<u32> = self.pages.iter().map(|p| p.image.width()).collect();
+        let (sw, tol) = (swatches.clone(), recolor::DEFAULT_TOLERANCE);
+        let (tx, rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("recolor-prepare".to_owned())
+            .spawn(move || {
+                let prepared = previews
+                    .iter()
+                    .zip(sizes)
+                    .map(|(small, full)| {
+                        let r = (mm_to_px(0.5) * small.width() as f32 / full as f32)
+                            .round()
+                            .max(1.0) as usize;
+                        recolor::prepare(small, &sw, paper, tol, r)
+                    })
+                    .collect();
+                let _ = tx.send(prepared);
+            })
+            .expect("spawn recolor prepare");
+        self.recolor_preparing = Some(rx);
+        self.recolor = Some(RecolorDialog {
+            rc: Recolor::new(swatches, paper),
+            selected: None,
+            protect_mode: false,
+            area_mode: false,
+        });
+        self.recolor_textures.clear();
+        self.recolor_prepared.clear();
+    }
+
+    /// Marks the recolour preview as changed.
+    pub fn recolor_changed(&mut self) {
+        self.recolor_textures.clear();
+    }
+
+    /// The paint palette (and paper colour): of the drawn areas when there
+    /// are any, else of all pages.
+    fn recolor_palette(&self) -> (Vec<recolor::Swatch>, Option<[u8; 3]>) {
+        let paper = recolor::paper_of(&self.pages[0].image);
+        if self.areas.is_empty() {
+            let refs: Vec<&RgbaImage> = self.pages.iter().map(|p| &p.image).collect();
+            return (recolor::palette(&refs, paper), paper);
+        }
+        let crops: Vec<RgbaImage> = (0..self.pages.len())
+            .filter_map(|i| self.area_crop(i))
+            .collect();
+        let refs: Vec<&RgbaImage> = crops.iter().collect();
+        (recolor::palette(&refs, paper), paper)
+    }
+
+    /// The bounding box of page `i`'s areas, transparent outside them.
+    fn area_crop(&self, i: usize) -> Option<RgbaImage> {
+        let img = &self.pages.get(i)?.image;
+        let polys: Vec<&Vec<(f32, f32)>> = self
+            .areas
+            .iter()
+            .filter(|(p, _)| *p == i)
+            .map(|(_, a)| a)
+            .collect();
+        let points = polys.iter().flat_map(|p| p.iter());
+        let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for &(x, y) in points {
+            (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+        }
+        let x0 = x0.floor().clamp(0.0, img.width() as f32) as u32;
+        let y0 = y0.floor().clamp(0.0, img.height() as f32) as u32;
+        let x1 = x1.ceil().clamp(0.0, img.width() as f32) as u32;
+        let y1 = y1.ceil().clamp(0.0, img.height() as f32) as u32;
+        if x1 <= x0 || y1 <= y0 {
+            return None;
+        }
+        let mut mask = GrayImage::new(x1 - x0, y1 - y0);
+        for poly in polys {
+            let shifted: Vec<(f32, f32)> = poly
+                .iter()
+                .map(|&(x, y)| (x - x0 as f32, y - y0 as f32))
+                .collect();
+            fill_polygon(&mut mask, &shifted);
+        }
+        let mut crop = image::imageops::crop_imm(img, x0, y0, x1 - x0, y1 - y0).to_image();
+        for (p, m) in crop.pixels_mut().zip(mask.pixels()) {
+            if m[0] == 0 {
+                p[3] = 0;
+            }
+        }
+        Some(crop)
+    }
+
+    /// Pixels of page `i` (at `w`×`h`) that recolouring must not change:
+    /// protected ones and, once areas are drawn, everything outside them.
+    fn blocked_mask(&self, i: usize, w: u32, h: u32) -> Option<GrayImage> {
+        let protect = self.protect.get(i).cloned().flatten().map(|m| {
+            if m.dimensions() == (w, h) {
+                m
+            } else {
+                image::imageops::resize(&m, w, h, image::imageops::FilterType::Nearest)
+            }
+        });
+        if self.areas.is_empty() {
+            return protect;
+        }
+        let s = w as f32 / self.pages.get(i)?.image.width() as f32;
+        let mut allowed = GrayImage::new(w, h);
+        for (_, poly) in self.areas.iter().filter(|(p, _)| *p == i) {
+            let scaled: Vec<(f32, f32)> = poly.iter().map(|&(x, y)| (x * s, y * s)).collect();
+            fill_polygon(&mut allowed, &scaled);
+        }
+        for p in allowed.pixels_mut() {
+            p[0] = if p[0] > 0 { 0 } else { 255 };
+        }
+        if let Some(m) = protect {
+            for (a, b) in allowed.pixels_mut().zip(m.pixels()) {
+                a[0] = a[0].max(b[0]);
+            }
+        }
+        Some(allowed)
+    }
+
+    /// Recolour Area: adds a drawn area (page pixels) to page `page`; tiny
+    /// ones (under 2 mm across) are ignored.
+    pub fn add_area(&mut self, page: usize, poly: Vec<(f32, f32)>) -> bool {
+        if page >= self.pages.len() || poly.len() < 3 {
+            return false;
+        }
+        let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for &(x, y) in &poly {
+            (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+        }
+        if (x1 - x0).min(y1 - y0) < mm_to_px(2.0) {
+            return false;
+        }
+        self.areas.push((page, poly));
+        self.areas_changed();
+        true
+    }
+
+    /// Clear Areas: whole pages are recoloured again.
+    pub fn clear_areas(&mut self) {
+        if self.areas.is_empty() {
+            return;
+        }
+        self.areas.clear();
+        self.areas_changed();
+    }
+
+    /// The palette follows the areas; chosen colours stay with matching
+    /// paints.
+    fn areas_changed(&mut self) {
+        self.recolor_textures.clear();
+        if self.recolor.is_none() {
+            return;
+        }
+        let (swatches, _) = self.recolor_palette();
+        let Some(dialog) = &mut self.recolor else {
+            return;
+        };
+        let old = &dialog.rc;
+        let targets: Vec<Option<[u8; 3]>> = swatches
+            .iter()
+            .map(|s| {
+                old.swatches
+                    .iter()
+                    .zip(&old.targets)
+                    .filter(|(o, t)| t.is_some() && delta_e(o.lab, s.lab) < recolor::MERGE_DE)
+                    .min_by(|a, b| delta_e(a.0.lab, s.lab).total_cmp(&delta_e(b.0.lab, s.lab)))
+                    .and_then(|(_, t)| *t)
+            })
+            .collect();
+        if swatches.is_empty() {
+            self.status = Some("No paint colours inside the areas".to_owned());
+        }
+        dialog.rc.swatches = swatches;
+        dialog.rc.targets = targets;
+        dialog.selected = None;
+        self.recolor_preparing = None;
+        self.recolor_prepared.clear();
+    }
+
+    /// Adds a MobileSAM mask (page-sized) to a page's protected area.
+    pub fn add_protect(&mut self, page: usize, mask: &GrayImage) {
+        if self.protect.len() < self.pages.len() {
+            self.protect.resize(self.pages.len(), None);
+        }
+        let Some(p) = self.pages.get(page) else {
+            return;
+        };
+        if mask.dimensions() != p.image.dimensions() {
+            return;
+        }
+        let slot = &mut self.protect[page];
+        match slot {
+            Some(m) => {
+                for (a, b) in m.pixels_mut().zip(mask.pixels()) {
+                    a[0] = a[0].max(b[0]);
+                }
+            }
+            None => *slot = Some(mask.clone()),
+        }
+        self.protect_textures.clear();
+        self.recolor_textures.clear();
+        self.status = Some(format!(
+            "Page {}: area protected from recolouring",
+            page + 1
+        ));
+    }
+
+    pub fn clear_protect(&mut self) {
+        self.protect.clear();
+        self.protect_textures.clear();
+        self.recolor_textures.clear();
+    }
+
+    /// The swatch under a page point (its own colour, else its surroundings).
+    pub fn swatch_at(&self, page: usize, point: (f32, f32)) -> Option<usize> {
+        let dialog = self.recolor.as_ref()?;
+        let img = &self.pages.get(page)?.image;
+        let (x, y) = (point.0 as i64, point.1 as i64);
+        if x < 0 || y < 0 || x >= img.width() as i64 || y >= img.height() as i64 {
+            return None;
+        }
+        let r = (mm_to_px(0.5) as i64).max(1);
+        let x0 = (x - r).max(0) as u32;
+        let y0 = (y - r).max(0) as u32;
+        let x1 = ((x + r) as u32).min(img.width() - 1);
+        let y1 = ((y + r) as u32).min(img.height() - 1);
+        let patch = image::imageops::crop_imm(img, x0, y0, x1 - x0 + 1, y1 - y0 + 1).to_image();
+        let member = recolor::membership(
+            &patch,
+            &dialog.rc.swatches,
+            dialog.rc.paper,
+            dialog.rc.tolerance,
+            r as usize,
+        );
+        let k = (y as u32 - y0) as usize * patch.width() as usize + (x as u32 - x0) as usize;
+        member
+            .get(k)
+            .copied()
+            .filter(|m| *m != u8::MAX)
+            .map(|m| m as usize)
+    }
+
+    /// Apply: recolours every page at full resolution on a worker thread.
+    pub fn start_recolor(&mut self, notify: Arc<dyn Fn() + Send + Sync>) -> bool {
+        let Some(dialog) = &self.recolor else {
+            return false;
+        };
+        if self.recolor_job.is_some() || dialog.rc.is_identity() {
+            return false;
+        }
+        let rc = dialog.rc.clone();
+        let pages: Vec<RgbaImage> = self.pages.iter().map(|p| p.image.clone()).collect();
+        let protect: Vec<Option<GrayImage>> = pages
+            .iter()
+            .enumerate()
+            .map(|(i, p)| self.blocked_mask(i, p.width(), p.height()))
+            .collect();
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = cancel.clone();
+        let total = pages.len();
+        std::thread::Builder::new()
+            .name("recolor".to_owned())
+            .spawn(move || {
+                let r = mm_to_px(0.5).round() as usize;
+                let mut out = Vec::with_capacity(pages.len());
+                for (i, page) in pages.iter().enumerate() {
+                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let _ = tx.send(RecolorEvent::Finished(None));
+                        notify();
+                        return;
+                    }
+                    out.push(recolor::apply(page, &rc, r, protect[i].as_ref()));
+                    let _ = tx.send(RecolorEvent::Progress(i + 1, total));
+                    notify();
+                }
+                let _ = tx.send(RecolorEvent::Finished(Some(out)));
+                notify();
+            })
+            .expect("spawn recolor");
+        self.recolor_job = Some(RecolorJob {
+            rx,
+            cancel,
+            done: 0,
+            total,
+        });
+        self.status = Some(format!("Recolouring {total} page(s)…"));
+        true
+    }
+
+    /// Progress of a running recolour (pages done, total).
+    pub fn recolor_progress(&self) -> Option<(usize, usize)> {
+        self.recolor_job.as_ref().map(|j| (j.done, j.total))
+    }
+
+    pub fn cancel_recolor(&mut self) {
+        if let Some(job) = &self.recolor_job {
+            job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn pump_recolor(&mut self) -> bool {
+        if let Some(rx) = &self.recolor_preparing {
+            if let Ok(prepared) = rx.try_recv() {
+                self.recolor_prepared = prepared.into_iter().map(Some).collect();
+                self.recolor_preparing = None;
+            }
+        }
+        let Some(job) = &mut self.recolor_job else {
+            return false;
+        };
+        let mut finished = None;
+        let mut changed = false;
+        while let Ok(e) = job.rx.try_recv() {
+            changed = true;
+            match e {
+                RecolorEvent::Progress(d, t) => {
+                    job.done = d;
+                    job.total = t;
+                }
+                RecolorEvent::Finished(r) => finished = Some(r),
+            }
+        }
+        if let Some(result) = finished {
+            self.recolor_job = None;
+            match result {
+                Some(new_pages) => {
+                    if self.original_pages.is_none() {
+                        self.original_pages =
+                            Some(self.pages.iter().map(|p| p.image.clone()).collect());
+                    }
+                    self.set_page_images(new_pages);
+                    self.status = Some("Recoloured; parts and sheets keep their places".to_owned());
+                }
+                None => self.status = Some("Recolour cancelled".to_owned()),
+            }
+        }
+        changed
+    }
+
+    /// Whether the pages were recoloured (Revert is possible).
+    pub fn recolored(&self) -> bool {
+        self.original_pages.is_some()
+    }
+
+    /// Revert: the original page colours come back.
+    pub fn revert_recolor(&mut self) -> bool {
+        let Some(original) = self.original_pages.take() else {
+            return false;
+        };
+        self.set_page_images(original);
+        self.status = Some("Original colours restored".to_owned());
+        true
+    }
+
+    /// Update Parts Layout Page: `image` (edited in the editor) replaces
+    /// page `page`, the parts are re-cut without re-packing, and Revert to
+    /// Original still restores the first images.
+    pub fn set_edited_page(&mut self, page: usize, image: RgbaImage) -> Result<(), String> {
+        let current = self
+            .pages
+            .get(page)
+            .ok_or_else(|| format!("Page {} is no longer there", page + 1))?;
+        if current.image.dimensions() != image.dimensions() {
+            let (w, h) = current.image.dimensions();
+            return Err(format!(
+                "The canvas is {}×{} but the page is {w}×{h}",
+                image.width(),
+                image.height()
+            ));
+        }
+        if self.recolor_job.is_some() {
+            return Err("Wait for the recolour to finish".to_owned());
+        }
+        let mut images: Vec<RgbaImage> = self.pages.iter().map(|p| p.image.clone()).collect();
+        if self.original_pages.is_none() {
+            self.original_pages = Some(images.clone());
+        }
+        images[page] = image;
+        self.set_page_images(images);
+        self.status = Some(format!(
+            "Page {} updated from the editor; parts keep their places",
+            page + 1
+        ));
+        Ok(())
+    }
+
+    /// Replaces the page pixels (same sizes) and re-cuts the parts, keeping
+    /// outlines, splits, and placements.
+    fn set_page_images(&mut self, images: Vec<RgbaImage>) {
+        self.page_version += 1;
+        for (page, img) in self.pages.iter_mut().zip(images) {
+            page.image = img;
+        }
+        self.page_previews = self.pages.iter().map(|p| preview(&p.image)).collect();
+        self.page_textures = vec![None; self.pages.len()];
+        self.recolor_textures.clear();
+        self.recolor_prepared.clear();
+        self.recut();
+    }
+
+    /// Re-cuts every part from the current pages without re-packing: the
+    /// items are rebuilt from the proposals, the recorded splits replayed,
+    /// and the placements restored.
+    fn recut(&mut self) {
+        for (k, part) in self.proposals.iter().enumerate() {
+            let img = part.image(&self.pages[part.page].image);
+            self.part_previews[k] = preview(&img);
+            self.part_images[k] = img;
+        }
+        let placements = self.layout.placements.clone();
+        let sheets = self.layout.sheets;
+        let keep: Vec<usize> = (0..self.proposals.len())
+            .filter(|&k| {
+                !self
+                    .manual
+                    .get(self.proposals[k].page)
+                    .copied()
+                    .unwrap_or(false)
+            })
+            .collect();
+        let items: Vec<Item> = keep
+            .iter()
+            .map(|&k| Item {
+                label: format!("{}.{}", self.proposals[k].page + 1, k + 1),
+                image: self.part_images[k].clone(),
+            })
+            .collect();
+        self.layout.items = items;
+        self.layout.placements = vec![None; self.layout.items.len()];
+        for &(i, a, b, glue, on) in &self.splits {
+            self.layout.split(i, a, b, glue, on);
+        }
+        if placements.len() == self.layout.items.len() {
+            self.layout.placements = placements;
+        }
+        self.layout.sheets = sheets;
+        self.item_previews = vec![None; self.layout.items.len()];
+        self.generation += 1;
+        self.item_textures.clear();
+    }
+
+    fn recolor_texture(&mut self, ctx: &egui::Context, i: usize) -> Option<TextureHandle> {
+        let dialog = self.recolor.as_ref()?;
+        if dialog.rc.is_identity() {
+            return None;
+        }
+        if self.recolor_textures.len() < self.pages.len() {
+            self.recolor_textures.resize(self.pages.len(), None);
+        }
+        if self.recolor_textures[i].is_none() {
+            let small = self.page_previews.get(i)?;
+            let (w, h) = small.dimensions();
+            let scale = w as f32 / self.pages[i].image.width() as f32;
+            let r = (mm_to_px(0.5) * scale).round().max(1.0) as usize;
+            let protect = self.blocked_mask(i, w, h);
+            if let Some(rx) = &self.recolor_preparing {
+                // Take the background preparation if it is done (or wait
+                // for it: it is about to be needed anyway).
+                if let Ok(prepared) = rx.recv() {
+                    self.recolor_prepared = prepared.into_iter().map(Some).collect();
+                }
+                self.recolor_preparing = None;
+            }
+            if self.recolor_prepared.len() < self.pages.len() {
+                self.recolor_prepared.resize(self.pages.len(), None);
+            }
+            let stale = self.recolor_prepared[i]
+                .as_ref()
+                .is_none_or(|p| p.tolerance != dialog.rc.tolerance);
+            if stale {
+                self.recolor_prepared[i] = Some(recolor::prepare(
+                    small,
+                    &dialog.rc.swatches,
+                    dialog.rc.paper,
+                    dialog.rc.tolerance,
+                    r,
+                ));
+            }
+            let prep = self.recolor_prepared[i].as_ref().expect("just prepared");
+            let out = recolor::apply_prepared(small, prep, &dialog.rc, protect.as_ref());
+            let c =
+                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], out.as_raw());
+            self.recolor_textures[i] =
+                Some(ctx.load_texture(format!("pdf-recolor-{i}"), c, TextureOptions::LINEAR));
+        }
+        self.recolor_textures[i].clone()
+    }
+
+    fn protect_texture(&mut self, ctx: &egui::Context, i: usize) -> Option<TextureHandle> {
+        let mask = self.protect.get(i)?.as_ref()?;
+        if self.protect_textures.len() < self.pages.len() {
+            self.protect_textures.resize(self.pages.len(), None);
+        }
+        if self.protect_textures[i].is_none() {
+            let (w, h) = self.page_previews[i].dimensions();
+            let small = image::imageops::resize(mask, w, h, image::imageops::FilterType::Nearest);
+            let tint = RgbaImage::from_fn(w, h, |x, y| {
+                if small.get_pixel(x, y)[0] > 0 && (x + y) % 6 < 3 {
+                    image::Rgba([230, 40, 160, 150])
+                } else {
+                    image::Rgba([0, 0, 0, 0])
+                }
+            });
+            let c =
+                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], tint.as_raw());
+            self.protect_textures[i] =
+                Some(ctx.load_texture(format!("pdf-protect-{i}"), c, TextureOptions::NEAREST));
+        }
+        self.protect_textures[i].clone()
+    }
+
+    fn show_recolor_window(&mut self, ctx: &egui::Context, actions: &mut Vec<PartsAction>) {
+        let Some(mut dialog) = self.recolor.take() else {
+            return;
+        };
+        let before = dialog.clone();
+        let mut keep = true;
+        let mut apply = false;
+        let mut revert = false;
+        let mut clear = false;
+        let mut cancel = false;
+        let mut clear_areas = false;
+        let areas = self.areas.len();
+        let progress = self.recolor_progress();
+        let sam = self.sam_ready;
+        let recolored = self.recolored();
+        egui::Window::new("Recolor Paint")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::RIGHT_TOP, Vec2::new(-24.0, 72.0))
+            .show(ctx, |ui| {
+                ui.label("Paint colours of the model (click a page to pick one):");
+                recolor_controls(ui, &mut dialog.rc, dialog.selected);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(sam, |ui| {
+                        if ui
+                            .toggle_value(&mut dialog.protect_mode, "Protect (MobileSAM)")
+                            .on_disabled_hover_text(
+                                "Needs the MobileSAM model (Extract Object downloads it)",
+                            )
+                            .changed()
+                            && dialog.protect_mode
+                        {
+                            dialog.area_mode = false;
+                        }
+                    });
+                    if ui.button("Clear Protected").clicked() {
+                        clear = true;
+                    }
+                });
+                if !sam {
+                    ui.weak("Protect needs the MobileSAM model.");
+                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .toggle_value(&mut dialog.area_mode, "Recolour Area")
+                        .on_hover_text("Drag on a page: rectangle · Shift + drag: lasso")
+                        .changed()
+                        && dialog.area_mode
+                    {
+                        dialog.protect_mode = false;
+                    }
+                    if ui
+                        .add_enabled(areas > 0, egui::Button::new("Clear Areas"))
+                        .clicked()
+                    {
+                        clear_areas = true;
+                    }
+                });
+                if areas > 0 {
+                    ui.weak(format!(
+                        "Only inside {areas} area{} (other pages unchanged)",
+                        if areas == 1 { "" } else { "s" }
+                    ));
+                } else if dialog.area_mode {
+                    ui.weak("Drag on a page: rectangle · Shift + drag: lasso");
+                }
+                ui.separator();
+                if let Some((done, total)) = progress {
+                    ui.add(
+                        egui::ProgressBar::new(done as f32 / total.max(1) as f32).text(format!(
+                            "Recolouring page {} of {total}",
+                            (done + 1).min(total)
+                        )),
+                    );
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                } else {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(!dialog.rc.is_identity(), egui::Button::new("Apply"))
+                            .clicked()
+                        {
+                            apply = true;
+                        }
+                        if ui
+                            .add_enabled(recolored, egui::Button::new("Revert to Original"))
+                            .clicked()
+                        {
+                            revert = true;
+                        }
+                        if ui.button("Close").clicked() {
+                            keep = false;
+                        }
+                    });
+                }
+            });
+        let changed = dialog != before;
+        if keep {
+            self.recolor = Some(dialog);
+        } else {
+            self.recolor_textures.clear();
+        }
+        if changed {
+            self.recolor_changed();
+        }
+        if clear {
+            self.clear_protect();
+        }
+        if cancel {
+            self.cancel_recolor();
+        }
+        if clear_areas {
+            self.clear_areas();
+        }
+        if revert {
+            self.revert_recolor();
+        }
+        if apply {
+            actions.push(PartsAction::ApplyRecolor);
+        }
     }
 
     /// Unplaced items, oversized ones first.
@@ -1023,6 +1749,9 @@ impl PartsTab {
                     self.cancel_export();
                 }
             } else {
+                if ui.button("Recolor…").clicked() && self.recolor.is_none() {
+                    self.open_recolor();
+                }
                 ui.checkbox(&mut self.pngs, "Also PNGs");
                 if ui.button("Export A4 Pages…").clicked() {
                     actions.push(PartsAction::Export { pngs: self.pngs });
@@ -1105,6 +1834,7 @@ impl PartsTab {
             });
         });
         self.show_split_window(&ctx);
+        self.show_recolor_window(&ctx, &mut actions);
         actions
     }
 
@@ -1117,6 +1847,7 @@ impl PartsTab {
     ) {
         let modifiers = ui.input(|i| i.modifiers);
         self.frame_rects.clear();
+        self.page_rects.clear();
         for i in 0..self.pages.len() {
             let (pw, ph) = self.pages[i].image.dimensions();
             let (wmm, hmm) = (self.pages[i].width_mm, self.pages[i].height_mm);
@@ -1179,15 +1910,76 @@ impl PartsTab {
                 self.set_manual(i, manual);
             }
             let scale = width / pw as f32;
-            let (rect, response) =
-                ui.allocate_exact_size(Vec2::new(width, ph as f32 * scale), Sense::click());
-            if let Some(t) = self.page_texture(ctx, i) {
+            let (rect, response) = ui
+                .allocate_exact_size(Vec2::new(width, ph as f32 * scale), Sense::click_and_drag());
+            self.page_rects.push((i, rect, scale));
+            let shown = self
+                .recolor_texture(ctx, i)
+                .or_else(|| self.page_texture(ctx, i));
+            if let Some(t) = shown {
                 ui.painter().image(
                     t.id(),
                     rect,
                     Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                     Color32::WHITE,
                 );
+            }
+            if let Some(t) = self.protect_texture(ctx, i) {
+                ui.painter().image(
+                    t.id(),
+                    rect,
+                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            }
+            // Recolour areas (and the one being drawn).
+            let drawing = self.recolor.as_ref().is_some_and(|d| d.area_mode);
+            let to_screen = |&(x, y): &(f32, f32)| rect.min + Vec2::new(x, y) * scale;
+            let to_page = |p: Pos2| {
+                let q = (p - rect.min) / scale;
+                (q.x, q.y)
+            };
+            if drawing {
+                if response.drag_started() {
+                    let origin = ui.input(|inp| inp.pointer.press_origin());
+                    if let Some(o) = origin.or(response.interact_pointer_pos()) {
+                        self.area_drag = Some((i, vec![to_page(o)], modifiers.shift));
+                    }
+                }
+                if let (Some((k, points, lasso)), Some(p), true) = (
+                    &mut self.area_drag,
+                    response.interact_pointer_pos(),
+                    response.dragged(),
+                ) {
+                    if *k == i {
+                        if !*lasso {
+                            points.truncate(1);
+                        }
+                        points.push(to_page(p));
+                    }
+                }
+                if response.drag_stopped() {
+                    if let Some((k, points, lasso)) = self.area_drag.take() {
+                        if k == i {
+                            self.add_area(i, area_polygon(points, lasso));
+                        }
+                    }
+                }
+            }
+            let area_stroke = Stroke::new(2.0, Color32::from_rgb(40, 140, 255));
+            for (_, poly) in self.areas.iter().filter(|(p, _)| *p == i) {
+                let pts: Vec<Pos2> = poly.iter().map(to_screen).collect();
+                ui.painter().add(egui::Shape::closed_line(pts, area_stroke));
+            }
+            if let Some((k, points, lasso)) = &self.area_drag {
+                if *k == i {
+                    let poly = area_polygon(points.clone(), *lasso);
+                    let pts: Vec<Pos2> = poly.iter().map(to_screen).collect();
+                    ui.painter().add(egui::Shape::closed_line(
+                        pts,
+                        Stroke::new(1.5, Color32::from_rgb(255, 150, 0)),
+                    ));
+                }
             }
             let is_manual = self.manual[i];
             for (k, part) in self
@@ -1286,10 +2078,21 @@ impl PartsTab {
                 if response.clicked() && !clicked_frame {
                     self.frame = None;
                 }
-            } else if response.clicked() {
+            } else if response.clicked() && !drawing {
                 if let Some(pos) = response.interact_pointer_pos() {
                     let p = ((pos - rect.min) / scale).to_pos2();
-                    if self.refine {
+                    let protecting = self.recolor.as_ref().is_some_and(|d| d.protect_mode);
+                    if protecting {
+                        actions.push(PartsAction::Protect {
+                            page: i,
+                            point: (p.x, p.y),
+                        });
+                    } else if self.recolor.is_some() {
+                        let picked = self.swatch_at(i, (p.x, p.y));
+                        if let Some(d) = &mut self.recolor {
+                            d.selected = picked;
+                        }
+                    } else if self.refine {
                         actions.push(PartsAction::Refine {
                             page: i,
                             point: (p.x, p.y),
@@ -1308,6 +2111,12 @@ impl PartsTab {
                     }
                 }
             }
+            response.context_menu(|ui| {
+                if ui.button("Open Page in Editor").clicked() {
+                    actions.push(PartsAction::OpenInEditor { page: i });
+                    ui.close();
+                }
+            });
             ui.add_space(8.0);
         }
     }
@@ -1633,9 +2442,170 @@ fn preview(img: &RgbaImage) -> RgbaImage {
     image::imageops::thumbnail(img, w, h)
 }
 
+/// Swatch list (base colour, share, new colour or keep), Tolerance, and
+/// Detail strength — shared by the Parts Layout window and the editor.
+/// An area being drawn: page, points (page pixels), lasso.
+type AreaDrag = (usize, Vec<(f32, f32)>, bool);
+
+/// A drawn area's polygon: a lasso's points, or the rectangle spanned by a
+/// drag's first and last point.
+fn area_polygon(points: Vec<(f32, f32)>, lasso: bool) -> Vec<(f32, f32)> {
+    if lasso {
+        return points;
+    }
+    match (points.first(), points.last()) {
+        (Some(&a), Some(&b)) if points.len() > 1 => vec![a, (b.0, a.1), b, (a.0, b.1)],
+        _ => Vec::new(),
+    }
+}
+
+/// Fills a closed polygon (even-odd rule at pixel centres) into `mask`.
+fn fill_polygon(mask: &mut GrayImage, poly: &[(f32, f32)]) {
+    if poly.len() < 3 {
+        return;
+    }
+    let (w, h) = mask.dimensions();
+    let top = poly.iter().map(|p| p.1).fold(f32::MAX, f32::min);
+    let bottom = poly.iter().map(|p| p.1).fold(f32::MIN, f32::max);
+    let y0 = top.floor().clamp(0.0, h as f32) as u32;
+    let y1 = bottom.ceil().clamp(0.0, h as f32) as u32;
+    let mut xs = Vec::new();
+    for y in y0..y1 {
+        let cy = y as f32 + 0.5;
+        xs.clear();
+        for k in 0..poly.len() {
+            let (a, b) = (poly[k], poly[(k + 1) % poly.len()]);
+            if (a.1 <= cy) != (b.1 <= cy) {
+                xs.push(a.0 + (cy - a.1) / (b.1 - a.1) * (b.0 - a.0));
+            }
+        }
+        xs.sort_by(f32::total_cmp);
+        for pair in xs.as_chunks::<2>().0 {
+            let xa = (pair[0] - 0.5).ceil().clamp(0.0, w as f32) as u32;
+            let xb = ((pair[1] - 0.5).floor() + 1.0).clamp(0.0, w as f32) as u32;
+            for x in xa..xb {
+                mask.put_pixel(x, y, image::Luma([255]));
+            }
+        }
+    }
+}
+
+fn hex(c: [u8; 3]) -> String {
+    format!("#{:02X}{:02X}{:02X}", c[0], c[1], c[2])
+}
+
+/// `#RRGGBB` (the `#` is optional).
+fn parse_hex(text: &str) -> Option<[u8; 3]> {
+    let t = text.trim().trim_start_matches('#');
+    if t.len() != 6 || !t.is_ascii() {
+        return None;
+    }
+    let c = |k: usize| u8::from_str_radix(&t[k..k + 2], 16).ok();
+    Some([c(0)?, c(2)?, c(4)?])
+}
+
+pub fn recolor_controls(ui: &mut egui::Ui, rc: &mut Recolor, selected: Option<usize>) {
+    for (i, sw) in rc.swatches.iter().enumerate() {
+        ui.horizontal(|ui| {
+            let (r, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+            ui.painter()
+                .rect_filled(r, 2.0, Color32::from_rgb(sw.rgb[0], sw.rgb[1], sw.rgb[2]));
+            if selected == Some(i) {
+                ui.painter().rect_stroke(
+                    r.expand(2.0),
+                    2.0,
+                    Stroke::new(2.0, Color32::from_rgb(40, 140, 255)),
+                    egui::StrokeKind::Outside,
+                );
+            }
+            ui.label(format!("{:.0} %", sw.share * 100.0));
+            ui.label("→");
+            // The new colour (the paint itself until another is picked):
+            // picker, R G B values, or a hex code.
+            let mut new = rc.targets[i].unwrap_or(sw.rgb);
+            let mut edited = ui
+                .color_edit_button_srgb(&mut new)
+                .on_hover_text("Pick the new colour for this paint")
+                .changed();
+            for (c, name) in new.iter_mut().zip(["R ", "G ", "B "]) {
+                edited |= ui
+                    .add(egui::DragValue::new(c).range(0..=255).prefix(name))
+                    .changed();
+            }
+            let id = ui.id().with(("recolor-hex", i));
+            let mut text = ui
+                .data_mut(|d| d.get_temp::<String>(id))
+                .unwrap_or_else(|| hex(new));
+            let field = ui.add(egui::TextEdit::singleline(&mut text).desired_width(64.0));
+            if field.changed() {
+                if let Some(c) = parse_hex(&text) {
+                    new = c;
+                    edited = true;
+                }
+            }
+            if !field.has_focus() {
+                text = hex(new);
+            }
+            ui.data_mut(|d| d.insert_temp(id, text));
+            if edited {
+                rc.targets[i] = (new != sw.rgb).then_some(new);
+            }
+            if rc.targets[i].is_some() {
+                if ui
+                    .small_button("Keep")
+                    .on_hover_text("Keep the original colour")
+                    .clicked()
+                {
+                    rc.targets[i] = None;
+                }
+            } else {
+                ui.weak("unchanged");
+            }
+        });
+    }
+    if rc.is_identity() {
+        ui.weak(
+            "Click a colour after → (or type R G B or #RRGGBB) to choose a paint's new colour.",
+        );
+    }
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.label("Tolerance");
+        ui.add(egui::Slider::new(&mut rc.tolerance, 4.0..=40.0).suffix(" ΔE"));
+    });
+    let mut detail = (rc.detail * 100.0).round();
+    ui.horizontal(|ui| {
+        ui.label("Detail strength");
+        ui.add(egui::Slider::new(&mut detail, 0.0..=150.0).suffix(" %"));
+    });
+    rc.detail = detail / 100.0;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn areas_fill_rectangles_and_lassos() {
+        let mut m = GrayImage::new(20, 20);
+        fill_polygon(&mut m, &area_polygon(vec![(2.0, 3.0), (6.0, 9.0)], false));
+        let count = |m: &GrayImage| m.pixels().filter(|p| p[0] > 0).count();
+        assert_eq!(count(&m), 4 * 6);
+        assert!(m.get_pixel(2, 3)[0] > 0 && m.get_pixel(6, 3)[0] == 0);
+        let mut t = GrayImage::new(20, 20);
+        fill_polygon(&mut t, &[(0.0, 0.0), (20.0, 0.0), (0.0, 20.0)]);
+        assert!(t.get_pixel(2, 2)[0] > 0 && t.get_pixel(18, 18)[0] == 0);
+        assert!((count(&t) as i32 - 200).abs() <= 20, "{}", count(&t));
+    }
+
+    #[test]
+    fn hex_codes_parse() {
+        assert_eq!(parse_hex("#2846A0"), Some([0x28, 0x46, 0xA0]));
+        assert_eq!(parse_hex(" 2846a0 "), Some([0x28, 0x46, 0xA0]));
+        assert_eq!(parse_hex("#zz12"), None);
+        assert_eq!(parse_hex("#2846A"), None);
+        assert_eq!(hex([0x28, 0x46, 0xA0]), "#2846A0");
+    }
 
     #[test]
     fn previews_fit_any_gpu() {

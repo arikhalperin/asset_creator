@@ -1,0 +1,759 @@
+schema: comet.native.v4
+name: recolor-paper-model
+language: en
+phase: archive
+status: done
+state_version: 20
+brief: brief.md
+document_constraints_version: 1
+shape_confirmation_hash: 1150ae13451c58b65e0eb43885ee8b54ad1b4b7c6d4aeface3878808658cb08c
+spec_changes:
+  - capability: recolor-paper-model
+    operation: create
+    source: specs/recolor-paper-model/spec.md
+workspace:
+  isolation: branch
+  change_branch: comet/recolor-paper-model
+  target_branch: master
+  finish: merge
+loop:
+  stage: done
+  goal_cycle: 3
+  iteration: 1
+  attempt: 1
+  retry_epoch: 0
+  failed_iteration_count: 2
+  no_progress_count: 0
+  execution_failure_count: 0
+  previous_unresolved_ids: []
+  next_action: null
+acceptance:
+  - id: A1
+    source: brief.md
+    text: "A1: On the fixture sheets the palette lists every paint colour (each
+      known paint colour matched by one swatch within ΔE 8), with paper, black
+      ink, and the white insignia not offered as paint swatches unless they
+      cover painted area; detection takes under 2 s per A3 page (release)."
+    result: passed
+    reason:
+      text: "tests/recolor.rs the_palette_holds_exactly_the_paints passes. Independent
+        release probe on both fixture pages: exactly 4 swatches (olive, grey,
+        sand, light blue), each within ΔE 0.03 of the known paint. Paper, black
+        ink and the white star are not offered. The palette takes 83 ms per A3
+        page (limit 2 s); bench-recolor log reports 83 ms."
+      truncated: false
+  - id: A2
+    source: brief.md
+    text: "A2: Mapping one swatch (e.g. olive → blue) changes exactly that paint: in
+      its areas the base colour becomes the new colour (mean ΔE to the target
+      under 5 away from markings), every other swatch, the paper, and the
+      insignia are unchanged (ΔE < 1), on all pages."
+    result: passed
+    reason:
+      text: "The new whole-page test mapping_each_paint_changes_only_that_paint
+        passes. Independent release probe mapped each of the 4 paints to 6
+        targets (blue, navy, very dark, light, red, magenta) at detail 0, 1 and
+        1.5 on both pages. Results: 0 pixels changed by ΔE ≥ 1 outside that
+        paint's panels; 0 paper or ink pixels changed; 0 of 203k white insignia
+        pixels changed. Mean ΔE to the target over all plain-paint pixels away
+        from markings is 0.00–0.24 (limit 5). The earlier failure (fringes on
+        outlines and paper) is gone."
+      truncated: false
+  - id: A3
+    source: brief.md
+    text: "A3: Markings survive: the lightness contrast of rivets and panel lines
+      against their surrounding paint is kept within 10 % at Detail 100 %,
+      removed to under 10 % of the original at 0 %, and increased at 150 %; part
+      joints/outlines stay dark."
+    result: passed
+    reason:
+      text: "Release probe measured every rivet and panel line (300 on olive, 96 on
+        each other paint). At Detail 100 % with targets that have room in
+        lightness (blue, red, magenta, light), the contrast ratio stays between
+        0.975 and 1.005. At 0 % it drops to 0.000. At 150 % it rises to about
+        1.22–1.51. A profile across a part outline shows its ink core stays at
+        L* 0 for every target and detail, so outlines stay dark. Fixture tests
+        detail_strength_fades_or_boosts_markings and
+        mapping_one_paint_keeps_everything_else_and_the_markings pass. Limit
+        (see risks): for very dark targets, contrast is cut off at black."
+      truncated: false
+  - id: A4
+    source: brief.md
+    text: "A4: In the Parts Layout tab, Protect (MobileSAM) outlines a clicked area
+      (the insignia) and recolouring leaves every protected pixel exactly
+      unchanged; protected areas show on the page and can be removed; without
+      MobileSAM the control is disabled with a reason."
+    result: passed
+    reason:
+      text: "protected_areas_are_never_recoloured (with GAC_MODEL_DIR) and
+        protect_needs_mobilesam_and_says_so pass. Independent probe through the
+        real widgets: clicking the 'Protect (MobileSAM)' toggle, then the star,
+        gives a 106,652 px mask that matches the star's area. After a second
+        protect click on the olive panel and an Apply mapping olive to red, 0
+        protected pixels changed while the unprotected olive changed. A hatched
+        overlay texture is drawn on the page. 'Clear Protected' removes the
+        masks. Without the model the toggle is disabled, with hover text and the
+        visible note 'Protect needs the MobileSAM model.'"
+      truncated: false
+  - id: A5
+    source: brief.md
+    text: "A5: Parts Layout Recolor…: the preview follows every change within 200 ms
+      (release); Apply runs on a worker with progress while the UI stays
+      responsive; afterwards parts keep their outlines and placements (no
+      re-pack), Export A4 Pages… shows the new colours, and Revert restores the
+      original pages exactly."
+    result: passed
+    reason:
+      text: "Release probe preview frame times: colour change 33–46 ms, detail 31 ms,
+        tolerance 46 ms (limit 200 ms). Apply starts on a 'recolor' worker; the
+        click frame takes 4 ms and the 'Recolouring page i of n' progress bar is
+        shown. The worst frame during Apply is 158 ms, on the completion frame
+        when parts are re-cut. A full 2-page apply takes 0.71 s. The UI test
+        confirms placements and proposal rects are unchanged (no re-pack), part
+        images and the exported A4 PDF carry the new colour, and Revert to
+        Original restores the pages exactly (byte-equal, also checked in the
+        probe)."
+      truncated: false
+  - id: A6
+    source: brief.md
+    text: "A6: Image ▸ Recolor Paint… on a document: palette of the active layer
+      (within the selection when there is one), the same controls, live preview,
+      Cancel restores, OK is one undo step, and pixels outside the selection are
+      unchanged."
+    result: passed
+    reason:
+      text: editor_recolor_paint_uses_the_selection_and_undo passes. It opens through
+        the Image menu. The palette within the selection has only the olive
+        swatch. The dialog shows the shared controls (swatch rows with picker,
+        RGB, hex, Tolerance, Detail strength). The live preview changes the
+        layer, Cancel restores it exactly, OK adds one undo step labelled
+        'Recolor Paint', pixels outside the selection are byte-identical, and
+        undo restores the layer.
+      truncated: false
+  - id: A7
+    source: brief.md
+    text: "A7: Applying a recolour to an A3 page at full resolution takes under 3 s
+      (release)."
+    result: passed
+    reason:
+      text: "Full-resolution apply on an A3 page (3508x4961) in release: bench-recolor
+        log 271 ms; my probe 180–285 ms for every paint, target and detail
+        combination (limit 3 s)."
+      truncated: false
+  - id: A8
+    source: brief.md
+    text: "A9: In the Parts Layout Recolor… window, Recolour Area mode: a rectangle
+      (drag) and a lasso (Shift-drag) on page 1 limit recolouring — after
+      mapping olive, olive inside the areas changes and olive outside them and
+      on page 2 is unchanged (preview and Apply); the swatches offered are those
+      inside the areas; areas show on the page; Clear Areas returns to
+      whole-page recolouring."
+    result: passed
+    reason:
+      text: "(Brief A9, Recolour Area.) drawn_areas_limit_the_recolour passes through
+        real drags (rectangle plus Shift-lasso). Independent release probe: a
+        rectangle over the sand panel alone gives a palette of only sand. A drag
+        under 2 mm is ignored. With rectangle plus lasso areas, every swatch was
+        mapped and applied: 1.425 M pixels changed on page 1, and only 2 changed
+        pixels fell outside the area polygons. Both are edge pixels on the
+        lasso's slanted sides, where pixel rounding differs. No plain olive
+        pixel inside the areas stayed unchanged, and page 2 stayed
+        byte-identical. Code review: the preview uses the same blocked mask;
+        areas are drawn as outlines; Clear Areas recomputes the whole-page
+        palette and keeps the olive mapping (asserted in the test)."
+      truncated: false
+  - id: A9
+    source: brief.md
+    text: "A10: Typing R, G, B values or a #RRGGBB hex code in a swatch row (both
+      windows) sets that paint's new colour exactly and previews it; invalid hex
+      is ignored without changing the colour; typing the paint's own colour
+      leaves it unchanged."
+    result: passed
+    reason:
+      text: "(Brief A10, RGB/hex entry.) typed_rgb_and_hex_set_the_new_colour passes
+        in the Parts Layout window: hex, invalid hex ignored, R typed, and the
+        paint's own hex gives unchanged. Independent probe of the editor Image ▸
+        Recolor Paint… dialog through real widgets: typing #2846A0 into the hex
+        box sets the target exactly and the layer previews it (ΔE 0.00). Invalid
+        '#12345' is ignored. Typing G=200 into the DragValue gives [40,200,160],
+        previewed at ΔE 0.10. Typing the paint's own hex sets the target to None
+        and the layer returns byte-identical to the original."
+      truncated: false
+  - id: A10
+    source: brief.md
+    text: "A8: Right-click a PDF page in the Parts Layout tab ▸ Open Page in Editor
+      opens a document with exactly that page's pixels; after Image ▸ Recolor
+      Paint… (or any edit) there, Image ▸ Update Parts Layout Page replaces that
+      page in the tab — the edited pixels appear on the page and in Export A4
+      Pages…, parts keep their outlines and placements (no re-pack), other pages
+      are unchanged, and Revert to Original restores the PDF render exactly; the
+      command is disabled with a reason for unlinked documents, a closed tab, or
+      a changed canvas size."
+    result: passed
+    reason:
+      text: "(Brief A8, Open Page in Editor.)
+        a_pdf_page_opens_in_the_editor_and_goes_back passes. It opens through a
+        real right-click context menu. The document is named '<file> – page N'
+        and its composite equals the page pixels exactly. After Recolor Paint,
+        Image ▸ Update Parts Layout Page (menu click) puts the edit on the page,
+        in the part images and in the exported A4 PDF. Page 2 is unchanged,
+        placements are unchanged, and Revert to Original restores the PDF render
+        exactly. Unlinked documents and closed tabs give reasons. Independent
+        probe closed the canvas-size gap the builder noted: a linked document
+        cropped to 1000x1000 gives blocker 'The canvas is 1000×1000 but the page
+        is 3508×4961', the menu item is disabled, and clicking it leaves the
+        page unchanged."
+      truncated: false
+builder_handoff:
+  candidate_id: 4179edef-b7fc-40f5-acb3-985eca95bdd9
+  identity_provider: skill-coordinated
+  builder_execution_ref: skill-coordinated:builder:2a804f2e-8ac7-4a24-b309-a42cdf2694d8
+  iteration: 1
+  summary:
+    text: "Candidate covering A1-A10. Since the last verifier (A2 failed): swatch
+      membership excludes paper/ink and assigns each paint pixel to the paint
+      whose own members fill most of its 0.5 mm box (>=35 %), so outlines,
+      ink/paper blends and other paints' shades are untouched (new whole-page
+      test maps each paint in turn); Cancel during Apply. A8: page right-click >
+      Open Page in Editor (linked doc) and Image > Update Parts Layout Page (no
+      re-pack, Revert restores the PDF render; disabled with reasons). A9:
+      Recolour Area mode (rectangle drag, Shift-lasso), recolour and palette
+      limited to areas, pages without areas unchanged, Clear Areas. A10: swatch
+      rows have an always-visible colour button, R/G/B DragValues and a #RRGGBB
+      box (user reported the old hidden checkbox made mapping
+      impossible/invisible)."
+    truncated: false
+  addressed_acceptance_ids:
+    - A1
+    - A2
+    - A3
+    - A4
+    - A5
+    - A6
+    - A7
+    - A8
+    - A9
+    - A10
+  checks:
+    - name:
+        text: all-dispatch-checks
+        truncated: false
+      result: passed
+      note:
+        text: debug+release recolor_ui 8/8; recolor bench palette 83 ms, apply A3 278
+          ms; clippy, fmt, all release benches exit 0
+        truncated: false
+  checks_truncated: false
+  known_limits:
+    - text: Canvas-size-changed reason for Update Parts Layout Page is checked via
+        set_edited_page refusal, not through the editor (a rendered page cannot
+        be cropped by Clean Up).
+      truncated: false
+    - text: Editor document keeps the default DPI (pixels are exact).
+      truncated: false
+    - text: A tolerance change re-prepares each displayed page preview (~40 ms/page).
+      truncated: false
+  known_limits_truncated: false
+  review: null
+  submitted_at: 2026-10-21T19:12:46.733Z
+blockers: []
+verification:
+  candidate_id: 4179edef-b7fc-40f5-acb3-985eca95bdd9
+  identity_provider: skill-coordinated
+  verifier_execution_ref: skill-coordinated:verifier:c2aab13f-de0b-432d-a83d-1b84e157bcff
+  iteration: 1
+  attempt: 1
+  assurance: skill-coordinated
+  verdict: pass
+  checks:
+    - id: cargo-test
+      name:
+        text: cargo test (with the tagging model)
+        truncated: false
+      argv_display:
+        - text: GAC_CLIP_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/clip
+          truncated: false
+        - text: GAC_MODEL_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/models
+          truncated: false
+        - text: GAC_PDFIUM_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/pdfium-installed
+          truncated: false
+        - text: GAC_PDFIUM_ARCHIVE=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/pdfium-dl
+          truncated: false
+        - text: cargo
+          truncated: false
+        - text: test
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 665403
+    - id: clippy
+      name:
+        text: clippy -D warnings
+        truncated: false
+      argv_display:
+        - text: clippy
+          truncated: false
+        - text: --all-targets
+          truncated: false
+        - text: --
+          truncated: false
+        - text: -D
+          truncated: false
+        - text: warnings
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 6263
+    - id: fmt
+      name:
+        text: fmt --check
+        truncated: false
+      argv_display:
+        - text: fmt
+          truncated: false
+        - text: --check
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 454
+    - id: bench-patterns
+      name:
+        text: release pattern detection / make seamless benchmark
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: patterns
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 18852
+    - id: bench-pattern-ui
+      name:
+        text: release pattern preview benchmark
+        truncated: false
+      argv_display:
+        - text: GAC_CLIP_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/clip
+          truncated: false
+        - text: cargo
+          truncated: false
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: pattern_ui
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --include-ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 5606
+    - id: bench-filters
+      name:
+        text: release filter preview benchmark
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: filters
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 4676
+    - id: bench-library
+      name:
+        text: release library/tagging benchmark
+        truncated: false
+      argv_display:
+        - text: GAC_CLIP_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/clip
+          truncated: false
+        - text: cargo
+          truncated: false
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: library
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 5963
+    - id: bench-extract
+      name:
+        text: release extraction benchmarks
+        truncated: false
+      argv_display:
+        - text: GAC_MODEL_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/models
+          truncated: false
+        - text: cargo
+          truncated: false
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: extract
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 4157
+    - id: bench-video
+      name:
+        text: release video benchmark
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: video
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 5189
+    - id: bench-canvas
+      name:
+        text: release pan/zoom benchmark
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: canvas
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 3242
+    - id: bench-transform
+      name:
+        text: release transform benchmark
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --lib
+          truncated: false
+        - text: bench_transform
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 9119
+    - id: bench-pdf
+      name:
+        text: release PDF render/detect/pack benchmark
+        truncated: false
+      argv_display:
+        - text: GAC_PDFIUM_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/pdfium-installed
+          truncated: false
+        - text: cargo
+          truncated: false
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: pdf_parts
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 2607
+    - id: pdf-ui-release
+      name:
+        text: release PDF UI tests (frame-time limits)
+        truncated: false
+      argv_display:
+        - text: GAC_PDFIUM_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/pdfium-installed
+          truncated: false
+        - text: GAC_PDFIUM_ARCHIVE=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/pdfium-dl
+          truncated: false
+        - text: GAC_MODEL_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/models
+          truncated: false
+        - text: cargo
+          truncated: false
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: pdf_ui
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 12006
+    - id: bench-recolor
+      name:
+        text: release recolour benchmark
+        truncated: false
+      argv_display:
+        - text: GAC_PDFIUM_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/pdfium-installed
+          truncated: false
+        - text: cargo
+          truncated: false
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: recolor
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 2924
+    - id: recolor-ui-release
+      name:
+        text: release recolour UI tests (preview frame limit, MobileSAM protect)
+        truncated: false
+      argv_display:
+        - text: GAC_PDFIUM_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/pdfium-installed
+          truncated: false
+        - text: GAC_MODEL_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/models
+          truncated: false
+        - text: cargo
+          truncated: false
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: recolor_ui
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 8990
+  summary:
+    text: "All 10 acceptance items pass. All 15 runtime check logs for candidate run
+      69ba6b04 passed (cargo test, clippy, fmt, every release bench, the PDF UI
+      release run, recolor UI release 8/8). Independent release probes confirm
+      the earlier A2 failure is fixed: every paint mapped to 6 targets at 3
+      detail levels changed nothing outside its panels, no paper, ink or
+      insignia pixels changed, and plain paint lands within ΔE 0.24 of the
+      target. Palette 83 ms and apply about 0.28 s per A3 page; preview frames ≤
+      46 ms; Revert and Update Parts Layout Page restore and transfer pixels
+      exactly. Through real widgets: RGB/hex entry in the editor dialog,
+      MobileSAM protect of the insignia and Clear Protected, Recolour Area
+      palette and masking, and the canvas-size blocker. Remaining risk: contrast
+      is cut off at black for very dark targets."
+    truncated: false
+  risks:
+    - text: "A3 marking contrast is cut off at black for dark targets. Examples: olive
+        to navy (L* 18) keeps 0.79–0.89 of panel-line contrast; very dark
+        targets keep 0.43–0.74 on light paints. Sand or light blue mapped to
+        blue at 150 % leaves a few markings at 0.99x instead of boosted. This is
+        a physical sRGB limit (the line would need L* < 0), not a membership
+        bug, but A3's 10 % rule holds only for targets with room in lightness."
+      truncated: false
+    - text: The shading transfer differs from the spec formula. The spec says Lab(p')
+        = Lab(n) + (Lab(p) − Lab(b)) × detail. The code adds the lightness
+        difference but scales chroma by the pixel's chroma ratio, plus a
+        hue-shift term. Plain paint and lightness are as specified; the spec
+        text could be updated to match.
+      truncated: false
+    - text: "'Clear Protected' clears protection on all pages; the spec says it
+        removes a page's protection."
+      truncated: false
+    - text: The completion frame of Apply (re-cutting parts and rebuilding previews)
+        took 158 ms on the 2-page fixture; larger PDFs will make this one frame
+        longer.
+      truncated: false
+    - text: "Area rasterisation: 2 boundary pixels on the lasso's slanted edges differ
+        from an even-odd point-in-polygon test (negligible)."
+      truncated: false
+    - text: Runtime acceptance IDs A8/A9/A10 carry the brief's A9/A10/A8 texts;
+        results above follow the runtime IDs.
+      truncated: false
+  risks_truncated: false
+  completed_at: 2026-10-21T19:47:41.289Z
+history:
+  - goal_cycle: 1
+    iteration: 1
+    attempt: 0
+    outcome: recovery
+    unresolved_ids: []
+    summary:
+      text: "Builder handoff Runtime checks failed: recolor-ui-release"
+      truncated: false
+    completed_at: 2026-10-21T15:36:43.178Z
+  - goal_cycle: 1
+    iteration: 2
+    attempt: 1
+    outcome: fail
+    unresolved_ids:
+      - A2
+    summary:
+      text: "Six of seven items pass (A1, A3, A4, A5, A6, A7); A2 fails. Plain paint
+        maps accurately: mean dE to the target is 0.00, the palette matches the
+        paints within dE 0.03, timings are well within limits, Revert is exact,
+        there is no re-pack, and the editor gives one undo step. But swatch
+        membership uses blurred surroundings without excluding paper and ink.
+        Mapping a paint therefore recolours paper and anti-aliased outline and
+        text pixels elsewhere on the page. Even the A2 example olive->blue puts
+        a blue fringe of up to dE 73 on the sand panel's outline, and mapping
+        grey or light blue turns tens of thousands of white paper pixels grey
+        (dE up to 48). The fixture tests sample only single points, so they miss
+        this."
+      truncated: false
+    completed_at: 2026-10-21T16:11:56.701Z
+  - goal_cycle: 1
+    iteration: 3
+    attempt: 0
+    outcome: recovery
+    unresolved_ids: []
+    summary:
+      text: Native confirmed acceptance criteria changed
+      truncated: false
+    completed_at: 2026-10-21T16:35:07.567Z
+  - goal_cycle: 2
+    iteration: 1
+    attempt: 0
+    outcome: recovery
+    unresolved_ids: []
+    summary:
+      text: Native confirmed acceptance criteria changed
+      truncated: false
+    completed_at: 2026-10-21T19:12:38.446Z
+  - goal_cycle: 3
+    iteration: 1
+    attempt: 1
+    outcome: pass
+    unresolved_ids: []
+    summary:
+      text: "All 10 acceptance items pass. All 15 runtime check logs for candidate run
+        69ba6b04 passed (cargo test, clippy, fmt, every release bench, the PDF
+        UI release run, recolor UI release 8/8). Independent release probes
+        confirm the earlier A2 failure is fixed: every paint mapped to 6 targets
+        at 3 detail levels changed nothing outside its panels, no paper, ink or
+        insignia pixels changed, and plain paint lands within ΔE 0.24 of the
+        target. Palette 83 ms and apply about 0.28 s per A3 page; preview frames
+        ≤ 46 ms; Revert and Update Parts Layout Page restore and transfer pixels
+        exactly. Through real widgets: RGB/hex entry in the editor dialog,
+        MobileSAM protect of the insignia and Clear Protected, Recolour Area
+        palette and masking, and the canvas-size blocker. Remaining risk:
+        contrast is cut off at black for very dark targets."
+      truncated: false
+    completed_at: 2026-10-21T19:47:41.289Z
+history_overflow:
+  dropped_entries: 0
+  first_dropped_at: null
+  last_dropped_at: null
+  outcome_counts:
+    pass: 0
+    fail: 0
+    blocked: 0
+    execution-error: 0
+    recovery: 0
+verification_result: pass
+verification_report: verification.md
+archived: true
+created_at: 2026-10-21T14:28:33.103Z
