@@ -289,6 +289,12 @@ impl AppState {
         Ok(self.insert(document))
     }
 
+    /// Sets a document's DPI (e.g. a page opened at its render resolution).
+    pub fn set_document_dpi(&mut self, id: DocId, dpi: f64) -> bool {
+        self.document_mut(id)
+            .is_some_and(|open| open.document.set_dpi(dpi).is_ok())
+    }
+
     /// Opens `image` as a new current document with one "Background" layer
     /// (e.g. a frame grabbed from a video). It has no file yet.
     pub fn new_document_from_image(
@@ -425,7 +431,7 @@ impl AppState {
                 open.document.selection(),
                 session.rect,
                 filter,
-                params,
+                &with_dpi(params, open.document.dpi()),
             )
         } else {
             session.before.clone()
@@ -448,7 +454,7 @@ impl AppState {
             open.document.selection(),
             session.rect,
             filter,
-            params,
+            &with_dpi(params, open.document.dpi()),
         );
         // Show the final result even if the preview was off, then record it.
         write_target_region(&mut open.document, session.target, session.rect, &after);
@@ -530,7 +536,7 @@ impl AppState {
             open.document.selection(),
             session.rect,
             filter,
-            params,
+            &with_dpi(params, open.document.dpi()),
         );
         let mut layer = open.document.layer(index).cloned();
         if let Some(layer) = &mut layer {
@@ -869,6 +875,13 @@ impl AppState {
         self.current = Some(id);
         id
     }
+}
+
+/// `params` with the hidden DPI parameter set (for millimetre settings).
+fn with_dpi(params: &Params, dpi: f64) -> Params {
+    let mut p = params.clone();
+    p.set(filters::DPI, filters::ParamValue::Float(dpi as f32));
+    p
 }
 
 #[cfg(test)]

@@ -5,6 +5,7 @@ pub mod asset_library;
 pub mod canvas;
 pub mod cleanup;
 pub mod document;
+pub mod enhance;
 pub mod extract;
 pub mod extract_ui;
 pub mod filter_dialog;
