@@ -213,6 +213,8 @@ impl NewDocumentForm {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
     New,
+    RecolorPaint,
+    UpdatePartsPage,
     OpenImageFolder,
     SaveBack,
     CleanUpDocument,
@@ -335,8 +337,12 @@ pub struct EditorApp {
     auto_detect: Option<AutoDetectDialog>,
     /// Extract → Find Repeating Pattern… window.
     pattern: Option<PatternDialog>,
+    /// Image → Recolor Paint… dialog.
+    recolor_paint: Option<RecolorPaintDialog>,
     /// Documents opened with Edit a Copy, and their library asset.
     library_links: HashMap<DocId, LibraryLink>,
+    /// Documents opened from a Parts Layout page (tab, page).
+    parts_links: HashMap<DocId, (PartsId, usize)>,
     extract: Option<ExtractSession>,
     /// Created on the first Extract Object prompt.
     segmenter: Option<Segmenter>,
@@ -369,8 +375,9 @@ pub struct EditorApp {
     pdf_pending: Option<PathBuf>,
     pdf_consent: Consent,
     pdf_download: Option<models::Download>,
-    /// MobileSAM refine request of a Parts tab: tab, page, point, request id.
-    parts_refine: Option<(PartsId, usize, (f32, f32), u64)>,
+    /// MobileSAM request of a Parts tab: tab, page, point, request id, and
+    /// whether it protects an area (else it refines a part).
+    parts_refine: Option<PartsRequest>,
 }
 
 impl Default for EditorApp {
@@ -415,7 +422,9 @@ impl EditorApp {
             remove_background: None,
             auto_detect: None,
             pattern: None,
+            recolor_paint: None,
             library_links: HashMap::new(),
+            parts_links: HashMap::new(),
             extract: None,
             segmenter: None,
             segment_config: segment::Config::default(),
@@ -675,6 +684,7 @@ impl EditorApp {
             || self.remove_background.is_some()
             || self.auto_detect.is_some()
             || self.pattern.is_some()
+            || self.recolor_paint.is_some()
     }
 
     // --- Remove Background ------------------------------------------------
@@ -1050,23 +1060,112 @@ impl EditorApp {
                 }
             }
             PartsAction::Refine { page, point } => self.refine_part(id, page, point),
+            PartsAction::Protect { page, point } => self.segment_page(id, page, point, true),
+            PartsAction::ApplyRecolor => {
+                let notify = self.notify();
+                if let Some(tab) = self.parts_tabs.get_mut(&id) {
+                    tab.start_recolor(notify);
+                }
+            }
             PartsAction::ReloadPage { page, dpi } => {
                 let notify = self.notify();
                 if let Some(tab) = self.parts_tabs.get_mut(&id) {
                     tab.reload_page(page, dpi, notify);
                 }
             }
+            PartsAction::OpenInEditor { page } => {
+                self.open_parts_page_in_editor(id, page);
+            }
+        }
+    }
+
+    /// Closes a Parts Layout tab (its linked documents stay open).
+    pub fn close_parts_tab(&mut self, id: PartsId) {
+        self.parts_tabs.remove(&id);
+        if self.parts_refine.is_some_and(|r| r.0 == id) {
+            self.parts_refine = None;
+        }
+    }
+
+    /// Open Page in Editor: the page's current image as a new document
+    /// linked to the page (see [`Self::update_parts_page`]).
+    pub fn open_parts_page_in_editor(&mut self, id: PartsId, page: usize) -> Option<DocId> {
+        let tab = self.parts_tabs.get(&id)?;
+        let image = tab.pages.get(page)?.image.clone();
+        let name = format!("{} – page {}", tab.name, page + 1);
+        let doc = self.open_image_document(name, image)?;
+        self.parts_links.insert(doc, (id, page));
+        Some(doc)
+    }
+
+    /// Why Image ▸ Update Parts Layout Page is unavailable for `doc`, if it is.
+    pub fn update_parts_page_blocker(&self, doc: DocId) -> Option<String> {
+        let Some(&(id, page)) = self.parts_links.get(&doc) else {
+            return Some(
+                "Only for a page opened from a Parts Layout tab (right-click a page ▸ Open Page in Editor)"
+                    .to_owned(),
+            );
+        };
+        let Some(tab) = self.parts_tabs.get(&id) else {
+            return Some("Its Parts Layout tab was closed".to_owned());
+        };
+        let Some(p) = tab.pages.get(page) else {
+            return Some(format!("Page {} is no longer there", page + 1));
+        };
+        let document = &self.state.document(doc)?.document;
+        let (w, h) = p.image.dimensions();
+        if (document.width(), document.height()) != (w, h) {
+            return Some(format!(
+                "The canvas is {}×{} but the page is {w}×{h}",
+                document.width(),
+                document.height()
+            ));
+        }
+        None
+    }
+
+    /// Image ▸ Update Parts Layout Page: the current document (flattened)
+    /// replaces its linked page; parts keep their outlines and placements.
+    pub fn update_parts_page(&mut self) -> bool {
+        let Some(doc) = self.state.current_id() else {
+            return false;
+        };
+        if let Some(reason) = self.update_parts_page_blocker(doc) {
+            self.error = Some(reason);
+            return false;
+        }
+        let (id, page) = self.parts_links[&doc];
+        let Some(image) = self.state.document(doc).map(|d| d.document.composite()) else {
+            return false;
+        };
+        let Some(tab) = self.parts_tabs.get_mut(&id) else {
+            return false;
+        };
+        match tab.set_edited_page(page, image) {
+            Ok(()) => {
+                self.status_message = Some(format!("Updated page {} of {}", page + 1, tab.name));
+                true
+            }
+            Err(err) => {
+                self.error = Some(err);
+                false
+            }
         }
     }
 
     /// Sends a MobileSAM click on a PDF page to the segmenter.
     pub fn refine_part(&mut self, id: PartsId, page: usize, point: (f32, f32)) {
-        let Some(image) = self
-            .parts_tabs
-            .get(&id)
-            .and_then(|t| t.pages.get(page))
-            .map(|p| std::sync::Arc::new(p.image.clone()))
-        else {
+        self.segment_page(id, page, point, false);
+    }
+
+    /// Sends a MobileSAM click on a PDF page: refine a part, or (`protect`)
+    /// outline an area to keep out of recolouring.
+    pub fn segment_page(&mut self, id: PartsId, page: usize, point: (f32, f32), protect: bool) {
+        let Some((image, version)) = self.parts_tabs.get(&id).and_then(|t| {
+            t.pages
+                .get(page)
+                .map(|p| (std::sync::Arc::new(p.image.clone()), t.page_version))
+        }) else {
             return;
         };
         if self.segmenter.is_none() {
@@ -1075,13 +1174,119 @@ impl EditorApp {
         self.next_request += 1;
         let request = segment::Request {
             id: self.next_request,
-            key: (1u64 << 62) ^ (id.0 << 20) ^ page as u64,
+            key: (1u64 << 62) ^ (id.0 << 20) ^ ((version & 0xff) << 12) ^ page as u64,
             image,
             prompt: Prompt::click(point),
         };
-        self.parts_refine = Some((id, page, point, self.next_request));
+        self.parts_refine = Some((id, page, point, self.next_request, protect));
         if let Some(segmenter) = &self.segmenter {
             segmenter.request(request);
+        }
+    }
+
+    // --- Recolor Paint (editor) --------------------------------------------------
+
+    /// Image → Recolor Paint…: the paint palette of the active layer (within
+    /// the selection) with a live preview; OK is one undo step.
+    pub fn open_recolor_paint(&mut self) -> bool {
+        if self.transform_active() || self.dialog_open() {
+            return false;
+        }
+        let Some((id, mut pixels)) = self.active_pixels() else {
+            return false;
+        };
+        if let Some(sel) = self
+            .state
+            .document(id)
+            .and_then(|o| o.document.selection().cloned())
+        {
+            crate::extract_ui::clip_to_selection(&mut pixels, &sel);
+        }
+        // Paper from the whole layer (the selection may hold none).
+        let paper = self
+            .active_pixels()
+            .and_then(|(_, full)| crate::recolor::paper_of(&full));
+        let swatches = crate::recolor::palette(&[&pixels], paper);
+        if swatches.is_empty() {
+            self.error = Some("No paint colours found on this layer".to_owned());
+            return false;
+        }
+        if let Err(err) = self.state.begin_filter(id) {
+            self.error = Some(format!("Recolor Paint: {err}"));
+            return false;
+        }
+        self.recolor_paint = Some(RecolorPaintDialog {
+            doc: id,
+            filter: RecolorPaint {
+                rc: crate::recolor::Recolor::new(swatches, paper),
+            },
+        });
+        true
+    }
+
+    pub fn recolor_paint_dialog_mut(&mut self) -> Option<&mut crate::recolor::Recolor> {
+        self.recolor_paint.as_mut().map(|d| &mut d.filter.rc)
+    }
+
+    /// Shows the dialog's current mapping on the canvas.
+    pub fn refresh_recolor_paint(&mut self) {
+        if let Some(d) = &self.recolor_paint {
+            self.state
+                .preview_filter(d.doc, &d.filter, &Params::default(), true);
+        }
+    }
+
+    /// OK: one undo step "Recolor Paint".
+    pub fn recolor_paint_ok(&mut self) -> bool {
+        let Some(d) = self.recolor_paint.take() else {
+            return false;
+        };
+        self.state
+            .commit_filter(d.doc, &d.filter, &Params::default())
+    }
+
+    pub fn recolor_paint_cancel(&mut self) {
+        if let Some(d) = self.recolor_paint.take() {
+            self.state.cancel_filter(d.doc);
+        }
+    }
+
+    fn show_recolor_paint_window(&mut self, ctx: &egui::Context) {
+        if let Some(d) = &self.recolor_paint {
+            if !self.state.document(d.doc).is_some_and(|o| o.is_filtering()) {
+                self.recolor_paint = None;
+            }
+        }
+        let Some(d) = &mut self.recolor_paint else {
+            return;
+        };
+        let before = d.filter.rc.clone();
+        let mut outcome = None;
+        egui::Window::new("Recolor Paint")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::RIGHT_TOP, egui::Vec2::new(-24.0, 72.0))
+            .show(ctx, |ui| {
+                ui.label("Paint colours of the layer:");
+                crate::parts_ui::recolor_controls(ui, &mut d.filter.rc, None);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        outcome = Some(false);
+                    }
+                    if ui.button("OK").clicked() {
+                        outcome = Some(true);
+                    }
+                });
+            });
+        let changed = d.filter.rc != before;
+        match outcome {
+            Some(true) => {
+                self.recolor_paint_ok();
+            }
+            Some(false) => self.recolor_paint_cancel(),
+            None if changed => self.refresh_recolor_paint(),
+            None => {}
         }
     }
 
@@ -1642,10 +1847,15 @@ impl EditorApp {
                     engine,
                     note,
                 } => {
-                    if let Some((tab, page, point, request)) = self.parts_refine {
+                    if let Some((tab, page, point, request, protect)) = self.parts_refine {
                         if request == id {
                             self.parts_refine = None;
                             if let Some(t) = self.parts_tabs.get_mut(&tab) {
+                                if protect {
+                                    t.add_protect(page, &mask);
+                                    self.analyzing = false;
+                                    continue;
+                                }
                                 t.apply_refine(page, point, &mask);
                                 t.status = Some(format!(
                                     "Refined with {engine:?}; the sheets were re-packed"
@@ -3586,10 +3796,7 @@ impl EditorApp {
             self.library_action(action);
         }
         for id in closed_parts {
-            self.parts_tabs.remove(&id);
-            if self.parts_refine.is_some_and(|r| r.0 == id) {
-                self.parts_refine = None;
-            }
+            self.close_parts_tab(id);
         }
         for (id, action) in parts_actions {
             self.parts_action(id, action);
@@ -3646,6 +3853,7 @@ impl EditorApp {
         self.show_remove_background_window(ui.ctx());
         self.show_auto_detect_window(ui.ctx());
         self.show_pattern_window(ui.ctx());
+        self.show_recolor_paint_window(ui.ctx());
         self.show_consent_window(ui.ctx());
         self.show_tag_consent_window(ui.ctx());
         self.show_pdf_consent_window(ui.ctx());
@@ -3974,13 +4182,34 @@ impl EditorApp {
             );
         });
         let can_clean = has_document && !self.transform_active() && !self.dialog_open();
+        let parts_blocker = self
+            .state
+            .current_id()
+            .and_then(|doc| self.update_parts_page_blocker(doc));
         ui.menu_button("Image", |ui| {
+            if ui
+                .add_enabled(can_clean, egui::Button::new("Recolor Paint…"))
+                .clicked()
+            {
+                actions.push(Action::RecolorPaint);
+            }
             if ui
                 .add_enabled(can_clean, egui::Button::new("Clean Up"))
                 .on_hover_text("Remove stray alpha specks on the active layer and crop the canvas to the visible content")
                 .clicked()
             {
                 actions.push(Action::CleanUpDocument);
+            }
+            ui.separator();
+            if ui
+                .add_enabled(
+                    can_clean && parts_blocker.is_none(),
+                    egui::Button::new("Update Parts Layout Page"),
+                )
+                .on_disabled_hover_text(parts_blocker.as_deref().unwrap_or("Not available now"))
+                .clicked()
+            {
+                actions.push(Action::UpdatePartsPage);
             }
         });
         if let Some(open) = self.state.current_document() {
@@ -4195,6 +4424,12 @@ impl EditorApp {
             }
             Action::SaveBack => {
                 self.save_back_to_library();
+            }
+            Action::RecolorPaint => {
+                self.open_recolor_paint();
+            }
+            Action::UpdatePartsPage => {
+                self.update_parts_page();
             }
             Action::CleanUpDocument => {
                 self.clean_up_document();
@@ -5012,3 +5247,35 @@ impl Default for PdfConfig {
         }
     }
 }
+
+/// The Image → Recolor Paint… dialog.
+struct RecolorPaintDialog {
+    doc: DocId,
+    filter: RecolorPaint,
+}
+
+/// Recolor Paint as a filter (not in the Filter menu): applies the mapping to
+/// the layer region; the selection blends it like every filter.
+struct RecolorPaint {
+    rc: crate::recolor::Recolor,
+}
+
+impl filters::Filter for RecolorPaint {
+    fn id(&self) -> &'static str {
+        "recolor_paint"
+    }
+    fn name(&self) -> &'static str {
+        "Recolor Paint"
+    }
+    fn category(&self) -> filters::Category {
+        filters::Category::Adjustments
+    }
+    fn apply(&self, source: &image::RgbaImage, _params: &Params) -> image::RgbaImage {
+        let r = crate::pdf::mm_to_px(0.5).round() as usize;
+        crate::recolor::apply(source, &self.rc, r, None)
+    }
+}
+
+/// A MobileSAM request of a Parts tab: tab, page, point, request id, and
+/// whether it protects an area (else it refines a part).
+type PartsRequest = (PartsId, usize, (f32, f32), u64, bool);
