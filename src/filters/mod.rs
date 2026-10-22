@@ -14,6 +14,7 @@ mod brightness_contrast;
 mod color_balance;
 mod curves;
 mod desaturate;
+mod enhance_lines;
 mod gaussian_blur;
 mod hue_saturation;
 mod invert;
@@ -32,6 +33,9 @@ pub use curves::{curve_lut, IDENTITY_CURVE};
 pub const ORIGIN_X: &str = "_origin_x";
 pub const ORIGIN_Y: &str = "_origin_y";
 pub const IMAGE_WIDTH: &str = "_image_width";
+/// Hidden parameter the editor sets: the document's DPI (filters with
+/// millimetre settings use it; 300 when missing).
+pub const DPI: &str = "_dpi";
 
 /// Where a filter appears in the Filter menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -265,7 +269,7 @@ pub trait Filter: Sync {
 
 /// Every filter, in menu order.
 pub fn registry() -> &'static [&'static dyn Filter] {
-    static FILTERS: [&dyn Filter; 15] = [
+    static FILTERS: [&dyn Filter; 16] = [
         &brightness_contrast::BrightnessContrast,
         &levels::Levels,
         &curves::Curves,
@@ -278,6 +282,7 @@ pub fn registry() -> &'static [&'static dyn Filter] {
         &motion_blur::MotionBlur,
         &sharpen::Sharpen,
         &unsharp_mask::UnsharpMask,
+        &enhance_lines::EnhanceLines,
         &add_noise::AddNoise,
         &median::Median,
         &make_seamless::MakeSeamless,
@@ -647,10 +652,10 @@ mod tests {
     #[test]
     fn registry_ids_are_unique_and_schemas_valid() {
         let mut ids: Vec<&str> = registry().iter().map(|f| f.id()).collect();
-        assert_eq!(ids.len(), 15);
+        assert_eq!(ids.len(), 16);
         ids.sort();
         ids.dedup();
-        assert_eq!(ids.len(), 15, "unique ids");
+        assert_eq!(ids.len(), 16, "unique ids");
         for f in registry() {
             let schema = f.params();
             let mut keys: Vec<&str> = schema.iter().map(|s| s.key).collect();

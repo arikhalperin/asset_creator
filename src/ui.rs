@@ -1076,6 +1076,12 @@ impl EditorApp {
             PartsAction::OpenInEditor { page } => {
                 self.open_parts_page_in_editor(id, page);
             }
+            PartsAction::ApplyEnhance => {
+                let notify = self.notify();
+                if let Some(tab) = self.parts_tabs.get_mut(&id) {
+                    tab.start_enhance(notify);
+                }
+            }
         }
     }
 
@@ -1094,6 +1100,7 @@ impl EditorApp {
         let image = tab.pages.get(page)?.image.clone();
         let name = format!("{} – page {}", tab.name, page + 1);
         let doc = self.open_image_document(name, image)?;
+        self.state.set_document_dpi(doc, crate::pdf::DPI as f64);
         self.parts_links.insert(doc, (id, page));
         Some(doc)
     }

@@ -466,7 +466,7 @@ pub fn membership(
 }
 
 /// Runs `f(start, chunk)` over `data` split into one chunk per core.
-fn par_chunks<T: Send>(data: &mut [T], f: impl Fn(usize, &mut [T]) + Sync) {
+pub(crate) fn par_chunks<T: Send>(data: &mut [T], f: impl Fn(usize, &mut [T]) + Sync) {
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
     let size = data.len().div_ceil(threads).max(4096);
     std::thread::scope(|scope| {
@@ -479,7 +479,7 @@ fn par_chunks<T: Send>(data: &mut [T], f: impl Fn(usize, &mut [T]) + Sync) {
 
 /// A small direct-mapped cache of sRGB → CIELAB conversions (paint areas
 /// repeat few colours).
-struct LabCache {
+pub(crate) struct LabCache {
     keys: Vec<u32>,
     values: Vec<[f32; 3]>,
 }
@@ -487,14 +487,14 @@ struct LabCache {
 impl LabCache {
     const SIZE: usize = 1 << 14;
 
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             keys: vec![u32::MAX; Self::SIZE],
             values: vec![[0.0; 3]; Self::SIZE],
         }
     }
 
-    fn lab(&mut self, c: [u8; 3]) -> [f32; 3] {
+    pub(crate) fn lab(&mut self, c: [u8; 3]) -> [f32; 3] {
         let key = (c[0] as u32) << 16 | (c[1] as u32) << 8 | c[2] as u32;
         let slot = (key.wrapping_mul(2_654_435_761) >> 18) as usize & (Self::SIZE - 1);
         if self.keys[slot] != key {

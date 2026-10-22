@@ -18,6 +18,9 @@ use crate::pdf::render::{self, Page};
 use crate::pdf::{mm_to_px, split};
 use crate::recolor::{self, delta_e, Recolor};
 
+mod enhance;
+pub use enhance::EnhanceDialog;
+
 /// Id of a Parts Layout tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PartsId(pub u64);
@@ -98,6 +101,15 @@ pub enum PartsAction {
     ApplyRecolor,
     /// Open Page in Editor (page right-click).
     OpenInEditor { page: usize },
+    /// Apply the Enhance Lines… window to the pages with areas.
+    ApplyEnhance,
+}
+
+/// A page job: recolour or enhance every page.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum JobKind {
+    Recolor,
+    Enhance,
 }
 
 /// The Recolor… window's state.
@@ -234,7 +246,18 @@ pub struct PartsTab {
     pub areas: Vec<(usize, Vec<(f32, f32)>)>,
     /// An area being drawn.
     area_drag: Option<AreaDrag>,
-    recolor_job: Option<RecolorJob>,
+    page_job: Option<RecolorJob>,
+    /// What the running page job does.
+    page_job_kind: JobKind,
+    /// Enhance Lines… window.
+    pub enhance: Option<enhance::EnhanceDialog>,
+    /// Enhance Lines areas (page, polygon in page pixels).
+    pub enhance_areas: Vec<(usize, Vec<(f32, f32)>)>,
+    /// Enhanced page previews while the window is open.
+    enhance_textures: Vec<Option<TextureHandle>>,
+    /// The pages already carry the window's enhancement (no preview on top
+    /// until a setting or an area changes).
+    enhance_applied: bool,
     /// Recoloured page previews while the window is open.
     recolor_textures: Vec<Option<TextureHandle>>,
     /// Per page preview: colours and swatch membership (valid for one
@@ -413,7 +436,12 @@ impl PartsTab {
             protect: Vec::new(),
             areas: Vec::new(),
             area_drag: None,
-            recolor_job: None,
+            page_job: None,
+            page_job_kind: JobKind::Recolor,
+            enhance: None,
+            enhance_areas: Vec::new(),
+            enhance_textures: Vec::new(),
+            enhance_applied: false,
             recolor_textures: Vec::new(),
             recolor_prepared: Vec::new(),
             recolor_preparing: None,
@@ -944,6 +972,8 @@ impl PartsTab {
         if self.pages.is_empty() {
             return;
         }
+        self.enhance = None;
+        self.enhance_textures.clear();
         let (swatches, paper) = self.recolor_palette();
         if swatches.is_empty() {
             self.status = Some("No paint colours found on these pages".to_owned());
@@ -1198,7 +1228,7 @@ impl PartsTab {
         let Some(dialog) = &self.recolor else {
             return false;
         };
-        if self.recolor_job.is_some() || dialog.rc.is_identity() {
+        if self.page_job.is_some() || dialog.rc.is_identity() {
             return false;
         }
         let rc = dialog.rc.clone();
@@ -1231,23 +1261,24 @@ impl PartsTab {
                 notify();
             })
             .expect("spawn recolor");
-        self.recolor_job = Some(RecolorJob {
+        self.page_job = Some(RecolorJob {
             rx,
             cancel,
             done: 0,
             total,
         });
+        self.page_job_kind = JobKind::Recolor;
         self.status = Some(format!("Recolouring {total} page(s)…"));
         true
     }
 
     /// Progress of a running recolour (pages done, total).
     pub fn recolor_progress(&self) -> Option<(usize, usize)> {
-        self.recolor_job.as_ref().map(|j| (j.done, j.total))
+        self.page_job.as_ref().map(|j| (j.done, j.total))
     }
 
     pub fn cancel_recolor(&mut self) {
-        if let Some(job) = &self.recolor_job {
+        if let Some(job) = &self.page_job {
             job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -1259,7 +1290,7 @@ impl PartsTab {
                 self.recolor_preparing = None;
             }
         }
-        let Some(job) = &mut self.recolor_job else {
+        let Some(job) = &mut self.page_job else {
             return false;
         };
         let mut finished = None;
@@ -1275,7 +1306,7 @@ impl PartsTab {
             }
         }
         if let Some(result) = finished {
-            self.recolor_job = None;
+            self.page_job = None;
             match result {
                 Some(new_pages) => {
                     if self.original_pages.is_none() {
@@ -1283,9 +1314,26 @@ impl PartsTab {
                             Some(self.pages.iter().map(|p| p.image.clone()).collect());
                     }
                     self.set_page_images(new_pages);
-                    self.status = Some("Recoloured; parts and sheets keep their places".to_owned());
+                    self.enhance_applied = self.page_job_kind == JobKind::Enhance;
+                    self.status = Some(
+                        match self.page_job_kind {
+                            JobKind::Recolor => "Recoloured; parts and sheets keep their places",
+                            JobKind::Enhance => {
+                                "Lines enhanced; parts and sheets keep their places"
+                            }
+                        }
+                        .to_owned(),
+                    );
                 }
-                None => self.status = Some("Recolour cancelled".to_owned()),
+                None => {
+                    self.status = Some(
+                        match self.page_job_kind {
+                            JobKind::Recolor => "Recolour cancelled",
+                            JobKind::Enhance => "Enhance cancelled",
+                        }
+                        .to_owned(),
+                    )
+                }
             }
         }
         changed
@@ -1302,6 +1350,7 @@ impl PartsTab {
             return false;
         };
         self.set_page_images(original);
+        self.enhance_applied = false;
         self.status = Some("Original colours restored".to_owned());
         true
     }
@@ -1322,7 +1371,7 @@ impl PartsTab {
                 image.height()
             ));
         }
-        if self.recolor_job.is_some() {
+        if self.page_job.is_some() {
             return Err("Wait for the recolour to finish".to_owned());
         }
         let mut images: Vec<RgbaImage> = self.pages.iter().map(|p| p.image.clone()).collect();
@@ -1349,6 +1398,7 @@ impl PartsTab {
         self.page_textures = vec![None; self.pages.len()];
         self.recolor_textures.clear();
         self.recolor_prepared.clear();
+        self.enhance_textures.clear();
         self.recut();
     }
 
@@ -1752,6 +1802,9 @@ impl PartsTab {
                 if ui.button("Recolor…").clicked() && self.recolor.is_none() {
                     self.open_recolor();
                 }
+                if ui.button("Enhance Lines…").clicked() && self.enhance.is_none() {
+                    self.open_enhance();
+                }
                 ui.checkbox(&mut self.pngs, "Also PNGs");
                 if ui.button("Export A4 Pages…").clicked() {
                     actions.push(PartsAction::Export { pngs: self.pngs });
@@ -1835,6 +1888,7 @@ impl PartsTab {
         });
         self.show_split_window(&ctx);
         self.show_recolor_window(&ctx, &mut actions);
+        self.show_enhance_window(&ctx, &mut actions);
         actions
     }
 
@@ -1914,7 +1968,8 @@ impl PartsTab {
                 .allocate_exact_size(Vec2::new(width, ph as f32 * scale), Sense::click_and_drag());
             self.page_rects.push((i, rect, scale));
             let shown = self
-                .recolor_texture(ctx, i)
+                .enhance_texture(ctx, i)
+                .or_else(|| self.recolor_texture(ctx, i))
                 .or_else(|| self.page_texture(ctx, i));
             if let Some(t) = shown {
                 ui.painter().image(
@@ -1933,7 +1988,8 @@ impl PartsTab {
                 );
             }
             // Recolour areas (and the one being drawn).
-            let drawing = self.recolor.as_ref().is_some_and(|d| d.area_mode);
+            let drawing = self.recolor.as_ref().is_some_and(|d| d.area_mode)
+                || self.enhance.as_ref().is_some_and(|d| d.area_mode);
             let to_screen = |&(x, y): &(f32, f32)| rect.min + Vec2::new(x, y) * scale;
             let to_page = |p: Pos2| {
                 let q = (p - rect.min) / scale;
@@ -1961,13 +2017,24 @@ impl PartsTab {
                 if response.drag_stopped() {
                     if let Some((k, points, lasso)) = self.area_drag.take() {
                         if k == i {
-                            self.add_area(i, area_polygon(points, lasso));
+                            let poly = area_polygon(points, lasso);
+                            if self.enhance.is_some() {
+                                self.add_enhance_area(i, poly);
+                            } else {
+                                self.add_area(i, poly);
+                            }
                         }
                     }
                 }
             }
-            let area_stroke = Stroke::new(2.0, Color32::from_rgb(40, 140, 255));
-            for (_, poly) in self.areas.iter().filter(|(p, _)| *p == i) {
+            // The open window's areas: Enhance Lines (orange) or Recolour (blue).
+            let (shown_areas, colour) = if self.enhance.is_some() {
+                (&self.enhance_areas, Color32::from_rgb(235, 110, 20))
+            } else {
+                (&self.areas, Color32::from_rgb(40, 140, 255))
+            };
+            let area_stroke = Stroke::new(2.0, colour);
+            for (_, poly) in shown_areas.iter().filter(|(p, _)| *p == i) {
                 let pts: Vec<Pos2> = poly.iter().map(to_screen).collect();
                 ui.painter().add(egui::Shape::closed_line(pts, area_stroke));
             }
@@ -2442,8 +2509,6 @@ fn preview(img: &RgbaImage) -> RgbaImage {
     image::imageops::thumbnail(img, w, h)
 }
 
-/// Swatch list (base colour, share, new colour or keep), Tolerance, and
-/// Detail strength — shared by the Parts Layout window and the editor.
 /// An area being drawn: page, points (page pixels), lasso.
 type AreaDrag = (usize, Vec<(f32, f32)>, bool);
 
@@ -2504,6 +2569,8 @@ fn parse_hex(text: &str) -> Option<[u8; 3]> {
     Some([c(0)?, c(2)?, c(4)?])
 }
 
+/// Swatch list (base colour, share, new colour or keep), Tolerance, and
+/// Detail strength — shared by the Parts Layout window and the editor.
 pub fn recolor_controls(ui: &mut egui::Ui, rc: &mut Recolor, selected: Option<usize>) {
     for (i, sw) in rc.swatches.iter().enumerate() {
         ui.horizontal(|ui| {
