@@ -765,6 +765,8 @@ pub struct VideoExtractJob {
     progress: Arc<AtomicU64>,
     total: u64,
     cancel: Arc<AtomicBool>,
+    /// Set when the worker has exited (finished or cancelled).
+    exited: Arc<AtomicBool>,
     result: Receiver<Result<Vec<Cluster>, String>>,
     handle: Option<JoinHandle<()>>,
 }
@@ -777,7 +779,8 @@ impl VideoExtractJob {
         let progress = Arc::new(AtomicU64::new(0));
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, result) = mpsc::channel();
-        let (p, c) = (progress.clone(), cancel.clone());
+        let exited = Arc::new(AtomicBool::new(false));
+        let (p, c, e) = (progress.clone(), cancel.clone(), exited.clone());
         let handle = std::thread::Builder::new()
             .name("video-extract-assets".to_owned())
             .spawn(move || {
@@ -785,6 +788,7 @@ impl VideoExtractJob {
                 if !c.load(Ordering::Relaxed) {
                     let _ = tx.send(outcome);
                 }
+                e.store(true, Ordering::Relaxed);
                 notify();
             })
             .expect("spawn video extraction");
@@ -792,6 +796,7 @@ impl VideoExtractJob {
             progress,
             total,
             cancel,
+            exited,
             result,
             handle: Some(handle),
         }
@@ -803,6 +808,11 @@ impl VideoExtractJob {
 
     pub fn try_result(&self) -> Option<Result<Vec<Cluster>, String>> {
         self.result.try_recv().ok()
+    }
+
+    /// A flag set once the worker has exited (stays valid after cancel).
+    pub fn exited(&self) -> Arc<AtomicBool> {
+        self.exited.clone()
     }
 
     /// Stops the run without waiting for the worker (it exits after its

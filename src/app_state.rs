@@ -199,7 +199,8 @@ impl OpenDocument {
 #[derive(Debug)]
 struct FilterSession {
     target: PaintTarget,
-    snapshot: image::RgbaImage,
+    /// Shared with filter renders running off the UI thread.
+    snapshot: std::sync::Arc<image::RgbaImage>,
     rect: PixelRect,
     before: image::RgbaImage,
 }
@@ -410,11 +411,42 @@ impl AppState {
             .to_image();
         open.filter = Some(FilterSession {
             target,
-            snapshot,
+            snapshot: std::sync::Arc::new(snapshot),
             rect,
             before,
         });
         Ok(())
+    }
+
+    /// What rendering `params` for the open filter session of `id` needs,
+    /// to run it off the UI thread ([`FilterRender::run`]); show the result
+    /// with [`Self::show_filter_pixels`] and record it with
+    /// [`Self::commit_filter_pixels`] or [`Self::end_layer_filter_pixels`].
+    pub fn filter_render(&self, id: DocId, params: &Params) -> Option<FilterRender> {
+        let open = self.document(id)?;
+        let session = open.filter.as_ref()?;
+        Some(FilterRender {
+            snapshot: session.snapshot.clone(),
+            selection: open.document.selection().cloned(),
+            rect: session.rect,
+            params: with_dpi(params, open.document.dpi()),
+        })
+    }
+
+    /// Shows rendered filter pixels (from [`Self::filter_render`]) as the preview.
+    pub fn show_filter_pixels(&mut self, id: DocId, pixels: &image::RgbaImage) {
+        let Some(open) = self.document_mut(id) else {
+            return;
+        };
+        let Some(session) = &open.filter else {
+            return;
+        };
+        if pixels.dimensions() != (session.rect.width, session.rect.height) {
+            return;
+        }
+        let (target, rect) = (session.target, session.rect);
+        write_target_region(&mut open.document, target, rect, pixels);
+        open.repainted(Some(rect));
     }
 
     /// Shows `filter` with `params` on the canvas (or the original when `show` is false).
@@ -446,7 +478,7 @@ impl AppState {
         let Some(open) = self.document_mut(id) else {
             return false;
         };
-        let Some(session) = open.filter.take() else {
+        let Some(session) = &open.filter else {
             return false;
         };
         let after = filters::render_filter(
@@ -456,19 +488,34 @@ impl AppState {
             filter,
             &with_dpi(params, open.document.dpi()),
         );
+        self.commit_filter_pixels(id, filter.name(), after)
+    }
+
+    /// Records rendered filter pixels (from [`Self::filter_render`]) as one
+    /// undo step `label` and ends the preview. Returns whether a step was added.
+    pub fn commit_filter_pixels(
+        &mut self,
+        id: DocId,
+        label: &'static str,
+        after: image::RgbaImage,
+    ) -> bool {
+        let Some(open) = self.document_mut(id) else {
+            return false;
+        };
+        let Some(session) = open.filter.take() else {
+            return false;
+        };
+        if after.dimensions() != (session.rect.width, session.rect.height) {
+            return false;
+        }
         // Show the final result even if the preview was off, then record it.
         write_target_region(&mut open.document, session.target, session.rect, &after);
         open.repainted(Some(session.rect));
         if after == session.before {
             return false;
         }
-        let patch = PixelPatch::on_target(
-            filter.name(),
-            session.target,
-            session.rect,
-            session.before,
-            after,
-        );
+        let patch =
+            PixelPatch::on_target(label, session.target, session.rect, session.before, after);
         match open.undo.execute(&mut open.document, Box::new(patch)) {
             Ok(change) => {
                 open.changed(change);
@@ -527,7 +574,7 @@ impl AppState {
         let Some(open) = self.document_mut(id) else {
             return false;
         };
-        let (Some((index, previous)), Some(session)) = (open.temp_layer, &open.filter) else {
+        let (Some(_), Some(session)) = (open.temp_layer, &open.filter) else {
             open.cancel_stroke();
             return false;
         };
@@ -538,6 +585,23 @@ impl AppState {
             filter,
             &with_dpi(params, open.document.dpi()),
         );
+        self.end_layer_filter_pixels(id, pixels, keep)
+    }
+
+    /// [`Self::end_layer_filter`] with rendered pixels (from [`Self::filter_render`]).
+    pub fn end_layer_filter_pixels(
+        &mut self,
+        id: DocId,
+        pixels: image::RgbaImage,
+        keep: Option<(&'static str, &str)>,
+    ) -> bool {
+        let Some(open) = self.document_mut(id) else {
+            return false;
+        };
+        let (Some((index, previous)), Some(session)) = (open.temp_layer, &open.filter) else {
+            open.cancel_stroke();
+            return false;
+        };
         let mut layer = open.document.layer(index).cloned();
         if let Some(layer) = &mut layer {
             let r = session.rect;
@@ -874,6 +938,29 @@ impl AppState {
         self.documents.push(OpenDocument::new(id, document));
         self.current = Some(id);
         id
+    }
+}
+
+/// A filter render detached from the document (see
+/// [`AppState::filter_render`]), so it can run on a worker thread.
+#[derive(Clone)]
+pub struct FilterRender {
+    snapshot: std::sync::Arc<image::RgbaImage>,
+    selection: Option<image::GrayImage>,
+    rect: PixelRect,
+    params: Params,
+}
+
+impl FilterRender {
+    /// The filtered region's new pixels (as the synchronous preview).
+    pub fn run(&self, filter: &dyn Filter) -> image::RgbaImage {
+        filters::render_filter(
+            &self.snapshot,
+            self.selection.as_ref(),
+            self.rect,
+            filter,
+            &self.params,
+        )
     }
 }
 

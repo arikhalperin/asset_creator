@@ -253,6 +253,7 @@ enum Action {
     ExtractToSelection,
     ExtractClear,
     DownloadModel,
+    CancelModelDownload,
 }
 
 /// Whether the user agreed to download MobileSAM this session.
@@ -270,6 +271,8 @@ pub struct ExtractStrip {
     pub status: String,
     pub has_mask: bool,
     pub can_download: bool,
+    /// A model download is running (Cancel Download).
+    pub downloading: bool,
 }
 
 /// A pending "save changes?" question.
@@ -334,6 +337,13 @@ pub struct EditorApp {
     /// For background workers to request repaints.
     repaint: Option<egui::Context>,
     remove_background: Option<RemoveBackgroundDialog>,
+    /// The Remove Background preview being rendered off the UI thread.
+    remove_background_job: Option<PreviewJob>,
+    /// The latest finished preview (generation, pixels), reused by OK.
+    remove_background_result: Option<(u64, image::RgbaImage)>,
+    remove_background_generation: u64,
+    /// OK was clicked before the result was rendered: apply it when it is.
+    remove_background_commit: bool,
     auto_detect: Option<AutoDetectDialog>,
     /// Extract → Find Repeating Pattern… window.
     pattern: Option<PatternDialog>,
@@ -420,6 +430,10 @@ impl EditorApp {
             frame_set_view: FrameSetView::default(),
             repaint: None,
             remove_background: None,
+            remove_background_job: None,
+            remove_background_result: None,
+            remove_background_generation: 0,
+            remove_background_commit: false,
             auto_detect: None,
             pattern: None,
             recolor_paint: None,
@@ -753,35 +767,145 @@ impl EditorApp {
         }
     }
 
+    /// Starts rendering the preview for the current settings on a worker
+    /// (an older render still running is superseded).
     fn refresh_remove_background(&mut self) {
+        self.remove_background_generation += 1;
+        self.remove_background_result = None;
+        self.remove_background_job = None;
+        let Some(dialog) = &self.remove_background else {
+            return;
+        };
+        if !dialog.preview {
+            self.state
+                .preview_filter(dialog.doc, &RemoveBackground, &dialog.params, false);
+            if !self.remove_background_commit {
+                return;
+            }
+        }
+        self.start_remove_background_render();
+    }
+
+    /// Renders the current settings on a worker.
+    fn start_remove_background_render(&mut self) {
+        let Some(dialog) = &self.remove_background else {
+            return;
+        };
+        let Some(render) = self.state.filter_render(dialog.doc, &dialog.params) else {
+            return;
+        };
+        self.remove_background_job = Some(PreviewJob::start(
+            "remove-background",
+            self.remove_background_generation,
+            render,
+            &RemoveBackground,
+            self.notify(),
+        ));
+    }
+
+    /// Shows a finished Remove Background preview.
+    fn pump_remove_background(&mut self) {
+        let Some(job) = &mut self.remove_background_job else {
+            return;
+        };
+        let Some(pixels) = job.try_take() else {
+            return;
+        };
+        let generation = job.generation;
+        self.remove_background_job = None;
+        if generation != self.remove_background_generation {
+            return;
+        }
         if let Some(dialog) = &self.remove_background {
-            self.state.preview_filter(
-                dialog.doc,
-                &RemoveBackground,
-                &dialog.params,
-                dialog.preview,
-            );
+            if dialog.preview {
+                self.state.show_filter_pixels(dialog.doc, &pixels);
+            }
+        }
+        self.remove_background_result = Some((generation, pixels));
+        if self.remove_background_commit {
+            self.finish_remove_background();
         }
     }
 
-    /// OK: one undo step "Remove Background".
+    /// Waits for the Remove Background preview and Auto-Detect's keying and
+    /// detection running on workers, and shows their results (tests and
+    /// scripted use).
+    pub fn wait_extraction_dialogs(&mut self) {
+        self.wait_remove_background();
+        if let Some(dialog) = &mut self.auto_detect {
+            dialog.wait();
+        }
+    }
+
+    /// Whether a Remove Background preview is still being rendered.
+    pub fn remove_background_busy(&self) -> bool {
+        self.remove_background_job.is_some()
+    }
+
+    /// Waits for the pending Remove Background preview and shows it (tests).
+    pub fn wait_remove_background(&mut self) {
+        if let Some(job) = &mut self.remove_background_job {
+            job.wait();
+        }
+        self.pump_remove_background();
+    }
+
+    /// OK: one undo step "Remove Background". The finished preview is
+    /// applied at once; otherwise the dialog shows "Applying…" and the result
+    /// is applied when its worker finishes (the UI never waits). Returns
+    /// whether the step was applied or is on its way.
     pub fn remove_background_ok(&mut self) -> bool {
+        if self.remove_background.is_none() {
+            return false;
+        }
+        let ready = self
+            .remove_background_result
+            .as_ref()
+            .is_some_and(|(g, _)| *g == self.remove_background_generation);
+        if ready {
+            return self.finish_remove_background();
+        }
+        self.remove_background_commit = true;
+        if self.remove_background_job.is_none() {
+            self.start_remove_background_render();
+        }
+        self.remove_background_job.is_some()
+    }
+
+    /// Records the rendered result as the undo step and closes the dialog.
+    fn finish_remove_background(&mut self) -> bool {
+        self.remove_background_commit = false;
+        self.remove_background_job = None;
         let Some(dialog) = self.remove_background.take() else {
             return false;
         };
+        let pixels = self
+            .remove_background_result
+            .take()
+            .filter(|(g, _)| *g == self.remove_background_generation)
+            .map(|(_, pixels)| pixels);
+        let Some(pixels) = pixels else {
+            self.state.cancel_filter(dialog.doc);
+            return false;
+        };
         if dialog.canvas {
-            return self.state.end_layer_filter(
+            return self.state.end_layer_filter_pixels(
                 dialog.doc,
-                &RemoveBackground,
-                &dialog.params,
+                pixels,
                 Some(("Remove Background", "Background removed")),
             );
         }
-        self.state
-            .commit_filter(dialog.doc, &RemoveBackground, &dialog.params)
+        self.state.commit_filter_pixels(
+            dialog.doc,
+            filters::Filter::name(&RemoveBackground),
+            pixels,
+        )
     }
 
     pub fn remove_background_cancel(&mut self) {
+        self.remove_background_job = None;
+        self.remove_background_result = None;
+        self.remove_background_commit = false;
         if let Some(dialog) = self.remove_background.take() {
             self.state.cancel_filter(dialog.doc);
         }
@@ -797,9 +921,15 @@ impl EditorApp {
                 self.remove_background = None;
             }
         }
+        let (working, applying) = (
+            self.remove_background_job.is_some(),
+            self.remove_background_commit,
+        );
         let Some(dialog) = &mut self.remove_background else {
             return;
         };
+        dialog.working = working;
+        dialog.applying = applying;
         match dialog.show(ctx) {
             crate::extract_ui::DialogOutcome::Open { changed: true } => {
                 self.refresh_remove_background()
@@ -832,6 +962,7 @@ impl EditorApp {
             &input.image,
             input.selection.as_ref(),
             input.canvas,
+            self.notify(),
         ));
         true
     }
@@ -846,9 +977,11 @@ impl EditorApp {
 
     /// Add to Library: the checked proposals become assets; returns how many.
     pub fn auto_detect_add(&mut self) -> usize {
-        let Some(dialog) = self.auto_detect.take() else {
+        let Some(mut dialog) = self.auto_detect.take() else {
             return 0;
         };
+        // (The button waits for detection; this keeps direct calls exact.)
+        dialog.wait();
         let name = self.document_name(dialog.doc);
         let crops = dialog.crops();
         let added = crops.len();
@@ -944,6 +1077,14 @@ impl EditorApp {
         ));
     }
 
+    /// Cancel: stops the PDFium download; the waiting PDF is not opened.
+    pub fn cancel_pdf_download(&mut self) {
+        if self.pdf_download.take().is_some() {
+            self.pdf_pending = None;
+            self.status_message = Some("PDFium download cancelled".to_owned());
+        }
+    }
+
     pub fn decline_pdf_download(&mut self) {
         self.pdf_consent = Consent::Declined;
         self.pdf_pending = None;
@@ -980,13 +1121,20 @@ impl EditorApp {
     fn show_pdf_consent_window(&mut self, ctx: &egui::Context) {
         if let Some(d) = &self.pdf_download {
             let progress = d.progress();
+            let mut cancel = false;
             egui::Window::new("Downloading PDFium")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                 .show(ctx, |ui| {
                     ui.add(egui::ProgressBar::new(progress).show_percentage());
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
                 });
+            if cancel {
+                self.cancel_pdf_download();
+            }
             return;
         }
         if self.pdf_consent != Consent::Asking {
@@ -1822,6 +1970,14 @@ impl EditorApp {
         ));
     }
 
+    /// Cancel Download: stops the MobileSAM download (partial files are
+    /// removed by the worker).
+    pub fn cancel_model_download(&mut self) {
+        if self.download.take().is_some() {
+            self.status_message = Some("MobileSAM download cancelled".to_owned());
+        }
+    }
+
     /// The consent dialog's Use GrabCut.
     pub fn decline_model_download(&mut self) {
         self.consent = Consent::Declined;
@@ -1957,6 +2113,7 @@ impl EditorApp {
             status,
             has_mask,
             can_download,
+            downloading: self.download.is_some(),
         }
     }
 
@@ -2160,6 +2317,15 @@ impl EditorApp {
         ));
     }
 
+    /// Cancel Download: stops the tagging-model download (partial files are
+    /// removed by the worker).
+    pub fn cancel_tag_download(&mut self) {
+        if self.tag_download.take().is_some() {
+            self.tag_consent = Consent::Declined;
+            self.status_message = Some("Tagging model download cancelled".to_owned());
+        }
+    }
+
     pub fn decline_tag_download(&mut self) {
         self.tag_consent = Consent::Declined;
     }
@@ -2188,7 +2354,11 @@ impl EditorApp {
                 (Some(Availability::Unavailable(r)), None) => format!("Auto-tag off — {r}"),
             }
         };
-        TagStatus { text, can_download }
+        TagStatus {
+            text,
+            can_download,
+            downloading: self.tag_download.is_some(),
+        }
     }
 
     fn show_tag_consent_window(&mut self, ctx: &egui::Context) {
@@ -2283,6 +2453,7 @@ impl EditorApp {
                 }
             }
             LibraryAction::DownloadTagger => self.start_tag_download(),
+            LibraryAction::CancelTaggerDownload => self.cancel_tag_download(),
             LibraryAction::Reveal(id) => {
                 if let (Some(dir), Some(a)) = (self.state.assets.dir(), self.state.assets.get(id)) {
                     let file = a
@@ -3648,6 +3819,10 @@ impl EditorApp {
         }
         self.pump_videos(ui.ctx());
         self.pump_extraction();
+        self.pump_remove_background();
+        if let Some(dialog) = &mut self.auto_detect {
+            dialog.poll();
+        }
         self.pump_video_assets();
         self.pump_tagging();
         self.pump_pdf();
@@ -4494,6 +4669,7 @@ impl EditorApp {
             }
             Action::ExtractClear => self.extract_clear(),
             Action::DownloadModel => self.start_model_download(),
+            Action::CancelModelDownload => self.cancel_model_download(),
             Action::Video(command) => {
                 if let Some(tab) = self.focused_video.and_then(|id| self.videos.get_mut(&id)) {
                     tab.transport(command);
@@ -5057,6 +5233,9 @@ fn tool_options_strip(
             if strip.can_download && ui.button("Download Model…").clicked() {
                 actions.push(Action::DownloadModel);
             }
+            if strip.downloading && ui.button("Cancel Download").clicked() {
+                actions.push(Action::CancelModelDownload);
+            }
             return;
         }
         if transform_active {
@@ -5251,6 +5430,51 @@ impl Default for PdfConfig {
         Self {
             dir: crate::pdf::pdfium::default_dir(),
             source: models::Source::Http(crate::pdf::pdfium::PDFIUM.base_url.to_owned()),
+        }
+    }
+}
+
+/// A filter preview rendered on a worker thread; `generation` identifies
+/// the settings it was started for.
+struct PreviewJob {
+    generation: u64,
+    rx: std::sync::mpsc::Receiver<image::RgbaImage>,
+    done: Option<image::RgbaImage>,
+}
+
+impl PreviewJob {
+    fn start(
+        name: &str,
+        generation: u64,
+        render: crate::app_state::FilterRender,
+        filter: &'static (dyn filters::Filter + Send),
+        notify: std::sync::Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(move || {
+                crate::background_priority();
+                let _ = tx.send(render.run(filter));
+                notify();
+            })
+            .expect("spawn preview");
+        Self {
+            generation,
+            rx,
+            done: None,
+        }
+    }
+
+    /// The result, once finished (taken once).
+    fn try_take(&mut self) -> Option<image::RgbaImage> {
+        self.done.take().or_else(|| self.rx.try_recv().ok())
+    }
+
+    /// Blocks until the result is ready (then returned by `try_take`).
+    fn wait(&mut self) {
+        if self.done.is_none() {
+            self.done = self.rx.recv().ok();
         }
     }
 }

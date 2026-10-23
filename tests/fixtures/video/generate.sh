@@ -51,3 +51,6 @@ $FF -f lavfi -i "color=c=0x1e465a:size=320x240:rate=30:duration=1" \
     -loop 1 -i ../tagging/skeleton_01.png \
     -filter_complex "[1]scale=96:112:flags=neighbor[s];[0][s]overlay=x='40+t*120':y=64:shortest=1,format=yuv420p" \
     -frames:v 30 -c:v libx264 -g 30 -pix_fmt yuv420p skeleton.mp4
+
+# A 1-minute clip (walk.mp4 looped) for the UI-responsiveness test.
+$FF -stream_loop 9 -i walk.mp4 -c copy -t 60 minute.mp4

@@ -89,6 +89,7 @@ fn remove_background_previews_picks_and_commits_one_step() {
     let original = layer(&h, id);
     let steps = h.app.state.document(id).unwrap().undo_stack().undo_len();
     assert!(h.app.open_remove_background());
+    h.app.wait_extraction_dialogs();
     h.frames(2);
     let out = h.frame(vec![]);
     assert!(has_text(&out, "Remove Background") && has_text(&out, "Edge Softness"));
@@ -107,6 +108,7 @@ fn remove_background_previews_picks_and_commits_one_step() {
     // Preview off shows the original.
     let key = dialog.key();
     h.app.set_remove_background(key, false);
+    h.app.wait_extraction_dialogs();
     assert_eq!(layer(&h, id), original);
     // Pick a sprite color instead: keys that sprite (non-contiguous).
     h.app.set_remove_background(
@@ -116,11 +118,13 @@ fn remove_background_previews_picks_and_commits_one_step() {
         },
         true,
     );
+    h.app.wait_extraction_dialogs();
     h.app.pick_background_color();
     h.frame(vec![]);
     let sprite = (50.0, 50.0); // the yellow circle's center
     let screen = h.screen_of(id, Pos2::new(sprite.0, sprite.1));
     h.click_at(screen);
+    h.app.wait_extraction_dialogs();
     let picked = h.app.remove_background_dialog().unwrap().key().color;
     assert_eq!(
         picked,
@@ -140,6 +144,7 @@ fn remove_background_previews_picks_and_commits_one_step() {
 
     // OK records one step; undo restores.
     assert!(h.app.open_remove_background());
+    h.app.wait_extraction_dialogs();
     assert!(h.app.remove_background_ok());
     let open = h.app.state.document(id).unwrap();
     assert_eq!(open.undo_stack().undo_len(), steps + 1);
@@ -155,6 +160,7 @@ fn auto_detect_proposes_boxes_and_adds_checked_assets() {
     let id = open(&mut h, "sheet_flat.png");
     let original = layer(&h, id);
     assert!(h.app.open_auto_detect());
+    h.app.wait_extraction_dialogs();
     let truth: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(fixture("sheet_flat.json")).unwrap())
             .unwrap();
@@ -412,6 +418,7 @@ fn asset_library_panel_saves_opens_and_removes() {
     assert!(h.app.add_selection_to_library());
     assert!(h.app.deselect());
     assert!(h.app.open_auto_detect());
+    h.app.wait_extraction_dialogs();
     h.app.auto_detect_add();
     let n = h.app.state.assets.len();
     assert!(n >= 20);
@@ -468,6 +475,7 @@ fn extract_menu_is_disabled_without_a_document() {
     assert!(!h.app.open_remove_background(), "during a transform");
     h.tap_key(Key::Escape);
     assert!(h.app.open_auto_detect());
+    h.app.wait_extraction_dialogs();
     assert!(!h.app.open_remove_background(), "one dialog at a time");
     h.app.auto_detect_cancel();
     let _ = id;

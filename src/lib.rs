@@ -25,6 +25,7 @@ pub mod project;
 pub mod recolor;
 pub mod review_ui;
 pub mod selection;
+pub mod selftest;
 pub mod tools;
 pub mod transform;
 pub mod ui;
@@ -36,3 +37,13 @@ pub use app_state::{AppState, DocId};
 pub use document::{Document, DocumentError, Layer, PixelRect};
 pub use ui::{EditorApp, APP_TITLE};
 pub use undo::{Command, CommandError, FillLayer, UndoStack};
+
+/// Lowers the calling thread (and the threads it starts) to background
+/// priority, so long computations never starve the UI thread.
+pub fn background_priority() {
+    #[cfg(target_os = "macos")]
+    // SAFETY: sets the QoS class of the current thread only.
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0);
+    }
+}

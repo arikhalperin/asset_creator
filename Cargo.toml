@@ -1,6 +1,6 @@
 [package]
 name = "game-asset-creator"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.95"
 description = "Desktop image editor for creating and extracting game assets"
@@ -15,6 +15,7 @@ name = "game-asset-creator"
 path = "src/main.rs"
 
 [dependencies]
+libc = "0.2"
 eframe = "0.36"
 egui = "0.36"
 egui_dock = "0.21"

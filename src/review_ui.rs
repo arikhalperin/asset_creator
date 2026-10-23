@@ -51,6 +51,11 @@ impl VideoAssetsDialog {
         self.job.as_ref().map(VideoExtractJob::progress)
     }
 
+    /// The running job's "worker exited" flag (see [`VideoExtractJob::exited`]).
+    pub fn worker_exited(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        self.job.as_ref().map(VideoExtractJob::exited)
+    }
+
     pub fn spec(&self) -> VideoExtractSpec {
         let to = self.to.min(self.info.last_frame());
         VideoExtractSpec {

@@ -1,0 +1,817 @@
+schema: comet.native.v4
+name: release-prep
+language: en
+phase: archive
+status: done
+state_version: 12
+brief: brief.md
+document_constraints_version: 1
+shape_confirmation_hash: e1362b119352c00d13eea8ac0591a9dd35118e280a270951819c810897580c24
+spec_changes:
+  - capability: release-prep
+    operation: create
+    source: specs/release-prep/spec.md
+workspace:
+  isolation: branch
+  change_branch: comet/release-prep
+  target_branch: master
+  finish: merge
+loop:
+  stage: done
+  goal_cycle: 1
+  iteration: 2
+  attempt: 1
+  retry_epoch: 0
+  failed_iteration_count: 1
+  no_progress_count: 0
+  execution_failure_count: 0
+  previous_unresolved_ids: []
+  next_action: null
+acceptance:
+  - id: A1
+    source: brief.md
+    text: "R1: Remove Background and Auto-Detect previews run on workers: while one
+      computes on a 2048 × 2048 layer, every UI frame stays under 50 ms
+      (release); the final pixels and detected rectangles equal the synchronous
+      results; changing a parameter mid-run discards the stale result; Cancel
+      restores the layer at once."
+    result: passed
+    reason:
+      text: "Remove Background now renders only on a PreviewJob worker. Results are
+        tagged with a generation number and stale ones are dropped. OK applies a
+        finished preview at once; otherwise it sets the commit flag, shows a
+        spinner with 'Applying…' (OK disabled) and records one undo step when
+        the worker finishes. This includes Preview off, which renders on a
+        worker when OK is clicked. While rendering, the dialog shows a spinner
+        with 'Working…'. Auto-Detect keys and detects on a worker: poll/busy,
+        Add disabled while busy, stale parameters re-detect. Runtime check
+        responsive-release passed (exit 0) and I re-ran it twice in a scratch
+        copy: OK mid-render and Preview-off apply frames 22-29 ms, cancel call
+        3.6 ms with next frame 17 ms, Auto-Detect proposals equal the
+        synchronous ones. My own probes on a 2048x2048 sheet, per-frame times,
+        both Canvas and Active-layer sources: Preview off + OK applied the exact
+        synchronous pixels as 1 step (worst frame 25 ms). Cancel during
+        'Applying…' restored at once; no step and no extra layer appeared after
+        the worker finished (worst 21 ms). Settings changed after OK gave
+        exactly 1 step with the newest settings (worst 27 ms). OK clicked in the
+        UI mid-render: every frame < 30 ms. The in-dialog Source switch frames
+        were at most 29 ms. The open frame (open + render) was 22-31 ms warm and
+        45-50 ms cold for the Canvas source. Auto-Detect open + frame < 20 ms."
+      truncated: false
+  - id: A2
+    source: brief.md
+    text: "R2: Extract Assets on a 1-minute clip: progress rises steadily to
+      completion, every UI frame during the run stays under 50 ms (release), and
+      Cancel ends the run within 1 s with the cancelling frame also under 50
+      ms."
+    result: passed
+    reason:
+      text: "tests/fixtures/video/minute.mp4 is 60.07 s, 640x360, 1802 frames.
+        bench_extract_assets_on_a_minute_keeps_the_ui_responsive (in
+        responsive-release, exit 0) checks progress never decreases and passes
+        0.95, every frame < 50 ms, the cancel frame < 50 ms, and the worker
+        exits within 1 s. My two re-runs: 11.0 s run, about 3710 frames, slowest
+        4.3-9.0 ms; after Cancel the worker exited in 5.3-5.7 ms."
+      truncated: false
+  - id: A3
+    source: brief.md
+    text: "R3: Model/PDFium downloads show a Cancel button that stops the download
+      and leaves no partial files; cancelling Extract Frames returns within one
+      UI frame (< 50 ms)."
+    result: passed
+    reason:
+      text: "Downloads for MobileSAM (Extract Object strip), OpenCLIP (Library panel)
+        and PDFium (window) all have a Cancel button. Cancelling drops the
+        Download, which sets the cancel flag; the worker then removes its .part
+        file. Part names are now unique per download, so a restart cannot race
+        the old cleanup. The MobileSAM test (local slow HTTP server) passes. I
+        probed offline using a slowly fed FIFO as the download source: clicking
+        PDFium Cancel took 0.3 ms and the .part file was removed; restart then
+        cancel left no leftovers. The tagging model's 'Cancel Download' button
+        shows in the Library panel and works, restart included. Extract Frames
+        cancel no longer joins the worker: 0.10-0.11 ms including the next
+        frame."
+      truncated: false
+  - id: A4
+    source: brief.md
+    text: "R4: `scripts/package-macos.sh` produces \"Game Asset Creator.app\", a
+      .zip, and a .dmg. Every Mach-O file in the app references only system
+      libraries or @rpath/@executable_path/@loader_path (no Homebrew or other
+      absolute paths); the bundled ffmpeg reports an LGPL, decode-only
+      configuration; `codesign --verify --deep --strict` passes; the bundled
+      binary's `--self-test` passes (decodes the sample frame, loads the bundled
+      ONNX Runtime) without touching the user's data. Launching the .app on
+      another Mac is a manual check described in the README."
+    result: passed
+    reason:
+      text: "The package check (scripts/package-macos.sh --skip-ffmpeg-build) passed
+        with exit 0, and the binary was built after the last source edit. I
+        inspected a copy of the bundle independently. otool: every Mach-O file
+        references only /usr/lib, /System or @rpath; the executable has rpath
+        @executable_path/../Frameworks; every @rpath library is bundled. The
+        ffmpeg 7.1.5 configuration has --disable-gpl --disable-nonfree
+        --disable-version3 --disable-encoders --disable-muxers
+        --disable-network, and its licence reports 'LGPL version 2.1 or later'.
+        codesign --verify --deep --strict passes (ad-hoc), and also on the app
+        unpacked from the zip. Info.plist: io.github.game-asset-creator, 1.0.0,
+        LSMinimumSystemVersion 13.0, NSHighResolutionCapable. I ran --self-test
+        from the copy with an empty HOME and ORT_DISABLE_TELEMETRY unset: exit
+        0; DYLD_PRINT_LIBRARIES shows only the bundle's ffmpeg and ONNX Runtime
+        1.31.0 loaded (no Homebrew); HOME was still empty afterwards. A bad path
+        exits 1 with a reason. The zip has 56 files; the dmg is UDZO and hdiutil
+        verify passes. The README describes the manual clean-Mac check."
+      truncated: false
+  - id: A5
+    source: brief.md
+    text: "R5: README.md, docs/user-guide.md, and THIRD_PARTY_NOTICES.md exist; the
+      guide's walkthrough uses only menu items and controls that exist in the
+      app (checked by a test that finds each named menu item/button through the
+      headless UI); model download sizes, sources, and storage paths match the
+      code."
+    result: passed
+    reason:
+      text: "README.md, docs/user-guide.md, THIRD_PARTY_NOTICES.md and LICENSE (MIT)
+        exist. The guide test (every `Menu ▸ Command` in the guide and README
+        found in the headless UI's menus) passes. Every bold control name in the
+        docs exists as a UI string. Model sizes match the code: MobileSAM
+        28,157,093 + 16,501,323 = 44.7 MB; CLIP 152,708,043 + 3,642,073 = 156.4
+        MB; PDFium arm64 3,533,019 = 3.5 MB, now correct in both README and
+        guide, matching the in-app {:.1} MB label. Sources match the code:
+        Acly/MobileSAM, the onnx-community CLIP-ViT-B-32-laion2B repo, bblanchon
+        pdfium-binaries chromium/7881. Storage paths match dirs::data_dir()/Game
+        Asset Creator/{models, models/clip, pdfium, library}. Keyboard shortcuts
+        match the KeyboardShortcut constants, and the video extensions match.
+        The notices cover ffmpeg LGPL with source URL, SHA and flags, ONNX
+        Runtime MIT, PDFium, MobileSAM Apache-2.0, and OpenCLIP MIT."
+      truncated: false
+  - id: A6
+    source: brief.md
+    text: "R6: tests/smoke.rs passes headlessly and offline via scripts/smoke.sh;
+      .github/workflows/ci.yml is valid YAML on a macOS arm64 runner and runs
+      exactly the commands that pass locally."
+    result: passed
+    reason:
+      text: "tests/smoke.rs runs offline: GrabCut-only config, temporary library,
+        tagging disabled by default. It covers image → filter → Remove
+        Background → Auto-Detect → library → export PNG, save project, export
+        assets; and video → Extract Assets → review → add → sprite sheet with
+        atlas. The smoke check (scripts/smoke.sh) passed and my re-run passed.
+        ci.yml parses as valid YAML: on push and pull_request, macos-14; brew
+        ffmpeg@7 (7.1.5, keg-only) with PKG_CONFIG_PATH from brew --prefix
+        ffmpeg@7; Rust pinned to 1.98.0 (the local toolchain); then fmt --check,
+        clippy --all-targets -D warnings, cargo test, scripts/smoke.sh — the
+        same commands as the passing Runtime checks. Tests that need models skip
+        when the GAC_* variables are unset."
+      truncated: false
+  - id: A7
+    source: brief.md
+    text: "R7: All existing release benchmarks and UI tests pass unchanged."
+    result: passed
+    reason:
+      text: "All 20 Runtime checks for this candidate passed with exit 0: cargo test
+        (32 suites), clippy, fmt, every release benchmark (patterns, pattern-ui,
+        filters, library, extract, video, canvas, transform, pdf, recolor,
+        enhance) and the release UI suites (pdf_ui, recolor_ui, enhance_ui). No
+        existing assertion was removed. Test changes only add
+        wait_extraction_dialogs() after the now-asynchronous dialogs, and
+        settle_canvas in the harness for the budgeted tile refresh. I reviewed
+        the budgeted canvas refresh (128-row strips, 12 ms budget, small changes
+        refreshed at once, pending tiles deferred) and the parallel
+        composite/downsample. Mip boundary rows are recomputed by the next
+        strip; the canvas level-equality test passes. The async dialog state
+        machine looks consistent (see A1)."
+      truncated: false
+builder_handoff:
+  candidate_id: a3bb5950-4e3c-45e6-bae7-4132899fb805
+  identity_provider: skill-coordinated
+  builder_execution_ref: skill-coordinated:builder:586a9c9b-42b9-4a1f-be58-72e4b6be51ec
+  iteration: 2
+  summary:
+    text: "Round 2 (A1 and A5 fixes): Remove Background OK never renders on the UI
+      thread - a finished preview is applied at once, otherwise the dialog shows
+      Applying... and the step is recorded when the worker finishes (also with
+      Preview off, which now renders on a worker when OK is clicked); the dialog
+      shows a spinner + Working... while rendering; new release test
+      remove_background_ok_never_blocks (OK mid-render and Preview off: frames
+      21-33 ms, same pixels, one undo step). PDFium size in README/guide
+      corrected to 3.5 MB. Also: download .part files are unique per download
+      (no cancel/restart race), two misplaced doc comments fixed, CI pins
+      ffmpeg@7 (PKG_CONFIG_PATH) and Rust 1.98.0. C16 release preparation
+      (R1-R7). Perf: Remove Background renders on a worker (FilterRender
+      snapshot Arc, generation-checked PreviewJob, OK reuses the finished
+      preview, utility QoS), Auto-Detect keys+detects on a worker
+      (poll/wait/busy; Add waits), Extract Frames cancel no longer joins,
+      Extract Assets job exposes an exited flag, Cancel Download for
+      MobileSAM/CLIP/PDFium. Profiling fixes: Layers panel computed a full Merge
+      Down every frame to enable its button (now can_merge_down),
+      Document::composite_region and canvas downsample_into run in parallel row
+      bands, and the tile cache refreshes big changes in 128-row strips within a
+      12 ms per-frame budget (tests settle the canvas). Packaging:
+      scripts/package-macos.sh (LGPL decode-only ffmpeg 7.1.5 + ONNX Runtime
+      1.31.0 pinned by SHA-256, @rpath Frameworks, ad-hoc sign, zip+dmg,
+      otool/LGPL/codesign/--self-test checks with an empty HOME),
+      src/selftest.rs + --self-test, ORT bundle search path and telemetry off
+      (ORT_DISABLE_TELEMETRY set in main), icon (assets/icon,
+      scripts/make-icon.sh). Docs: README.md, docs/user-guide.md,
+      THIRD_PARTY_NOTICES.md, LICENSE; tests/guide.rs checks every Menu >
+      Command in the docs exists. Smoke: tests/smoke.rs + scripts/smoke.sh;
+      .github/workflows/ci.yml. Version 1.0.0; tests/fixtures/video/minute.mp4
+      (walk.mp4 looped). (Runtime IDs A1-A7 = brief R1-R7.)"
+    truncated: false
+  addressed_acceptance_ids:
+    - A1
+    - A2
+    - A3
+    - A4
+    - A5
+    - A6
+    - A7
+  checks:
+    - name:
+        text: all-dispatch-checks
+        truncated: false
+      result: passed
+      note:
+        text: "c16_all.sh: all 20 exit 0 (1-minute Extract Assets slowest frame 4.6 ms;
+          OK-while-rendering frames <= 33 ms; cancel frame 17 ms; packaging
+          self-test OK)."
+        truncated: false
+  checks_truncated: false
+  known_limits:
+    - text: Launching on a different (clean) Mac is a manual check; the bundle checks
+        are the automated proxy.
+      truncated: false
+    - text: The CI workflow has not run yet (the GitHub remote is empty until the push
+        after acceptance).
+      truncated: false
+    - text: Very large images now appear/update over a few frames (12 ms refresh
+        budget per frame) instead of in one long frame.
+      truncated: false
+    - text: The MobileSAM test models in the scratchpad had been removed by the OS
+        /tmp cleanup and were re-downloaded (pinned SHA).
+      truncated: false
+  known_limits_truncated: false
+  review: null
+  submitted_at: 2026-10-23T12:14:13.186Z
+blockers: []
+verification:
+  candidate_id: a3bb5950-4e3c-45e6-bae7-4132899fb805
+  identity_provider: skill-coordinated
+  verifier_execution_ref: skill-coordinated:verifier:f4f475c6-4aa6-4b46-805f-b206f62f11e8
+  iteration: 2
+  attempt: 1
+  assurance: skill-coordinated
+  verdict: pass
+  checks:
+    - id: cargo-test
+      name:
+        text: cargo test (with the tagging model)
+        truncated: false
+      argv_display:
+        - text: GAC_CLIP_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/clip
+          truncated: false
+        - text: GAC_MODEL_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/models
+          truncated: false
+        - text: GAC_PDFIUM_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/pdfium-installed
+          truncated: false
+        - text: GAC_PDFIUM_ARCHIVE=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/pdfium-dl
+          truncated: false
+        - text: cargo
+          truncated: false
+        - text: test
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 766540
+    - id: clippy
+      name:
+        text: clippy -D warnings
+        truncated: false
+      argv_display:
+        - text: clippy
+          truncated: false
+        - text: --all-targets
+          truncated: false
+        - text: --
+          truncated: false
+        - text: -D
+          truncated: false
+        - text: warnings
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 6451
+    - id: fmt
+      name:
+        text: fmt --check
+        truncated: false
+      argv_display:
+        - text: fmt
+          truncated: false
+        - text: --check
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 472
+    - id: bench-patterns
+      name:
+        text: release pattern detection / make seamless benchmark
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: patterns
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 10746
+    - id: bench-pattern-ui
+      name:
+        text: release pattern preview benchmark
+        truncated: false
+      argv_display:
+        - text: GAC_CLIP_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/clip
+          truncated: false
+        - text: cargo
+          truncated: false
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: pattern_ui
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --include-ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 4932
+    - id: bench-filters
+      name:
+        text: release filter preview benchmark
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: filters
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 3501
+    - id: bench-library
+      name:
+        text: release library/tagging benchmark
+        truncated: false
+      argv_display:
+        - text: GAC_CLIP_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/clip
+          truncated: false
+        - text: cargo
+          truncated: false
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: library
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 4804
+    - id: bench-extract
+      name:
+        text: release extraction benchmarks
+        truncated: false
+      argv_display:
+        - text: GAC_MODEL_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/models
+          truncated: false
+        - text: cargo
+          truncated: false
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: extract
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 2861
+    - id: bench-video
+      name:
+        text: release video benchmark
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: video
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 4085
+    - id: bench-canvas
+      name:
+        text: release pan/zoom benchmark
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: canvas
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 3053
+    - id: bench-transform
+      name:
+        text: release transform benchmark
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --lib
+          truncated: false
+        - text: bench_transform
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 5029
+    - id: bench-pdf
+      name:
+        text: release PDF render/detect/pack benchmark
+        truncated: false
+      argv_display:
+        - text: GAC_PDFIUM_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/pdfium-installed
+          truncated: false
+        - text: cargo
+          truncated: false
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: pdf_parts
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 2101
+    - id: pdf-ui-release
+      name:
+        text: release PDF UI tests (frame-time limits)
+        truncated: false
+      argv_display:
+        - text: GAC_PDFIUM_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/pdfium-installed
+          truncated: false
+        - text: GAC_PDFIUM_ARCHIVE=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/pdfium-dl
+          truncated: false
+        - text: GAC_MODEL_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/models
+          truncated: false
+        - text: cargo
+          truncated: false
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: pdf_ui
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 11951
+    - id: bench-recolor
+      name:
+        text: release recolour benchmark
+        truncated: false
+      argv_display:
+        - text: GAC_PDFIUM_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/pdfium-installed
+          truncated: false
+        - text: cargo
+          truncated: false
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: recolor
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 2488
+    - id: recolor-ui-release
+      name:
+        text: release recolour UI tests (preview frame limit, MobileSAM protect)
+        truncated: false
+      argv_display:
+        - text: GAC_PDFIUM_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/pdfium-installed
+          truncated: false
+        - text: GAC_MODEL_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/models
+          truncated: false
+        - text: cargo
+          truncated: false
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: recolor_ui
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 9349
+    - id: bench-enhance
+      name:
+        text: enhance fixture tests + A3 benchmark (release)
+        truncated: false
+      argv_display:
+        - text: GAC_PDFIUM_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/pdfium-installed
+          truncated: false
+        - text: cargo
+          truncated: false
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: enhance
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --include-ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 2137
+    - id: enhance-ui-release
+      name:
+        text: enhance UI tests (release, PDFium)
+        truncated: false
+      argv_display:
+        - text: GAC_PDFIUM_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/pdfium-installed
+          truncated: false
+        - text: GAC_MODEL_DIR=/private/tmp/claude-502/-Users-arikha-game-asset-creator/d82aeee0-b73c-4042-b7f8-98127421b63b/scratchpad/models
+          truncated: false
+        - text: cargo
+          truncated: false
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: enhance_ui
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 6091
+    - id: responsive-release
+      name:
+        text: UI responsiveness (R1-R3, release, incl. 1-minute Extract Assets)
+        truncated: false
+      argv_display:
+        - text: test
+          truncated: false
+        - text: --release
+          truncated: false
+        - text: --test
+          truncated: false
+        - text: responsive
+          truncated: false
+        - text: --
+          truncated: false
+        - text: --include-ignored
+          truncated: false
+        - text: --nocapture
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 15572
+    - id: smoke
+      name:
+        text: headless offline smoke test (scripts/smoke.sh)
+        truncated: false
+      argv_display: []
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 4478
+    - id: package
+      name:
+        text: macOS packaging + bundle checks (otool, LGPL ffmpeg, codesign,
+          --self-test)
+        truncated: false
+      argv_display:
+        - text: --skip-ffmpeg-build
+          truncated: false
+      argv_truncated: false
+      cwd_ref: .
+      status: passed
+      exit_code: 0
+      duration_ms: 16201
+  summary:
+    text: "Candidate passes all of R1-R7 (A1-A7). The previous failures are fixed.
+      A1: Remove Background OK no longer renders on the UI thread in any path
+      tested: OK while previewing, Preview off, settings changed after OK,
+      Cancel during 'Applying…', Source switch. Every frame was < 50 ms in
+      release on 2048², with spinner, 'Working…' and 'Applying…' shown. A5:
+      PDFium is 3.5 MB everywhere. All 20 Runtime checks exit 0. Independent
+      bundle inspection and the empty-HOME --self-test pass. Re-runs of the
+      responsive, smoke and guide tests pass, and offline FIFO probes confirm
+      PDFium and tagging-model download cancel and restart."
+    truncated: false
+  risks:
+    - text: "The first Remove Background open on a 2048² canvas still composites,
+        clips and auto-keys on the UI thread: about 45-50 ms cold, 22-31 ms
+        warm. It is within the bar but has little headroom on slower Macs."
+      truncated: false
+    - text: Download cancel depends on the worker's next read() returning. With a
+        stalled connection (ureq has no read timeout) the .part file stays until
+        data or a disconnect arrives.
+      truncated: false
+    - text: "Pre-existing: the in-app consent text says 'MobileSAM (MIT license)'
+        while THIRD_PARTY_NOTICES says Apache-2.0."
+      truncated: false
+    - text: "Pre-existing: tests/pdf_ui.rs and similar fall back to
+        pdfium::default_dir(), the user's Application Support, when
+        GAC_PDFIUM_DIR is unset. My CI simulation (GAC_MODEL_DIR pointed at an
+        empty folder) therefore read the user's installed PDFium read-only.
+        mobilesam_refines_a_part failed only because of that artificial empty
+        model folder. On CI none of these folders exist, so those tests skip."
+      truncated: false
+    - text: The new files (scripts, fixtures including minute.mp4, docs, .github) are
+        still untracked and must be committed with their executable bits for CI
+        to run.
+      truncated: false
+  risks_truncated: false
+  completed_at: 2026-10-23T12:46:40.321Z
+history:
+  - goal_cycle: 1
+    iteration: 1
+    attempt: 1
+    outcome: fail
+    unresolved_ids:
+      - A1
+      - A5
+    summary:
+      text: "Fail on 2 of 7. A1: clicking OK while a 2048x2048 Remove Background
+        preview is computing renders on the UI thread (71-83 ms frames in
+        release, measured), and the dialog has no 'Working…' indicator, contrary
+        to the spec. A5: PDFium's size is documented as 3.6 MB, but the code's
+        archive is 3,533,019 bytes and the app says 'about 3.5 MB'. A2, A3, A4,
+        A6 and A7 pass: all 20 runtime checks are green; I reran responsive,
+        smoke and guide; and I inspected the bundle independently (otool,
+        rpaths, LGPL config, codesign including the zip copy, dmg verify,
+        self-test with an empty HOME loading only bundled libraries)."
+      truncated: false
+    completed_at: 2026-10-23T11:56:59.728Z
+  - goal_cycle: 1
+    iteration: 2
+    attempt: 1
+    outcome: pass
+    unresolved_ids: []
+    summary:
+      text: "Candidate passes all of R1-R7 (A1-A7). The previous failures are fixed.
+        A1: Remove Background OK no longer renders on the UI thread in any path
+        tested: OK while previewing, Preview off, settings changed after OK,
+        Cancel during 'Applying…', Source switch. Every frame was < 50 ms in
+        release on 2048², with spinner, 'Working…' and 'Applying…' shown. A5:
+        PDFium is 3.5 MB everywhere. All 20 Runtime checks exit 0. Independent
+        bundle inspection and the empty-HOME --self-test pass. Re-runs of the
+        responsive, smoke and guide tests pass, and offline FIFO probes confirm
+        PDFium and tagging-model download cancel and restart."
+      truncated: false
+    completed_at: 2026-10-23T12:46:40.321Z
+history_overflow:
+  dropped_entries: 0
+  first_dropped_at: null
+  last_dropped_at: null
+  outcome_counts:
+    pass: 0
+    fail: 0
+    blocked: 0
+    execution-error: 0
+    recovery: 0
+verification_result: pass
+verification_report: verification.md
+archived: true
+created_at: 2026-10-23T06:02:54.587Z
