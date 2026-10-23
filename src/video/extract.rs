@@ -91,12 +91,11 @@ impl ExtractJob {
         self.result.try_recv().ok()
     }
 
-    /// Stops the job; nothing is delivered.
+    /// Stops the job without waiting for the worker (it exits after its
+    /// current frame); nothing is delivered.
     pub fn cancel(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+        drop(self.handle.take());
     }
 }
 

@@ -311,6 +311,13 @@ fn pixels_with_mask(layer: &Layer) -> RgbaImage {
     pixels
 }
 
+/// Whether Merge Down applies (a layer below the active one) — what
+/// [`merge_down`] checks, without compositing.
+pub fn can_merge_down(doc: &Document) -> bool {
+    let upper = doc.active_layer();
+    upper >= 1 && doc.layer(upper).is_some() && doc.layer(upper - 1).is_some()
+}
+
 /// Layer → Merge Down; `None` on the bottom layer.
 pub fn merge_down(doc: &Document) -> Option<ReplaceLayers> {
     let upper_index = doc.active_layer();
@@ -594,6 +601,7 @@ mod tests {
         let mut bottom = doc3();
         bottom.set_active_layer(0);
         assert!(merge_down(&bottom).is_none());
+        assert!(!can_merge_down(&bottom));
     }
 
     #[test]

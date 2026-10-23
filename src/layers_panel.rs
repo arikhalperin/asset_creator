@@ -58,7 +58,8 @@ impl LayerOp {
             Self::Delete => layers::delete_layer(doc).is_some(),
             Self::MoveUp => layers::move_layer(doc, true).is_some(),
             Self::MoveDown => layers::move_layer(doc, false).is_some(),
-            Self::MergeDown => layers::merge_down(doc).is_some(),
+            // Checked without compositing (the panel asks every frame).
+            Self::MergeDown => layers::can_merge_down(doc),
             Self::AddMask => !has_mask,
             Self::AddMaskFromSelection => !has_mask && doc.selection().is_some(),
             Self::DeleteMask | Self::ApplyMask | Self::ToggleMask => has_mask,

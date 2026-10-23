@@ -461,12 +461,14 @@ fn auto_detect_reads_the_canvas_within_the_selection() {
     let (id, a, b) = two_layer_doc(&mut h, tmp.path());
     // Canvas (default): both sprites, from both layers.
     assert!(h.app.open_auto_detect());
+    h.app.wait_extraction_dialogs();
     h.frame(vec![]);
     let out = h.frame(vec![]);
     assert!(has_text(&out, "Source") && has_text(&out, "Canvas") && has_text(&out, "Active layer"));
     assert_eq!(detected(&h), vec![a, b]);
     // Active layer: only the top layer's sprite.
     click_text(&mut h, "Active layer");
+    h.app.wait_extraction_dialogs();
     assert!(!h.app.auto_detect_dialog().unwrap().canvas);
     assert_eq!(detected(&h), vec![b]);
     click_text(&mut h, "Canvas");
@@ -475,6 +477,7 @@ fn auto_detect_reads_the_canvas_within_the_selection() {
     let sel = PixelRect::new(10, 20, 130, 60);
     select(&mut h, id, sel);
     assert!(h.app.open_auto_detect());
+    h.app.wait_extraction_dialogs();
     let found = detected(&h);
     assert_eq!(found[0], a);
     for r in &found {
@@ -498,6 +501,7 @@ fn remove_background_from_the_canvas_adds_a_layer_in_one_step() {
     let steps = h.app.state.document(id).unwrap().undo_stack().undo_len();
     // Cancel leaves no trace.
     assert!(h.app.open_remove_background());
+    h.app.wait_extraction_dialogs();
     h.frames(2);
     assert_eq!(
         h.app.state.document(id).unwrap().document.layer_count(),
@@ -515,6 +519,7 @@ fn remove_background_from_the_canvas_adds_a_layer_in_one_step() {
     // OK: one step adding "Background removed" with both sprites keyed out of
     // the magenta.
     assert!(h.app.open_remove_background());
+    h.app.wait_extraction_dialogs();
     assert_eq!(
         h.app.remove_background_dialog().unwrap().key().color,
         [255, 0, 255]
@@ -541,6 +546,7 @@ fn remove_background_from_the_canvas_adds_a_layer_in_one_step() {
     // With a selection: nothing outside it.
     select(&mut h, id, PixelRect::new(10, 20, 60, 50));
     assert!(h.app.open_remove_background());
+    h.app.wait_extraction_dialogs();
     assert!(h.app.remove_background_ok());
     let open = h.app.state.document(id).unwrap();
     let layer = open.document.layer(open.document.active_layer()).unwrap();
@@ -677,6 +683,7 @@ fn full_loop_video_to_composition() {
     h.frames(2);
     // 2. Extract the skeleton (drawn at 40,64, 96×112) with Auto-Detect.
     assert!(h.app.open_auto_detect());
+    h.app.wait_extraction_dialogs();
     let found: Vec<PixelRect> = h
         .app
         .auto_detect_dialog()
@@ -801,6 +808,7 @@ fn the_remove_background_preview_layer_never_leaks() {
     h.frames(2);
     assert!(h.app.can_save_back(doc));
     assert!(h.app.open_remove_background());
+    h.app.wait_extraction_dialogs();
     h.frames(2);
     assert!(!h.app.can_save_back(doc), "no Save Back during the preview");
     assert!(h.app.save_back_to_library().is_none());
@@ -894,6 +902,7 @@ fn extraction_waits_while_remove_background_is_open() {
         h.app.extract_session().is_some_and(|s| s.mask.is_some())
     });
     assert!(h.app.open_remove_background());
+    h.app.wait_extraction_dialogs();
     h.frames(2);
     assert!(!h.app.extract_prompt(prompt.clone()), "prompt refused");
     assert!(!h.app.extract_accept(), "accept refused");

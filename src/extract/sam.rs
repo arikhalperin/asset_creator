@@ -22,6 +22,18 @@ pub fn default_runtime_paths() -> Vec<PathBuf> {
     }
     #[cfg(target_os = "macos")]
     {
+        // Inside the app bundle: Contents/MacOS/<exe> → Contents/Frameworks.
+        if let Some(bundled) = std::env::current_exe().ok().and_then(|exe| {
+            Some(
+                exe.parent()?
+                    .parent()?
+                    .join("Frameworks/libonnxruntime.dylib"),
+            )
+        }) {
+            if bundled.is_file() {
+                paths.push(bundled);
+            }
+        }
         paths.push("/opt/homebrew/lib/libonnxruntime.dylib".into());
         paths.push("/usr/local/lib/libonnxruntime.dylib".into());
         paths.push("libonnxruntime.dylib".into());
@@ -49,7 +61,13 @@ pub fn runtime(paths: &[PathBuf]) -> Result<&'static ort::environment::Environme
                     continue;
                 }
                 match ort::init_from(path) {
-                    Ok(builder) => match builder.with_name("game-asset-creator").build() {
+                    // Microsoft's builds send usage telemetry by default; the
+                    // app makes no network requests the user did not ask for.
+                    Ok(builder) => match builder
+                        .with_name("game-asset-creator")
+                        .with_telemetry(false)
+                        .build()
+                    {
                         Ok(env) => return Ok(env),
                         Err(e) => last = format!("ONNX Runtime failed to start: {e}"),
                     },

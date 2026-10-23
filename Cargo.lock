@@ -1513,7 +1513,7 @@ dependencies = [
 
 [[package]]
 name = "game-asset-creator"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "dirs",
  "eframe",
@@ -1522,6 +1522,7 @@ dependencies = [
  "ffmpeg-next",
  "flate2",
  "image",
+ "libc",
  "ndarray",
  "ort",
  "pdf-writer",

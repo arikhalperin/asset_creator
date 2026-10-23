@@ -233,7 +233,15 @@ fn download_all(
             done.fetch_add(f.size, Ordering::Relaxed);
             continue;
         }
-        let part = dir.join(format!("{}.part", f.name));
+        // Unique per download, so a cancelled one cleaning up never removes
+        // the partial file of a newer one.
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let part = dir.join(format!(
+            "{}.{}-{}.part",
+            f.name,
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         let result = fetch(set, source, f, &part, done, cancel, notify).and_then(|()| {
             let hash = sha256_file(&part).map_err(|e| e.to_string())?;
             if hash == f.sha256 {

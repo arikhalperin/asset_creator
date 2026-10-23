@@ -1,6 +1,9 @@
 //! Extraction UI: the Remove Background and Auto-Detect Objects dialogs, the
 //! Extract Object session, canvas overlays, and the Asset Library panel.
 
+use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
+
 use egui::{Color32, Pos2, Rect, Stroke, TextureHandle, TextureOptions, Vec2};
 use image::{GrayImage, RgbaImage};
 
@@ -31,6 +34,10 @@ pub struct RemoveBackgroundDialog {
     pub original: RgbaImage,
     /// Source: the visible canvas (keyed onto a new layer) or the active layer.
     pub canvas: bool,
+    /// The preview is being rendered (shown as "Working…").
+    pub working: bool,
+    /// OK was clicked; the result is applied once rendered ("Applying…").
+    pub applying: bool,
 }
 
 /// What the user did in a dialog this frame.
@@ -60,6 +67,8 @@ impl RemoveBackgroundDialog {
             picking: false,
             original: layer.clone(),
             canvas,
+            working: false,
+            applying: false,
         }
     }
 
@@ -142,8 +151,19 @@ impl RemoveBackgroundDialog {
                     if ui.button("Cancel").clicked() {
                         outcome = Some(DialogOutcome::Cancel);
                     }
-                    if ui.button("OK").clicked() {
+                    if ui
+                        .add_enabled(!self.applying, egui::Button::new("OK"))
+                        .clicked()
+                    {
                         outcome = Some(DialogOutcome::Ok);
+                    }
+                    if self.applying || self.working {
+                        ui.spinner();
+                        ui.label(if self.applying {
+                            "Applying…"
+                        } else {
+                            "Working…"
+                        });
                     }
                 });
             });
@@ -179,17 +199,48 @@ pub fn clip_to_selection(image: &mut RgbaImage, selection: &GrayImage) {
 // ---------------------------------------------------------------------------
 // Auto-Detect Objects
 
-/// The open Auto-Detect Objects dialog.
+/// The open Auto-Detect Objects dialog. Keying and detection run on a
+/// worker thread; [`Self::poll`] takes their results.
 pub struct AutoDetectDialog {
     pub doc: DocId,
     /// Source: the visible canvas or the active layer.
     pub canvas: bool,
     /// The pixels assets are cut from (the layer, keyed when it had no
-    /// transparency).
+    /// transparency); empty until the worker has keyed it.
     pub source: RgbaImage,
     pub params: DetectParams,
     pub proposals: Vec<Proposal>,
     pub checked: Vec<bool>,
+    job: Option<DetectJob>,
+    notify: Arc<dyn Fn() + Send + Sync>,
+}
+
+/// Keying (when `source` is still empty) and detection with `params`.
+struct DetectJob {
+    params: DetectParams,
+    rx: Receiver<(Option<RgbaImage>, Vec<Proposal>)>,
+}
+
+/// The pixels Auto-Detect cuts from: `layer` (only the `selection`), keyed
+/// when it has no transparency there.
+fn detect_source(layer: &RgbaImage, selection: Option<&GrayImage>) -> RgbaImage {
+    let inside = |x: u32, y: u32| selection.is_none_or(|s| s.get_pixel(x, y)[0] > 0);
+    let transparent = layer
+        .enumerate_pixels()
+        .any(|(x, y, p)| p[3] < 255 && inside(x, y));
+    let mut source = if transparent {
+        layer.clone()
+    } else {
+        let r = selection
+            .and_then(crate::selection::bounds)
+            .unwrap_or(PixelRect::new(0, 0, layer.width(), layer.height()));
+        let area = image::imageops::crop_imm(layer, r.x, r.y, r.width, r.height).to_image();
+        keying::key(layer, &KeyParams::auto(&area))
+    };
+    if let Some(sel) = selection {
+        clip_to_selection(&mut source, sel);
+    }
+    source
 }
 
 /// What the user did in the Auto-Detect dialog.
@@ -203,42 +254,111 @@ pub enum DetectOutcome {
 }
 
 impl AutoDetectDialog {
-    /// Detects objects in `layer`, keying it first when it has no
-    /// transparency. With a `selection`, only the selected area counts: it is
-    /// keyed when it has no transparency, and everything outside is cleared.
-    pub fn new(doc: DocId, layer: &RgbaImage, selection: Option<&GrayImage>, canvas: bool) -> Self {
-        let inside = |x: u32, y: u32| selection.is_none_or(|s| s.get_pixel(x, y)[0] > 0);
-        let transparent = layer
-            .enumerate_pixels()
-            .any(|(x, y, p)| p[3] < 255 && inside(x, y));
-        let mut source = if transparent {
-            layer.clone()
-        } else {
-            let r = selection
-                .and_then(crate::selection::bounds)
-                .unwrap_or(PixelRect::new(0, 0, layer.width(), layer.height()));
-            let area = image::imageops::crop_imm(layer, r.x, r.y, r.width, r.height).to_image();
-            keying::key(layer, &KeyParams::auto(&area))
-        };
-        if let Some(sel) = selection {
-            clip_to_selection(&mut source, sel);
-        }
-        let mut dialog = Self {
+    /// Detects objects in `layer` on a worker, keying it first when it has
+    /// no transparency. With a `selection`, only the selected area counts:
+    /// it is keyed when it has no transparency, and everything outside is
+    /// cleared. `notify` is called when results are ready.
+    pub fn new(
+        doc: DocId,
+        layer: &RgbaImage,
+        selection: Option<&GrayImage>,
+        canvas: bool,
+        notify: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        let params = DetectParams::default();
+        let (tx, rx) = mpsc::channel();
+        let (layer, selection) = (layer.clone(), selection.cloned());
+        let done = notify.clone();
+        std::thread::Builder::new()
+            .name("auto-detect".to_owned())
+            .spawn(move || {
+                let source = detect_source(&layer, selection.as_ref());
+                let proposals = detect::detect(&source, &params);
+                let _ = tx.send((Some(source), proposals));
+                done();
+            })
+            .expect("spawn auto-detect");
+        Self {
             doc,
             canvas,
-            source,
-            params: DetectParams::default(),
+            source: RgbaImage::new(0, 0),
+            params,
             proposals: Vec::new(),
             checked: Vec::new(),
-        };
-        dialog.detect();
-        dialog
+            job: Some(DetectJob { params, rx }),
+            notify,
+        }
     }
 
-    /// Re-runs detection with the current parameters (all checked).
+    /// Whether keying or detection is still running.
+    pub fn busy(&self) -> bool {
+        self.job.is_some()
+    }
+
+    /// Takes finished results; re-detects when the parameters changed
+    /// meanwhile. Returns whether anything changed.
+    pub fn poll(&mut self) -> bool {
+        let Some(job) = &self.job else {
+            return false;
+        };
+        let Ok((source, proposals)) = job.rx.try_recv() else {
+            return false;
+        };
+        let used = job.params;
+        self.job = None;
+        if let Some(source) = source {
+            self.source = source;
+        }
+        if used == self.params {
+            self.checked = vec![true; proposals.len()];
+            self.proposals = proposals;
+        } else {
+            self.detect();
+        }
+        true
+    }
+
+    /// Waits for keying and detection to finish (tests).
+    pub fn wait(&mut self) {
+        while let Some(job) = &self.job {
+            let Ok(result) = job.rx.recv() else {
+                self.job = None;
+                break;
+            };
+            let used = job.params;
+            self.job = None;
+            if let Some(source) = result.0 {
+                self.source = source;
+            }
+            if used == self.params {
+                self.checked = vec![true; result.1.len()];
+                self.proposals = result.1;
+            } else {
+                self.detect();
+            }
+        }
+    }
+
+    /// Re-runs detection with the current parameters on a worker (all
+    /// checked when done).
     pub fn detect(&mut self) {
-        self.proposals = detect::detect(&self.source, &self.params);
-        self.checked = vec![true; self.proposals.len()];
+        if self.job.is_some() {
+            // The running job re-detects when it sees the new parameters.
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let (source, params, done) = (self.source.clone(), self.params, self.notify.clone());
+        std::thread::Builder::new()
+            .name("auto-detect".to_owned())
+            .spawn(move || {
+                let _ = tx.send((None, detect::detect(&source, &params)));
+                done();
+            })
+            .expect("spawn auto-detect");
+        self.job = Some(DetectJob {
+            params: self.params,
+            rx,
+        });
     }
 
     pub fn set_params(&mut self, params: DetectParams) {
@@ -279,11 +399,17 @@ impl AutoDetectDialog {
                     });
                 ui.separator();
                 let checked = self.checked.iter().filter(|c| **c).count();
+                let busy = self.job.is_some();
                 ui.horizontal(|ui| {
-                    ui.label(format!(
-                        "{} objects found, {checked} selected",
-                        self.proposals.len()
-                    ));
+                    if busy {
+                        ui.spinner();
+                        ui.label("Detecting…");
+                    } else {
+                        ui.label(format!(
+                            "{} objects found, {checked} selected",
+                            self.proposals.len()
+                        ));
+                    }
                     if ui.small_button("All").clicked() {
                         self.checked.iter_mut().for_each(|c| *c = true);
                     }
@@ -314,7 +440,7 @@ impl AutoDetectDialog {
                         outcome = DetectOutcome::Cancel;
                     }
                     if ui
-                        .add_enabled(checked > 0, egui::Button::new("Add to Library"))
+                        .add_enabled(checked > 0 && !busy, egui::Button::new("Add to Library"))
                         .clicked()
                     {
                         outcome = DetectOutcome::Add;

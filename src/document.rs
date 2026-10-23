@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use image::{GrayImage, Rgba, RgbaImage};
+use image::{GrayImage, ImageBuffer, Rgba, RgbaImage};
 use thiserror::Error;
 
 /// DPI used when a file carries no resolution information.
@@ -476,9 +476,44 @@ impl Document {
     pub fn composite_region(&self, rect: PixelRect) -> RgbaImage {
         let rect = rect.intersect(self.bounds()).unwrap_or_default();
         let mut out = RgbaImage::new(rect.width, rect.height);
-        for layer in self.layers.iter().filter(|l| l.visible && l.opacity > 0.0) {
-            composite_layer_onto(&mut out, layer, rect);
+        let layers: Vec<&Layer> = self
+            .layers
+            .iter()
+            .filter(|l| l.visible && l.opacity > 0.0)
+            .collect();
+        // Big regions (a whole-layer change) are composited in row bands
+        // across cores so the canvas refresh stays short.
+        let row = rect.width as usize * 4;
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let rows = rect.height as usize;
+        let per = if (rect.width as usize * rows) < 256 * 1024 {
+            rows.max(1)
+        } else {
+            rows.div_ceil(threads).max(16)
+        };
+        if row == 0 {
+            return out;
         }
+        let raw: &mut [u8] = &mut out;
+        std::thread::scope(|scope| {
+            for (k, band) in raw.chunks_mut(per * row).enumerate() {
+                let layers = &layers;
+                let job = move || {
+                    let h = (band.len() / row) as u32;
+                    let sub = PixelRect::new(rect.x, rect.y + (k * per) as u32, rect.width, h);
+                    let mut img: ImageBuffer<Rgba<u8>, &mut [u8]> =
+                        ImageBuffer::from_raw(rect.width, h, band).expect("band size");
+                    for layer in layers {
+                        composite_layer_into(&mut img, layer, sub);
+                    }
+                };
+                if per >= rows {
+                    job();
+                } else {
+                    scope.spawn(job);
+                }
+            }
+        });
         out
     }
 
@@ -516,6 +551,14 @@ fn validate_dpi(dpi: f64) -> Result<(), DocumentError> {
 /// Composites `layer` (its blend mode, opacity, and enabled mask) onto `out`,
 /// which holds the region `rect` of the document.
 pub fn composite_layer_onto(out: &mut RgbaImage, layer: &Layer, rect: PixelRect) {
+    composite_layer_into(out, layer, rect);
+}
+
+/// [`composite_layer_onto`] for any pixel buffer (e.g. a band of a bigger one).
+fn composite_layer_into<C>(out: &mut ImageBuffer<Rgba<u8>, C>, layer: &Layer, rect: PixelRect)
+where
+    C: std::ops::Deref<Target = [u8]> + std::ops::DerefMut,
+{
     let opacity = layer.opacity;
     let use_mask = layer.mask_enabled && layer.mask.is_some();
     for (x, y, dst) in out.enumerate_pixels_mut() {

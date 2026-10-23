@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>Game Asset Creator</title>
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4B3BA8"/>
+      <stop offset="1" stop-color="#1C8A9C"/>
+    </linearGradient>
+    <pattern id="checker" width="64" height="64" patternUnits="userSpaceOnUse" x="232" y="232">
+      <rect width="64" height="64" fill="#FFFFFF"/>
+      <rect width="32" height="32" fill="#D5DAE6"/>
+      <rect x="32" y="32" width="32" height="32" fill="#D5DAE6"/>
+    </pattern>
+  </defs>
+  <!-- Tile (macOS icon grid: 824 px rounded square on a 1024 canvas) -->
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#tile)"/>
+  <!-- Transparent-canvas card -->
+  <rect x="224" y="236" width="576" height="576" rx="56" fill="#0E0F2A" opacity="0.28"/>
+  <rect x="224" y="224" width="576" height="576" rx="56" fill="url(#checker)"/>
+  <!-- Selection (marching ants) around the sprite -->
+  <rect x="286" y="324" width="452" height="396" rx="10" fill="none" stroke="#1A1B3A" stroke-width="10"/>
+  <rect x="286" y="324" width="452" height="396" rx="10" fill="none" stroke="#FFFFFF" stroke-width="10" stroke-dasharray="30 22"/>
+  <!-- Pixel-art sprite -->
+  <g shape-rendering="crispEdges">
+    <rect x="428" y="354" width="168" height="28" fill="#1A1B3A"/>
+    <rect x="372" y="382" width="56" height="28" fill="#1A1B3A"/>
+    <rect x="428" y="382" width="56" height="28" fill="#B4F5A8"/>
+    <rect x="484" y="382" width="140" height="28" fill="#58D16A"/>
+    <rect x="624" y="382" width="28" height="28" fill="#1A1B3A"/>
+    <rect x="344" y="410" width="28" height="28" fill="#1A1B3A"/>
+    <rect x="372" y="410" width="112" height="28" fill="#B4F5A8"/>
+    <rect x="484" y="410" width="140" height="28" fill="#58D16A"/>
+    <rect x="624" y="410" width="28" height="28" fill="#2E9D55"/>
+    <rect x="652" y="410" width="28" height="28" fill="#1A1B3A"/>
+    <rect x="344" y="438" width="28" height="28" fill="#1A1B3A"/>
+    <rect x="372" y="438" width="28" height="28" fill="#B4F5A8"/>
+    <rect x="400" y="438" width="224" height="28" fill="#58D16A"/>
+    <rect x="624" y="438" width="28" height="28" fill="#2E9D55"/>
+    <rect x="652" y="438" width="28" height="28" fill="#1A1B3A"/>
+    <rect x="316" y="466" width="28" height="28" fill="#1A1B3A"/>
+    <rect x="344" y="466" width="28" height="28" fill="#58D16A"/>
+    <rect x="372" y="466" width="28" height="28" fill="#B4F5A8"/>
+    <rect x="400" y="466" width="252" height="28" fill="#58D16A"/>
+    <rect x="652" y="466" width="28" height="28" fill="#2E9D55"/>
+    <rect x="680" y="466" width="28" height="28" fill="#1A1B3A"/>
+    <rect x="316" y="494" width="28" height="28" fill="#1A1B3A"/>
+    <rect x="344" y="494" width="308" height="28" fill="#58D16A"/>
+    <rect x="652" y="494" width="28" height="28" fill="#2E9D55"/>
+    <rect x="680" y="494" width="28" height="28" fill="#1A1B3A"/>
+    <rect x="316" y="522" width="28" height="28" fill="#1A1B3A"/>
+    <rect x="344" y="522" width="56" height="28" fill="#58D16A"/>
+    <rect x="400" y="522" width="28" height="28" fill="#1A1B3A"/>
+    <rect x="428" y="522" width="28" height="28" fill="#FFFFFF"/>
+    <rect x="456" y="522" width="112" height="28" fill="#58D16A"/>
+    <rect x="568" y="522" width="28" height="28" fill="#1A1B3A"/>
+    <rect x="596" y="522" width="28" height="28" fill="#FFFFFF"/>
+    <rect x="624" y="522" width="28" height="28" fill="#58D16A"/>
+    <rect x="652" y="522" width="28" height="28" fill="#2E9D55"/>
+    <rect x="680" y="522" width="28" height="28" fill="#1A1B3A"/>
+    <rect x="316" y="550" width="28" height="28" fill="#1A1B3A"/>
+    <rect x="344" y="550" width="56" height="28" fill="#58D16A"/>
+    <rect x="400" y="550" width="56" height="28" fill="#1A1B3A"/>
+    <rect x="456" y="550" width="112" height="28" fill="#58D16A"/>
+    <rect x="568" y="550" width="56" height="28" fill="#1A1B3A"/>
+    <rect x="624" y="550" width="28" height="28" fill="#58D16A"/>
+    <rect x="652" y="550" width="28" height="28" fill="#2E9D55"/>
+    <rect x="680" y="550" width="28" height="28" fill="#1A1B3A"/>
+    <rect x="316" y="578" width="28" height="28" fill="#1A1B3A"/>
+    <rect x="344" y="578" width="308" height="28" fill="#58D16A"/>
+    <rect x="652" y="578" width="28" height="28" fill="#2E9D55"/>
+    <rect x="680" y="578" width="28" height="28" fill="#1A1B3A"/>
+    <rect x="316" y="606" width="28" height="28" fill="#1A1B3A"/>
+    <rect x="344" y="606" width="168" height="28" fill="#58D16A"/>
+    <rect x="512" y="606" width="56" height="28" fill="#1A1B3A"/>
+    <rect x="568" y="606" width="84" height="28" fill="#58D16A"/>
+    <rect x="652" y="606" width="28" height="28" fill="#2E9D55"/>
+    <rect x="680" y="606" width="28" height="28" fill="#1A1B3A"/>
+    <rect x="316" y="634" width="28" height="28" fill="#1A1B3A"/>
+    <rect x="344" y="634" width="28" height="28" fill="#2E9D55"/>
+    <rect x="372" y="634" width="224" height="28" fill="#58D16A"/>
+    <rect x="596" y="634" width="84" height="28" fill="#2E9D55"/>
+    <rect x="680" y="634" width="28" height="28" fill="#1A1B3A"/>
+    <rect x="344" y="662" width="336" height="28" fill="#1A1B3A"/>
+  </g>
+  <!-- Sparkle -->
+  <polygon points="742.0,208.0 753.3,270.7 816.0,282.0 753.3,293.3 742.0,356.0 730.7,293.3 668.0,282.0 730.7,270.7" fill="#FFE066" stroke="#1A1B3A" stroke-width="10" stroke-linejoin="round"/>
+</svg>

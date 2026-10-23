@@ -87,7 +87,7 @@ pub struct TransformBox {
     pub affine: Affine,
     pub bounds: PixelRect,
 }
-use image::{Rgba, RgbaImage};
+use image::RgbaImage;
 
 pub const MIN_ZOOM: f32 = 0.01;
 pub const MAX_ZOOM: f32 = 64.0;
@@ -345,42 +345,68 @@ pub fn downsample_into(src: &RgbaImage, dst: &mut RgbaImage, rect: PixelRect) {
     let Some(rect) = rect.intersect(PixelRect::new(0, 0, dst.width(), dst.height())) else {
         return;
     };
-    for y in rect.y..rect.bottom() {
-        for x in rect.x..rect.right() {
-            let mut sum = [0.0f32; 4];
-            let mut count = 0.0f32;
-            for (sx, sy) in [
-                (2 * x, 2 * y),
-                (2 * x + 1, 2 * y),
-                (2 * x, 2 * y + 1),
-                (2 * x + 1, 2 * y + 1),
-            ] {
-                if sx < src.width() && sy < src.height() {
-                    let [r, g, b, a] = src.get_pixel(sx, sy).0;
-                    let alpha = a as f32 / 255.0;
-                    sum[0] += r as f32 * alpha;
-                    sum[1] += g as f32 * alpha;
-                    sum[2] += b as f32 * alpha;
-                    sum[3] += a as f32;
-                    count += 1.0;
+    let row = dst.width() as usize * 4;
+    let rows = &mut dst.as_mut()[rect.y as usize * row..rect.bottom() as usize * row];
+    // Big regions (a whole-layer change) are split into row bands across cores.
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let height = rect.height as usize;
+    let per = if (rect.width as usize * height) < 128 * 1024 {
+        height.max(1)
+    } else {
+        height.div_ceil(threads).max(8)
+    };
+    std::thread::scope(|scope| {
+        for (k, band) in rows.chunks_mut(per * row).enumerate() {
+            let mut job = move || {
+                for (j, line) in band.chunks_mut(row).enumerate() {
+                    let y = rect.y + (k * per + j) as u32;
+                    for x in rect.x..rect.right() {
+                        let px = downsample_pixel(src, x, y);
+                        let i = x as usize * 4;
+                        line[i..i + 4].copy_from_slice(&px);
+                    }
                 }
-            }
-            let alpha = sum[3] / count;
-            let pixel = if alpha <= 0.0 {
-                [0, 0, 0, 0]
-            } else {
-                let unpremultiply =
-                    |c: f32| (c / count / (alpha / 255.0)).round().clamp(0.0, 255.0) as u8;
-                [
-                    unpremultiply(sum[0]),
-                    unpremultiply(sum[1]),
-                    unpremultiply(sum[2]),
-                    alpha.round() as u8,
-                ]
             };
-            dst.put_pixel(x, y, Rgba(pixel));
+            if per >= height {
+                job();
+            } else {
+                scope.spawn(job);
+            }
+        }
+    });
+}
+
+/// The alpha-weighted mean of the 2 × 2 source pixels under (x, y).
+fn downsample_pixel(src: &RgbaImage, x: u32, y: u32) -> [u8; 4] {
+    let mut sum = [0.0f32; 4];
+    let mut count = 0.0f32;
+    for (sx, sy) in [
+        (2 * x, 2 * y),
+        (2 * x + 1, 2 * y),
+        (2 * x, 2 * y + 1),
+        (2 * x + 1, 2 * y + 1),
+    ] {
+        if sx < src.width() && sy < src.height() {
+            let [r, g, b, a] = src.get_pixel(sx, sy).0;
+            let alpha = a as f32 / 255.0;
+            sum[0] += r as f32 * alpha;
+            sum[1] += g as f32 * alpha;
+            sum[2] += b as f32 * alpha;
+            sum[3] += a as f32;
+            count += 1.0;
         }
     }
+    let alpha = sum[3] / count;
+    if alpha <= 0.0 {
+        return [0, 0, 0, 0];
+    }
+    let unpremultiply = |c: f32| (c / count / (alpha / 255.0)).round().clamp(0.0, 255.0) as u8;
+    [
+        unpremultiply(sum[0]),
+        unpremultiply(sum[1]),
+        unpremultiply(sum[2]),
+        alpha.round() as u8,
+    ]
 }
 
 /// One level of the mip pyramid: CPU pixels plus one texture per tile.
@@ -493,23 +519,41 @@ impl TileCache {
                 level.uploads = count;
             }
         }
-        for rect in std::mem::take(&mut self.pending) {
-            let pixels = doc.composite_region(rect);
+        // Big changes are refreshed in row strips within a time budget per
+        // frame (the rest continues next frame), so the UI never stalls.
+        let start = std::time::Instant::now();
+        while let Some(rect) = self.pending.first().copied() {
+            if !self.pending_is_small() && start.elapsed() > REFRESH_BUDGET {
+                break;
+            }
+            let strip = PixelRect::new(rect.x, rect.y, rect.width, rect.height.min(REFRESH_STRIP));
+            if strip.height == rect.height {
+                self.pending.remove(0);
+            } else {
+                self.pending[0] = PixelRect::new(
+                    rect.x,
+                    rect.y + strip.height,
+                    rect.width,
+                    rect.height - strip.height,
+                );
+            }
+            let pixels = doc.composite_region(strip);
             image::imageops::replace(
                 &mut self.levels[0].image,
                 &pixels,
-                rect.x as i64,
-                rect.y as i64,
+                strip.x as i64,
+                strip.y as i64,
             );
             for k in 1..self.levels.len() {
                 let (above, below) = self.levels.split_at_mut(k);
                 downsample_into(
                     &above[k - 1].image,
                     &mut below[0].image,
-                    rect_at_level(rect, k),
+                    rect_at_level(strip, k),
                 );
             }
         }
+        let pending = self.pending.clone();
         for (k, level) in self.levels.iter_mut().enumerate() {
             // Full resolution is shown crisp when magnified; smaller levels are
             // only ever drawn slightly minified.
@@ -523,6 +567,13 @@ impl TileCache {
                     continue;
                 }
                 let rect = level.grid.tile_rect(index);
+                // Tiles still waiting for pixels upload once they are complete.
+                if pending
+                    .iter()
+                    .any(|p| rect_at_level(*p, k).intersect(rect).is_some())
+                {
+                    continue;
+                }
                 let tile = image::imageops::crop_imm(
                     &level.image,
                     rect.x,
@@ -549,8 +600,32 @@ impl TileCache {
                 level.uploads += 1;
             }
         }
+        if !self.pending.is_empty() {
+            ctx.request_repaint();
+        }
+    }
+
+    /// Whether the changes still waiting are small enough to finish now.
+    fn pending_is_small(&self) -> bool {
+        self.pending
+            .iter()
+            .map(|r| r.width as u64 * r.height as u64)
+            .sum::<u64>()
+            < REFRESH_SMALL_PIXELS
+    }
+
+    /// Whether every change has been composited (and its tiles uploaded).
+    pub fn up_to_date(&self) -> bool {
+        self.pending.is_empty()
     }
 }
+
+/// Time a frame spends refreshing a big change before continuing it next frame.
+const REFRESH_BUDGET: std::time::Duration = std::time::Duration::from_millis(12);
+/// Rows composited at a time when refreshing a big change.
+const REFRESH_STRIP: u32 = 128;
+/// Changes up to this many pixels are always refreshed in one frame.
+const REFRESH_SMALL_PIXELS: u64 = 512 * 512;
 
 /// Per-document canvas state kept by the UI.
 pub struct CanvasState {
@@ -1537,6 +1612,8 @@ pub fn checker_texture(ctx: &egui::Context) -> TextureHandle {
 
 #[cfg(test)]
 mod tests {
+    use image::Rgba;
+
     use super::*;
 
     fn approx(a: f32, b: f32) -> bool {

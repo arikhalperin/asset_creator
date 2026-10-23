@@ -24,6 +24,7 @@ pub enum LibraryAction {
     /// Export… was confirmed in the dialog.
     Export(Vec<u64>, ExportFormat),
     DownloadTagger,
+    CancelTaggerDownload,
     /// Clean Up: despeckle and crop (a new version for each changed asset).
     CleanUp(Vec<u64>),
     /// Make an older version current again.
@@ -167,6 +168,8 @@ impl LibraryView {
 pub struct TagStatus {
     pub text: String,
     pub can_download: bool,
+    /// The tagging-model download is running (Cancel Download).
+    pub downloading: bool,
 }
 
 pub fn library_panel(
@@ -230,6 +233,9 @@ pub fn library_panel(
     ui.add(egui::Label::new(egui::RichText::new(&status.text).weak()).wrap());
     if status.can_download && ui.small_button("Download tagging model…").clicked() {
         actions.push(LibraryAction::DownloadTagger);
+    }
+    if status.downloading && ui.small_button("Cancel Download").clicked() {
+        actions.push(LibraryAction::CancelTaggerDownload);
     }
     for notice in library.notices() {
         ui.add(

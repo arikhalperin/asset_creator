@@ -79,7 +79,20 @@ impl Harness {
     pub fn new_doc(&mut self, w: u32, h: u32) -> DocId {
         let id = self.app.create_document(w, h, 72.0).unwrap();
         self.frames(2);
+        self.settle_canvas(id);
         id
+    }
+
+    /// Runs frames until the canvas of `id` has drawn every change (big
+    /// changes are refreshed over several frames).
+    pub fn settle_canvas(&mut self, id: DocId) {
+        for _ in 0..1000 {
+            if self.app.canvas(id).is_none_or(|c| c.tiles().up_to_date()) {
+                return;
+            }
+            self.frame(vec![]);
+        }
+        panic!("the canvas never caught up");
     }
 
     pub fn view(&self, id: DocId) -> game_asset_creator::canvas::ViewState {
