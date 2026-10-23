@@ -2128,7 +2128,7 @@ impl EditorApp {
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
                 ui.label(format!(
-                    "Extract Object can use MobileSAM (MIT license) for better masks.\nDownload it now (about {} MB) into\n{}?\nUntil then, GrabCut is used.",
+                    "Extract Object can use MobileSAM (Apache 2.0 license) for better masks.\nDownload it now (about {} MB) into\n{}?\nUntil then, GrabCut is used.",
                     models::total_size() / 1_000_000,
                     self.segment_config.model_dir.display()
                 ));
